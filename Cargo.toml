@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.53", features = ["process", "net", "time", "macros", "rt-multi-thread", "io-util", "io-std", "sync", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = "0.42"
+anyhow = "1.0"
+tempfile = "3.27"
+tracing = "0.1"
+clap = { version = "4.6", features = ["derive"] }
+cache-manager = "0.4"
+tar = "0.4"
+flate2 = "1.1"
+liblzma = "0.4"
+reqwest = { version = "0.13", features = ["rustls", "stream", "json"] }
+sha2 = { version = "0.11" }
+hex = "0.4"
+
+[package]
+name = "windows-headless"
+version = "0.1.0-alpha"
+edition = "2024"
+description = "Minimal-dependency headless Windows 11 VM provisioning and automation"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+quick-xml.workspace = true
+anyhow.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+clap.workspace = true
+cache-manager = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+liblzma = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+[features]
+default = ["downloader"]
+downloader = ["reqwest", "sha2", "hex", "cache-manager", "tar", "flate2", "liblzma"]

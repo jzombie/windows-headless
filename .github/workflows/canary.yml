@@ -1,0 +1,41 @@
+name: Weekly Windows Canary Test
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils netcat-openbsd curl
+          sudo modprobe kvm || true
+          sudo chmod 666 /dev/kvm || true
+
+      - name: Download latest ISOs (no cache)
+        run: |
+          wget -O /tmp/virtio-win.iso https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+          # No static-HTML scrape: EvalCenter links require the interactive
+          # form. Fido drives the real download API instead.
+          wget -O /tmp/Fido.ps1 https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1
+          pwsh -NoProfile -File /tmp/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -Quiet -Dir /tmp
+          mv /tmp/*Windows_11*.iso /tmp/win11-latest.iso
+          test -f /tmp/win11-latest.iso
+
+      - name: Run canary test
+        env:
+          LATEST_WIN11_ISO: /tmp/win11-latest.iso
+          VIRTIO_ISO: /tmp/virtio-win.iso
+        run: cargo test --test canary_test -- --ignored --nocapture
+
+      - name: Upload failure screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup-stuck-screenshot
+          path: /tmp/ci_failure.ppm
