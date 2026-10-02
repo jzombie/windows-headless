@@ -33,7 +33,7 @@ Sizing is Docker-style: `--memory 8g --cpus 8 --disk-size 128g`
 Sizing applies to installs too, so `run --win-iso` honors the same flags.
 
 Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
-`demo2026`); a screenshot lands in `<cache>/vms/win11/screenshots/` every
+`demo2026`); an installer screenshot lands in `<cache>/vms/win11/screenshots/` every
 60 seconds until SSH answers.
 
 ## Where things live

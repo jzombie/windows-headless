@@ -1104,7 +1104,7 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     let screenshots = if p.screenshots_every_secs > 0 {
         let dir = screenshots_dir(&vm_dir);
         eprintln!(
-            "Saving a screenshot every {}s until then → {}",
+            "Saving an installer screenshot every {}s until then → {}",
             p.screenshots_every_secs,
             dir.display()
         );
@@ -2150,7 +2150,7 @@ fn spawn_screenshots(
         let mut n = 0u64;
         let announce = |n: u64, p: PathBuf| {
             eprintln!(
-                "screenshot {n}: {}",
+                "installer screenshot {n}: {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
             );
         };
