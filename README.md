@@ -1,6 +1,6 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI.
+Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI, no host packages.
 
 **STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. macOS users: see [Gatekeeper requirement](#macos-gatekeeper-requirement).**
 
@@ -56,6 +56,21 @@ user cache dir. Layout:
 Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
 `$WINDOWS_HEADLESS_MEDIA_DIR`, `$WINDOWS_HEADLESS_VM_DIR`.
 
+## Drivers
+
+One third-party driver, installed from the pinned virtio-win ISO:
+
+- **Network: Red Hat VirtIO NetKVM** (`NetKVM/w11/<arch>`). The guest NIC
+  is `virtio-net-pci`, so without it there is no network (and no SSH).
+
+Everything else is inbox Windows:
+
+- **Storage: none.** The disk is NVMe, driven by Windows' built-in
+  `stornvme`. No `viostor` needed or installed.
+- **GPU: none.** Display is `ramfb` (a plain framebuffer for VNC and
+  installer screenshots). No virtio-gpu, QXL, or vendor GPU driver: expect
+  software rendering only.
+
 Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
 
 > Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
@@ -67,6 +82,7 @@ Proven installs, logged automatically by `install` to [tested-isos.jsonl](./test
 <!-- TESTED-BEGIN -->
 | Date | ISO | Arch | Accel | Host | QEMU | wimlib | virtio | Commit | Result |
 |---|---|---|---|---|---|---|---|---|---|
+| 2026-10-02 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | hvf | macos 26.6.2 | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [51606bf](https://github.com/jzombie/windows-headless/commit/51606bf345ba) | ssh-banner |
 | 2026-10-02 | Windows11_Client_x64_en-us_26300_9457.iso | amd64 | kvm | linux Ubuntu 26.04.1 LTS | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [c077bbc](https://github.com/jzombie/windows-headless/commit/c077bbcff71d) | ssh-banner |
 | 2026-10-02 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | tcg | linux Ubuntu 26.04 LTS | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [088e297](https://github.com/jzombie/windows-headless/commit/088e297df38f) | ssh-banner |
 | 2026-10-01 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | hvf | macos 26.6.2 | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [29b32fc](https://github.com/jzombie/windows-headless/commit/29b32fc96e3d) | ssh-banner |
