@@ -7,29 +7,27 @@ on:
 
 jobs:
   # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
-  # ISO acquisition runs here and travels to the Linux job as an artifact.
-  # This is the one step that cannot go through the Rust pipeline:
-  # EvalCenter links require the interactive form, so Fido drives the
-  # real download API instead.
-  fetch-iso:
+  # download URL is resolved here. Only the URL crosses the job boundary —
+  # the ISO bytes are never stored on GitHub infra (no redistribution:
+  # the Linux job downloads straight from Microsoft, and the links expire).
+  # Eval media is evaluation-licensed, which covers installer testing.
+  fetch-iso-url:
     runs-on: windows-latest
+    outputs:
+      url: ${{ steps.fido.outputs.url }}
     steps:
-      - name: Download latest Windows ISO (Fido)
+      - name: Resolve latest Windows ISO URL (Fido)
+        id: fido
         run: |
+          # No -Ed flag: the default (retail Home/Pro/Edu) is what this
+          # project actually evaluates; Enterprise media is untested.
           Invoke-WebRequest -Uri https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1 -OutFile $env:RUNNER_TEMP/Fido.ps1
-          & $env:RUNNER_TEMP/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -Quiet -Dir $env:RUNNER_TEMP
-          Move-Item $env:RUNNER_TEMP/*Windows_11*.iso $env:RUNNER_TEMP/win11-latest.iso
-          if (!(Test-Path $env:RUNNER_TEMP/win11-latest.iso)) { exit 1 }
-
-      - name: Upload ISO artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: win11-latest-iso
-          path: ${{ runner.temp }}/win11-latest.iso
-          retention-days: 2
+          $url = & $env:RUNNER_TEMP/Fido.ps1 -Win 11 -Lang English -Arch x64 -GetUrl -Quiet
+          if ([string]::IsNullOrWhiteSpace($url)) { exit 1 }
+          "url=$url" >> $env:GITHUB_OUTPUT
 
   canary:
-    needs: fetch-iso
+    needs: fetch-iso-url
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,18 +47,18 @@ jobs:
           sudo docker system prune -af 2>/dev/null || true
           df -h
 
-      - name: Download ISO artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: win11-latest-iso
-          path: /tmp/canary-iso
+      - name: Download Windows ISO (direct from Microsoft)
+        # Time-limited signed URL (hours); the Linux job runs back-to-back.
+        run: |
+          curl -L -o /tmp/win11-latest.iso "${{ needs.fetch-iso-url.outputs.url }}"
+          test -f /tmp/win11-latest.iso
 
       # Everything from here runs through `cargo` — pinned QEMU/wimlib/
       # virtio/OpenSSH via the fetch chain, media build, then install.
       # No manual downloads, no apt QEMU.
       - name: Run canary test
         env:
-          LATEST_WIN11_ISO: /tmp/canary-iso/win11-latest.iso
+          LATEST_WIN11_ISO: /tmp/win11-latest.iso
         run: cargo test --test canary_test -- --ignored --nocapture
 
       - name: Upload time-lapse screenshots
