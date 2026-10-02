@@ -97,6 +97,27 @@ fn expand_tilde(p: PathBuf) -> PathBuf {
     }
     p
 }
+
+/// Fail fast when the Windows ISO is absent, naming the path we actually
+/// resolved instead of guessing at a cause. The `~` hint is emitted only
+/// when a literal `~` survived [`expand_tilde`] — i.e. `HOME` was unset (or
+/// the path is `~otheruser/...`), which is the only way a `~` reaches here
+/// from either an unquoted or a quoted argument.
+fn require_win_iso(path: &Path) -> Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+    let shown = path.display();
+    let raw = path.to_string_lossy();
+    if raw == "~" || raw.starts_with("~/") {
+        anyhow::bail!("Windows ISO not found: {shown} (`~` not expanded — is $HOME set?)");
+    }
+    if raw.starts_with('~') {
+        anyhow::bail!("Windows ISO not found: {shown} (`~otheruser` paths are not expanded)");
+    }
+    anyhow::bail!("Windows ISO not found: {shown}");
+}
+
 fn stage_local_dir(base: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
     fn walk(base: &Path, rel: &str, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
         let dir = if rel.is_empty() {
@@ -190,6 +211,9 @@ pub struct BuildArgs {
 
 #[cfg(feature = "downloader")]
 pub async fn cmd_build(a: BuildArgs) -> Result<()> {
+    // The ISO is the one input `setup` cannot fetch, so check it BEFORE the
+    // downloads: a bad path must fail in milliseconds, not after gigabytes.
+    require_win_iso(&expand_tilde(a.win_iso.clone()))?;
     cmd_setup(None, a.arch).await?;
     cmd_build_media(BuildMediaArgs {
         win_iso: a.win_iso,
@@ -225,6 +249,10 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
         );
         return Ok(());
     }
+
+    // ISO first, honest error, before any state changes: a missing input
+    // must not invalidate a good sidecar or stage the driver archives.
+    require_win_iso(&win_iso)?;
 
     // Invalidate first: a crashed/failed build must never leave a previous
     // sidecar next to a partial image, or the next run skips as "fresh"
@@ -335,12 +363,6 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
     // tolerates the UDF variants hadris-udf rejects with
     // `invalid Information Control Block` (isomage first, hadris fallback).
     eprintln!("extracting install.wim (several minutes) ...");
-    if !win_iso.is_file() {
-        anyhow::bail!(
-            "Windows ISO {} missing (quote-shielded `~`? the shell only expands it unquoted)",
-            win_iso.display()
-        );
-    }
     // Deterministic scratch under the project cache (not $TMPDIR):
     // a previous killed/failed run leaves it behind, so purge-then-
     // reuse. The Drop guard removes it on every exit path — success,
@@ -874,6 +896,10 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
             // Explicit `--win-iso` only — never silent (setup downloads).
             #[cfg(feature = "downloader")]
             Some(iso) => {
+                // The ISO is the one input `setup` cannot fetch: check it
+                // BEFORE the downloads, so a bad path fails in milliseconds
+                // instead of after gigabytes of tools.
+                require_win_iso(&expand_tilde(iso.clone()))?;
                 eprintln!(
                     "USB installer media missing — building it from {} (one-time; downloads tools, then builds a ~7 GB image) ...",
                     iso.display()
@@ -1078,7 +1104,7 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     let screenshots = if p.screenshots_every_secs > 0 {
         let dir = screenshots_dir(&vm_dir);
         eprintln!(
-            "Saving a screenshot every {}s until then → {}",
+            "Saving an installer screenshot every {}s until then → {}",
             p.screenshots_every_secs,
             dir.display()
         );
@@ -1165,15 +1191,19 @@ pub async fn cmd_install(p: InstallParams, shell: bool) -> Result<()> {
     let password = p.password.clone();
     let mut session = install_to_ready(p).await?;
     finish_install_capture(&mut session).await;
-    shell_then_wait(
-        shell,
-        PROVEN_SSH_HOST,
-        PROVEN_SSH_PORT,
-        &username,
-        &password,
-        "press Ctrl-C to shut the VM down cleanly",
-    )
-    .await?;
+    if shell {
+        shell_then_wait(
+            true,
+            PROVEN_SSH_HOST,
+            PROVEN_SSH_PORT,
+            &username,
+            &password,
+            "press Ctrl-C to shut the VM down cleanly",
+        )
+        .await?;
+    } else {
+        eprintln!("install complete (non-interactive — shutting down guest)...");
+    }
     session.child.kill().await?;
     Ok(())
 }
@@ -2120,7 +2150,7 @@ fn spawn_screenshots(
         let mut n = 0u64;
         let announce = |n: u64, p: PathBuf| {
             eprintln!(
-                "screenshot {n}: {}",
+                "installer screenshot {n}: {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
             );
         };
@@ -2493,6 +2523,33 @@ mod tests {
             expand_tilde("~other/x.iso".into()),
             PathBuf::from("~other/x.iso")
         );
+    }
+
+    #[test]
+    fn missing_iso_error_names_the_path_it_tried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("present.iso");
+        std::fs::write(&present, b"x").unwrap();
+        assert!(require_win_iso(&present).is_ok());
+        // A directory is not an ISO.
+        assert!(require_win_iso(tmp.path()).is_err());
+
+        let missing = tmp.path().join("Win11.iso");
+        let err = require_win_iso(&missing).unwrap_err().to_string();
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(!err.contains("quote-shielded"), "{err}");
+        assert!(!err.contains("unquoted"), "{err}");
+
+        // A literal `~` survives expand_tilde only when $HOME is unset (or
+        // the path is ~otheruser) — the hint must say that, not "quote it".
+        let err = require_win_iso(Path::new("~/Win11.iso"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$HOME"), "{err}");
+        let err = require_win_iso(Path::new("~other/x.iso"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("~otheruser"), "{err}");
     }
 
     #[test]
