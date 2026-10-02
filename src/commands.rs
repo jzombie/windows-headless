@@ -1165,15 +1165,19 @@ pub async fn cmd_install(p: InstallParams, shell: bool) -> Result<()> {
     let password = p.password.clone();
     let mut session = install_to_ready(p).await?;
     finish_install_capture(&mut session).await;
-    shell_then_wait(
-        shell,
-        PROVEN_SSH_HOST,
-        PROVEN_SSH_PORT,
-        &username,
-        &password,
-        "press Ctrl-C to shut the VM down cleanly",
-    )
-    .await?;
+    if shell {
+        shell_then_wait(
+            true,
+            PROVEN_SSH_HOST,
+            PROVEN_SSH_PORT,
+            &username,
+            &password,
+            "press Ctrl-C to shut the VM down cleanly",
+        )
+        .await?;
+    } else {
+        eprintln!("install complete (non-interactive — shutting down guest)...");
+    }
     session.child.kill().await?;
     Ok(())
 }
