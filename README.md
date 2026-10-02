@@ -116,7 +116,7 @@ Run `cargo run --bin windows-headless -- verify-pins` to check every pin without
 
 macOS hosts are fully supported.
 
-One-time setup: the portable QEMU and wimlib binaries are adhoc-signed (not notarized), so Gatekeeper blocks them until the quarantine flag is cleared from the cache directory.
+One-time setup: the [portable QEMU and wimlib binaries](https://github.com/jzombie/lab-qemu-portable/releases) are adhoc-signed (not notarized), so Gatekeeper blocks them until the quarantine flag is cleared from the cache directory.
 
 Either set `WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP=1` to let provisioning clear it automatically, or run `xattr -dr com.apple.quarantine <cache-dir>` yourself once. Without one of these, provisioning stops with an error before downloading anything (fail-closed by design, not a malfunction).
 
