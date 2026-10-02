@@ -18,6 +18,7 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
+# (macOS first run: prefix with WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP=1)
 cargo run -- run --win-iso ~/Downloads/Win11.iso
 
 # ...or in two steps: build once, boot any time.
