@@ -506,6 +506,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     a.memory,
                     a.cpus,
                     a.disk_size,
+                    &a.display,
                 )
                 .await?;
                 finish_install_capture(&mut session).await;
@@ -716,6 +717,7 @@ pub(crate) struct InstallQemuArgv<'a> {
     pub cpu: &'a str,
     pub memory_mb: u32,
     pub cpus: u32,
+    pub display: &'a str,
     pub code_tpl: &'a Path,
     pub vars_fd: &'a Path,
     pub serial_log: &'a str,
@@ -760,7 +762,7 @@ pub(crate) fn install_qemu_argv(s: &InstallQemuArgv) -> Vec<String> {
         "-drive".into(),
         format!("if=pflash,format=raw,file={}", s.vars_fd.display()),
         "-display".into(),
-        PROVEN_VNC_DISPLAY.to_string(),
+        s.display.to_string(),
         "-serial".into(),
         format!("file:{}", s.serial_log),
         "-drive".into(),
@@ -825,7 +827,7 @@ pub(crate) fn install_qemu_argv(s: &InstallQemuArgv) -> Vec<String> {
 /// `shell_then_wait` + `finish_install_capture`.
 ///
 /// Run from the repo root (USB media must already exist).
-/// Twelve params is the honest shape (one orchestrator for all install
+/// Thirteen params is the honest shape (one orchestrator for all install
 /// stages); an args struct would just relocate the list.
 #[allow(clippy::too_many_arguments)]
 async fn install_to_ready(
@@ -840,6 +842,7 @@ async fn install_to_ready(
     memory_mb: u32,
     cpus: u32,
     disk_size_gb: u32,
+    display: &str,
 ) -> Result<InstallSession> {
     // Sockets, serial log, SSH port and VNC settings match what `run`
     // boots: every endpoint is scoped to this VM dir (never /tmp —
@@ -987,6 +990,7 @@ async fn install_to_ready(
         cpu,
         memory_mb,
         cpus,
+        display,
         code_tpl: &code_tpl,
         vars_fd: &vars_fd,
         serial_log: &serial_log,
@@ -1049,13 +1053,21 @@ async fn install_to_ready(
                 );
             }
         };
-    mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
-        .await?;
+    // VNC-only step (same guard as the boot path): cocoa/gtk/sdl have
+    // no VNC server to password-protect.
+    if display.starts_with("vnc=") {
+        mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
+            .await?;
+    }
     let mon = std::sync::Arc::new(mon);
-    let url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string());
-    eprintln!(
-        "Windows installer is running — watch it at {url} (VNC password: {PROVEN_VNC_PASSWORD})."
-    );
+    let url = vnc_url(display).unwrap_or_else(|| display.to_string());
+    if display.starts_with("vnc=") {
+        eprintln!(
+            "Windows installer is running — watch it at {url} (VNC password: {PROVEN_VNC_PASSWORD})."
+        );
+    } else {
+        eprintln!("Windows installer is running on the {url} display.");
+    }
     eprintln!(
         "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
     );
@@ -1158,6 +1170,7 @@ pub async fn cmd_install(
     memory_mb: u32,
     cpus: u32,
     disk_size_gb: u32,
+    display: &str,
 ) -> Result<()> {
     let mut session = install_to_ready(
         usb_image,
@@ -1171,6 +1184,7 @@ pub async fn cmd_install(
         memory_mb,
         cpus,
         disk_size_gb,
+        display,
     )
     .await?;
     finish_install_capture(&mut session).await;
@@ -2346,6 +2360,7 @@ mod tests {
             cpu: "max",
             memory_mb,
             cpus,
+            display: "vnc=127.0.0.1:10,password=on",
             code_tpl: &code,
             vars_fd: &vars,
             serial_log: "serial.log",
@@ -2375,9 +2390,39 @@ mod tests {
         let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
         assert_eq!(at("-m"), "4096");
         assert_eq!(at("-smp"), "4");
+        assert_eq!(at("-display"), "vnc=127.0.0.1:10,password=on");
         let img64 = qemu_img_create_args("disk.qcow2", 64);
         assert_eq!(img64.last().unwrap(), "64G");
         assert_eq!(img[..5], img64[..5]);
+    }
+
+    #[test]
+    fn install_cocoa_display_passes_through() {
+        // Non-VNC displays reach QEMU verbatim (the VNC password step is
+        // guarded separately); cocoa installs show a window instead.
+        let dir = std::env::temp_dir();
+        let code = dir.join("code.fd");
+        let vars = dir.join("vars.fd");
+        let usb = dir.join("usb.dmg");
+        let spec = InstallQemuArgv {
+            machine: "virt",
+            accel: "tcg",
+            cpu: "max",
+            memory_mb: 4096,
+            cpus: 4,
+            display: "cocoa",
+            code_tpl: &code,
+            vars_fd: &vars,
+            serial_log: "serial.log",
+            mon_sock: "mon.sock",
+            qmp_sock: "qmp.sock",
+            usb_image: &usb,
+            target: "disk.qcow2",
+            arch: Architecture::Arm64,
+        };
+        let argv = install_qemu_argv(&spec);
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-display"), "cocoa");
     }
 
     #[test]

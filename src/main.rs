@@ -156,6 +156,10 @@ enum Cmd {
         /// Minimum 32g.
         #[arg(long, default_value = "64g", value_parser = windows_headless::sizes::parse_disk_gb)]
         disk_size: u32,
+        /// `-display` spec for the install VM (`cocoa` opens a window;
+        /// default VNC, same as `run`).
+        #[arg(long, default_value = PROVEN_VNC_DISPLAY)]
+        display: String,
     },
     /// Build the USB installer image from the Windows ISO (pure Rust +
     /// vendored `wimlib-imagex`; no host tools). Output defaults to the
@@ -516,6 +520,7 @@ async fn async_main() -> Result<()> {
             memory,
             cpus,
             disk_size,
+            display,
         } => {
             cmd_install(
                 usb_image,
@@ -530,6 +535,7 @@ async fn async_main() -> Result<()> {
                 memory,
                 cpus,
                 disk_size,
+                &display,
             )
             .await
         }
