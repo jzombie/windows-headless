@@ -4,9 +4,11 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 
 **STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. macOS users: see [Gatekeeper requirement](#macos-gatekeeper-requirement).**
 
-> Prerequisite: a recent Rust toolchain (`cargo`, 1.85+ for edition 2024;
-any current stable via [rustup](https://rustup.rs) works). There are no
-prebuilt binaries yet, so every command below builds from source first.
+> Prerequisite: a recent Rust toolchain (`cargo`, 1.85+; any stable via
+> [rustup](https://rustup.rs)). Everything else (QEMU, wimlib, virtio
+> drivers, OpenSSH) is fetched automatically, so a vanilla host with
+> just Rust is enough. No prebuilt binaries yet: every command below
+> builds from source first.
 
 ```sh
 # Build the installer image from your ISO (downloads required tools on first run)
