@@ -1970,7 +1970,8 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 }
 
 /// One screendump frame: `screendump` to PPM, converted in-crate to PNG
-/// (README-displayable, ~6 KB vs 1.4 MB), PPM deleted. Frames land as
+/// (README-displayable; tens to low hundreds of KB depending on screen
+/// content vs 1.4 MB raw), PPM deleted. Frames land as
 /// `<screenshots_dir>/screenshot-<epoch>.png`.
 /// Best-effort (logs, never fails): the monitor may be busy mid-command
 /// and a missed frame is not worth failing an install over.
