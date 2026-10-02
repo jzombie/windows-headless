@@ -76,13 +76,19 @@ jobs:
           curl -L -o /tmp/win11-latest.iso "${{ needs.fetch-iso-url.outputs.url }}"
           test -f /tmp/win11-latest.iso
 
-      # Everything from here runs through `cargo` — pinned QEMU/wimlib/
+      # Everything from here is the user pipeline — pinned QEMU/wimlib/
       # virtio/OpenSSH via the fetch chain, media build, then install.
       # No manual downloads, no apt QEMU.
-      - name: Run canary test
-        env:
-          LATEST_WIN11_ISO: /tmp/win11-latest.iso
-        run: cargo test --test canary_test -- --ignored --nocapture
+      - name: Build installer media
+        run: cargo run -- build --win-iso /tmp/win11-latest.iso --force
+
+      - name: Free the ISO (media built, provenance recorded)
+        # The installer no longer needs the ISO; deleting its 6-8 GB now
+        # keeps peak disk inside the reclaimed headroom during Setup.
+        run: rm -f /tmp/win11-latest.iso && df -h
+
+      - name: Unattended install (the canary)
+        run: cargo run -- install
 
       - name: Upload time-lapse screenshots
         if: failure()
