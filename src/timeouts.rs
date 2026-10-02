@@ -123,6 +123,13 @@ pub const IDLE_BAIL_SECS: u64 = 120;
 /// Cadence of the "... still waiting for SSH (Ns elapsed)" boot narration.
 pub const BOOT_STATUS_TICK: Duration = Duration::from_secs(30);
 
+/// Cadence of the "still installing: … — Ns elapsed, N reboot(s) so far"
+/// heartbeat during the readiness wait. Probes run every
+/// [`READINESS_PROBE_INTERVAL`]; printing on every one buried the log, so
+/// progress is narrated on change plus this slower pulse (proof of life,
+/// not event spam).
+pub const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
+
 /// Grace the runtime gives leaked blocking threads at process exit before
 /// abandoning them (a pending `stdin.read()` in the shell loop otherwise
 /// parks a pool thread forever and the CLI never exits).

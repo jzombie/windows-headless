@@ -64,16 +64,22 @@ pub async fn wait_for_ssh(host: &str, port: u16, timeout_: Duration) -> Result<(
 /// marker-delimited sections. `&& echo YES || echo NO` keeps
 /// key-existence checks locale-independent; value parsing keys on the
 /// (never localized) `REG_DWORD` token.
+///
+/// Every query sends its stderr to `nul`: a missing value/key is a *verdict*
+/// here (OOBE not started, no servicing reboot pending), not a failure —
+/// letting it through logged "ERROR: The system was unable to find the
+/// specified registry key or value." twice on every healthy probe, which
+/// read like a broken install.
 fn reg_probe_command() -> String {
     [
         "echo [SETUP]",
-        "reg query \"HKLM\\SYSTEM\\Setup\" /v SetupType",
+        "reg query \"HKLM\\SYSTEM\\Setup\" /v SetupType 2>nul",
         "echo [OOBE]",
-        "reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress",
+        "reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2>nul",
         "echo [CBS]",
-        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\" && echo YES || echo NO",
+        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\" 2>nul && echo YES || echo NO",
         "echo [WU]",
-        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\" && echo YES || echo NO",
+        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\" 2>nul && echo YES || echo NO",
         "echo [END]",
     ]
     .join(" & ")
@@ -154,9 +160,17 @@ async fn authed_session(
 
 /// Run one command over SSH (password auth), returning stdout.
 /// Host key is accepted blind (loopback NAT to our own guest; the key
-/// changes on every reinstall, so TOFU is pointless). Stderr lines are
-/// echoed (PowerShell errors would otherwise vanish); the caller decides
+/// changes on every reinstall, so TOFU is pointless).
+///
+/// Stderr is not echoed unconditionally: healthy guests produce plenty of
+/// it (the readiness probe reads registry keys that legitimately don't
+/// exist yet), and printing every line made normal runs look broken. It is
+/// reported loudly only in the case that used to bite — empty stdout, where
+/// a broken command would otherwise masquerade as empty output — and
+/// otherwise at `tracing::debug!` (`RUST_LOG=debug`). The caller decides
 /// what stdout means.
+///
+/// NB: never log `cmd` itself — it may carry a password.
 pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) -> Result<String> {
     let session = authed_session(host, port, user, pass).await?;
     let mut ch = session.channel_open_session().await?;
@@ -164,23 +178,18 @@ pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) 
     // Bounded channel drain: PowerShell cold-start on a fresh boot can
     // stall tens of seconds, and a hung channel would otherwise burn the
     // caller's whole budget silently. Hard cap, then loud timeout.
-    let out = tokio::time::timeout(timeouts::SSH_EXEC_DRAIN, async {
+    let (out, err) = tokio::time::timeout(timeouts::SSH_EXEC_DRAIN, async {
         let mut out = Vec::new();
+        let mut err = Vec::new();
         while let Some(msg) = ch.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
-                russh::ChannelMsg::ExtendedData { data, .. } => {
-                    // PowerShell parse errors land on stderr while stdout stays
-                    // empty — without this, a broken command masquerades as
-                    // empty output (observed live). Surface it loudly.
-                    // NB: never log `cmd` itself here — it may carry a password.
-                    eprintln!("ssh stderr: {}", String::from_utf8_lossy(&data).trim())
-                }
+                russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
                 russh::ChannelMsg::ExitStatus { .. } => break,
                 _ => {}
             }
         }
-        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out).into_owned())
+        Ok::<_, anyhow::Error>((out, err))
     })
     .await
     .map_err(|_| {
@@ -189,7 +198,27 @@ pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) 
             timeouts::SSH_EXEC_DRAIN.as_secs()
         )
     })??;
-    Ok(out)
+    match loud_stderr_message(&out, &err) {
+        Some(msg) => eprintln!("{msg}"),
+        None if !err.is_empty() => {
+            tracing::debug!("guest stderr: {}", String::from_utf8_lossy(&err).trim())
+        }
+        None => {}
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The one stderr report worth printing at the default level: `Some` only
+/// when stderr changes how the result reads (empty stdout = a broken
+/// command that would otherwise look like an empty answer). Routine stderr
+/// alongside real stdout is `None` here and goes to `RUST_LOG=debug`.
+fn loud_stderr_message(out: &[u8], err: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(err);
+    let text = text.trim();
+    if text.is_empty() || !out.iter().all(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(format!("guest command produced no stdout — stderr: {text}"))
 }
 
 /// Enable or disable Windows Automatic Repair ("Diagnosing your PC") on
@@ -306,7 +335,7 @@ pub async fn change_guest_password(
     )
     .await
     .map_err(|_| anyhow::anyhow!("rotated-password login timed out"))??;
-    if !verified {
+    if !verified.is_ready() {
         anyhow::bail!("rotated password rejected by guest");
     }
     Ok(())
@@ -404,20 +433,67 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     Ok(())
 }
 
+/// What the guest itself reports about Setup: finished, or still working —
+/// with a human-readable description of what is pending. Callers narrate
+/// that description only when it changes, so a long install logs a handful
+/// of progress lines instead of one per probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestProgress {
+    Ready,
+    /// e.g. `Windows Setup in progress (SetupType=2), OOBE pending`.
+    Busy(String),
+}
+
+impl GuestProgress {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, GuestProgress::Ready)
+    }
+}
+
+/// The guest's answer could not be interpreted: a defect in our probe
+/// command or in parsing its output — NOT a guest reboot. Typed so waiters
+/// report it as what it is instead of narrating a reboot that never happened.
+#[derive(Debug)]
+pub struct ProbeOutputBroken(pub String);
+
+impl std::fmt::Display for ProbeOutputBroken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProbeOutputBroken {}
+
 /// Guest readiness probe over a real SSH login (password auth). Asks the
 /// guest itself whether Setup is finished instead of inferring it from
 /// banner timing: four registry reads through `cmd`+`reg.exe` (millisecond
 /// startup, no PowerShell cold start per probe).
 ///
-/// Returns `Ok(true)` = finished, `Ok(false)` = still working,
-/// `Err` = SSH/login/exec failure (caller treats as "not yet" — sshd may
-/// be mid-restart during reboots). No marker lines at all means the probe
-/// command itself broke (quoting, channel) — loud error, never a silent
-/// `Ok(false)` limp.
-pub async fn probe_setup_done(host: &str, port: u16, user: &str, pass: &str) -> Result<bool> {
+/// Returns [`GuestProgress::Ready`] = finished, [`GuestProgress::Busy`] =
+/// still working (with what is pending), `Err` = SSH/login/exec failure
+/// (caller treats as "not yet" — sshd may be mid-restart during reboots).
+/// No marker lines at all means the probe command itself broke (quoting,
+/// channel) — a [`ProbeOutputBroken`] error, never a silent `Busy` limp.
+pub async fn probe_setup_done(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+) -> Result<GuestProgress> {
     let text = ssh_exec(host, port, user, pass, &reg_probe_command()).await?;
-    let sections = probe_sections(&text)
-        .ok_or_else(|| anyhow::anyhow!("unparseable probe output: {text:?}"))?;
+    let sections = probe_sections(&text).ok_or_else(|| {
+        anyhow::Error::new(ProbeOutputBroken(format!(
+            "unparseable probe output: {text:?}"
+        )))
+    })?;
+    progress_from_sections(&sections)
+}
+
+/// Verdict from already-parsed probe sections (pure — unit-tested; the SSH
+/// transport lives in [`probe_setup_done`]).
+fn progress_from_sections(
+    sections: &std::collections::HashMap<&str, Vec<&str>>,
+) -> Result<GuestProgress> {
     let get = |name: &str| sections.get(name).map(Vec::as_slice).unwrap_or(&[]);
     // Absent key/value: OOBE counts as done (not started), everything
     // else as busy — matching the old PowerShell probe's verdicts.
@@ -429,18 +505,43 @@ pub async fn probe_setup_done(host: &str, port: u16, user: &str, pass: &str) -> 
     // neither YES nor NO means the chain broke mid-command.
     for (name, lines) in [("CBS", get("CBS")), ("WU", get("WU"))] {
         if !lines.iter().any(|l| *l == "YES" || *l == "NO") {
-            anyhow::bail!("probe section {name} has no verdict: {lines:?}");
+            return Err(anyhow::Error::new(ProbeOutputBroken(format!(
+                "probe section {name} has no verdict: {lines:?}"
+            ))));
         }
     }
     if setup == Some(0) && oobe == 0 && !cbs && !wu {
-        return Ok(true);
+        return Ok(GuestProgress::Ready);
     }
-    let line = format!(
-        "BUSY setuptype={} oobe={oobe} cbs={cbs} wu={wu}",
-        setup.map_or("unknown".to_string(), |v| v.to_string())
-    );
-    eprintln!("guest busy: {line}");
-    Ok(false)
+    // The raw tuple is diagnostic detail, not a progress report.
+    tracing::debug!("guest probe busy: setup={setup:?} oobe={oobe} cbs={cbs} wu={wu}");
+    Ok(GuestProgress::Busy(pending_description(
+        setup, oobe, cbs, wu,
+    )))
+}
+
+/// Phrasing for a not-ready verdict: exactly the four values the probe
+/// read, never a guess about what Windows is doing beyond them.
+fn pending_description(setup: Option<u32>, oobe: u32, cbs: bool, wu: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match setup {
+        Some(0) => {}
+        Some(v) => parts.push(format!("Windows Setup in progress (SetupType={v})")),
+        None => parts.push("Setup state unreadable".into()),
+    }
+    if oobe != 0 {
+        parts.push("OOBE pending".into());
+    }
+    if cbs {
+        parts.push("component-servicing reboot pending".into());
+    }
+    if wu {
+        parts.push("Windows Update reboot pending".into());
+    }
+    if parts.is_empty() {
+        parts.push("finishing up".into());
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -496,10 +597,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_probe_reports_state() {
-        let done = probe_setup_done("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
+        let state = probe_setup_done("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
             .await
             .unwrap();
-        eprintln!("guest setup done: {done}");
+        eprintln!("guest setup state: {state:?}");
     }
 
     /// Live exec check (read-only): same transport the password rotation
@@ -539,5 +640,54 @@ mod tests {
         for marker in ["[SETUP]", "[OOBE]", "[CBS]", "[WU]", "[END]"] {
             assert!(cmd.contains(marker), "missing {marker}");
         }
+    }
+
+    #[test]
+    fn probe_verdicts_read_as_progress_not_failure() {
+        // Ready: everything quiet.
+        let ready = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x0\n[CBS]\nNO\n[WU]\nNO\n[END]\n";
+        let sections = probe_sections(ready).unwrap();
+        assert!(progress_from_sections(&sections).unwrap().is_ready());
+
+        // Typical mid-install: one calm line naming exactly what was read.
+        let mid = "[SETUP]\n    SetupType    REG_DWORD    0x2\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x1\n[CBS]\nNO\n[WU]\nNO\n[END]\n";
+        let sections = probe_sections(mid).unwrap();
+        assert_eq!(
+            progress_from_sections(&sections).unwrap(),
+            GuestProgress::Busy("Windows Setup in progress (SetupType=2), OOBE pending".into())
+        );
+
+        // A section with no verdict means OUR probe broke: typed so waiters
+        // report a probe problem instead of narrating a guest reboot.
+        let broken = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\n[CBS]\n[WU]\nNO\n[END]\n";
+        let sections = probe_sections(broken).unwrap();
+        let err = progress_from_sections(&sections).unwrap_err();
+        assert!(
+            err.downcast_ref::<ProbeOutputBroken>().is_some(),
+            "want ProbeOutputBroken, got {err:#}"
+        );
+    }
+
+    #[test]
+    fn probe_command_suppresses_expected_stderr() {
+        // A missing value/key is a *verdict* here (OOBE not started, no
+        // servicing reboot), not an error: every query must redirect stderr
+        // or a healthy install logs "ERROR: unable to find ..." twice per
+        // probe and reads like a broken one.
+        let cmd = reg_probe_command();
+        let queries = cmd.matches("reg query").count();
+        assert_eq!(queries, 4, "expected four reg queries: {cmd}");
+        assert_eq!(cmd.matches("2>nul").count(), queries, "unsilenced: {cmd}");
+    }
+
+    #[test]
+    fn stderr_is_loud_only_when_it_changes_the_reading() {
+        let err = b"ERROR: the key does not exist\r\n";
+        // No stdout: without the loud report a broken command would masquerade
+        // as an empty-but-successful answer (observed live).
+        assert!(loud_stderr_message(b"", err).is_some());
+        // Routine stderr beside real stdout: that is progress, not an error.
+        assert!(loud_stderr_message(b"HKEY_LOCAL_MACHINE\\...\r\n", err).is_none());
+        assert!(loud_stderr_message(b"ok", b"").is_none());
     }
 }

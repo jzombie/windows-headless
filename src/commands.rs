@@ -1408,9 +1408,9 @@ pub async fn cmd_guest(a: GuestArgs) -> Result<()> {
                 .await?;
         }
         GuestOp::Probe => {
-            let done =
+            let progress =
                 crate::ssh::probe_setup_done(host, a.ssh_port, &a.username, &a.password).await?;
-            eprintln!("{}", if done { "READY" } else { "BUSY" });
+            eprintln!("{}", if progress.is_ready() { "READY" } else { "BUSY" });
         }
     }
     Ok(())
@@ -2226,7 +2226,7 @@ async fn wait_install_ready(
     auto_updates: bool,
     scope: &GuestScope,
 ) -> Result<String> {
-    use crate::ssh::probe_setup_done;
+    use crate::ssh::{GuestProgress, probe_setup_done};
     use crate::unattend::DEFAULT_PASSWORD;
     let start = std::time::Instant::now();
     // Phase 1: first banner.
@@ -2239,7 +2239,9 @@ async fn wait_install_ready(
             );
         }
         if let Some(b) = banner_once(port).await {
-            eprintln!("SSH banner: {b} (first contact — Setup still working)");
+            eprintln!(
+                "guest SSH is up (first contact) — Setup is still installing Windows, not ready yet ({b})"
+            );
             break b;
         }
         // Dead-screen watchdog (same as run): fail fast with evidence.
@@ -2257,9 +2259,17 @@ async fn wait_install_ready(
     // PowerShell (Setup still applying), not rebooting. Hammering it with
     // a probe every 10 s only stacks more powershell.exe on the pile, so
     // the cadence backs off while stalled.
+    //
+    // Narration policy: transient states print once per *change* (reboot,
+    // new pending phase) plus a slow heartbeat — never one line per probe.
+    // Default output is progress; words like "failed"/"ERROR" are reserved
+    // for things that are actually wrong (raw errors: RUST_LOG=debug).
     let mut reboots = 0u32;
     let mut was_up = true;
     let mut exec_stalls = 0u32;
+    // Last pending-state line printed, and when the heartbeat last fired.
+    let mut phase: Option<String> = None;
+    let mut last_beat = start;
     loop {
         if start.elapsed() > deadline {
             anyhow::bail!(
@@ -2276,7 +2286,7 @@ async fn wait_install_ready(
         )
         .await
         {
-            Ok(Ok(true)) => {
+            Ok(Ok(GuestProgress::Ready)) => {
                 if password != DEFAULT_PASSWORD {
                     eprintln!("rotating guest password ...");
                     crate::ssh::change_guest_password(
@@ -2318,30 +2328,61 @@ async fn wait_install_ready(
                 );
                 return Ok(banner);
             }
-            Ok(Ok(false)) => {
+            Ok(Ok(GuestProgress::Busy(what))) => {
                 exec_stalls = 0;
+                if phase.as_deref() == Some(what.as_str()) {
+                    // Unchanged since the last probe: stay quiet unless the
+                    // heartbeat is due (proof of life on a long install).
+                    if last_beat.elapsed() >= timeouts::PROGRESS_HEARTBEAT {
+                        last_beat = std::time::Instant::now();
+                        eprintln!(
+                            "still installing: {what} — {}s elapsed, {reboots} reboot(s) so far",
+                            start.elapsed().as_secs()
+                        );
+                    }
+                } else {
+                    eprintln!("still installing: {what}");
+                    phase = Some(what);
+                    last_beat = std::time::Instant::now();
+                }
             }
             Ok(Err(e)) => {
                 exec_stalls += 1;
-                // Five straight exec timeouts with the banner up is not a
-                // reboot (banner would drop) — it is saturation. Say so
-                // once, then stay quiet while backing off below.
-                if exec_stalls == 5 {
+                if e.downcast_ref::<crate::ssh::ProbeOutputBroken>().is_some() {
+                    // OUR probe broke, not the guest: never narrate that as a
+                    // reboot. Rare but real, so it stays at the default level.
+                    if exec_stalls == 1 || exec_stalls == 5 {
+                        eprintln!(
+                            "warning: readiness probe could not read the guest's reply ({e:#}) — probe/output problem, not a reboot; retrying ..."
+                        );
+                    }
+                } else if exec_stalls == 1 {
+                    // Expected while Setup reboots: sshd restarts with the
+                    // guest. One calm line per stall run; the raw transport
+                    // error goes to RUST_LOG=debug instead of reading as a
+                    // failure.
+                    eprintln!(
+                        "waiting: SSH dropped — Windows is rebooting as part of Setup, retrying ..."
+                    );
+                    tracing::debug!("probe error: {e:#}");
+                } else if exec_stalls == 5 {
+                    // Five straight exec failures with the banner up is not a
+                    // reboot (the banner would drop) — it is saturation.
                     eprintln!(
                         "exec stalled 5x with SSH stable — guest is overloaded (Setup still applying), not rebooting; backing off probes ..."
                     );
-                } else if exec_stalls < 5 {
-                    eprintln!("probe failed (sshd mid-reboot?): {e:#}");
                 }
             }
             Err(_) => {
                 exec_stalls += 1;
-                if exec_stalls == 5 {
+                if exec_stalls == 1 {
+                    eprintln!(
+                        "waiting: probe timed out — guest is busy (Setup still applying), retrying ..."
+                    );
+                } else if exec_stalls == 5 {
                     eprintln!(
                         "probe timed out 5x with SSH stable — guest is overloaded, backing off probes ..."
                     );
-                } else if exec_stalls < 5 {
-                    eprintln!("probe timed out (sshd busy?) — retrying ...");
                 }
             }
         }
@@ -2349,7 +2390,7 @@ async fn wait_install_ready(
         match (was_up, up) {
             (true, false) => {
                 eprintln!(
-                    "SSH lost — reboot #{} in progress, waiting for return ...",
+                    "Windows is rebooting (#{}) — SSH dropped, waiting for it to return ...",
                     reboots + 1
                 );
             }
