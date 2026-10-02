@@ -57,12 +57,17 @@ enum Cmd {
         /// `-display` spec: `none`, `cocoa`, `gtk`, `vnc=127.0.0.1:0`.
         #[arg(long, default_value = PROVEN_VNC_DISPLAY)]
         display: String,
-        /// Guest RAM in MB (Windows 11 setup needs >= 4096).
-        #[arg(long, default_value_t = 4096)]
+        /// Guest RAM: Docker syntax (`512m`, `4g`; bare digits are MB).
+        /// Minimum 2g; Windows 11 setup needs 4g.
+        #[arg(long, default_value = "4g", value_parser = windows_headless::sizes::parse_memory_mb)]
         memory: u32,
-        /// Guest SMP cores.
-        #[arg(long, default_value_t = 4)]
-        smp: u32,
+        /// Guest vCPUs, Docker-style (`--cpus`; `--smp` still works).
+        #[arg(long, default_value_t = 4, visible_alias = "smp")]
+        cpus: u32,
+        /// New-disk size on install: Docker syntax (`64g`; bare digits are
+        /// GB). Minimum 32g; ignored when booting an existing disk.
+        #[arg(long, default_value = "64g", value_parser = windows_headless::sizes::parse_disk_gb)]
+        disk_size: u32,
         /// VM dir for the pidfile (default: project cache `vms/win11`).
         #[arg(long)]
         vm_dir: Option<PathBuf>,
@@ -140,6 +145,17 @@ enum Cmd {
         /// watchdog — this only bounds an install that is still moving.
         #[arg(long, default_value_t = windows_headless::timeouts::INSTALL_SSH_DEADLINE_SECS)]
         install_timeout_secs: u64,
+        /// Guest RAM: Docker syntax (`512m`, `4g`; bare digits are MB).
+        /// Minimum 2g; Windows 11 setup needs 4g.
+        #[arg(long, default_value = "4g", value_parser = windows_headless::sizes::parse_memory_mb)]
+        memory: u32,
+        /// Guest vCPUs, Docker-style (`--cpus`; `--smp` still works).
+        #[arg(long, default_value_t = 4, visible_alias = "smp")]
+        cpus: u32,
+        /// New-disk size: Docker syntax (`64g`; bare digits are GB).
+        /// Minimum 32g.
+        #[arg(long, default_value = "64g", value_parser = windows_headless::sizes::parse_disk_gb)]
+        disk_size: u32,
     },
     /// Build the USB installer image from the Windows ISO (pure Rust +
     /// vendored `wimlib-imagex`; no host tools). Output defaults to the
@@ -185,9 +201,9 @@ enum Cmd {
     /// Offline overlay: qemu-img create -b base overlay.
     #[command(hide = true)]
     Overlay {
+        overlay: PathBuf,
         /// Base image (default: `<vm-dir>/disk.qcow2` — the disk `run` boots).
         base: Option<PathBuf>,
-        overlay: PathBuf,
         /// Portable tree root (extracted `qemu-portable` dir); else PATH.
         #[arg(long)]
         qemu_dir: Option<PathBuf>,
@@ -460,7 +476,8 @@ async fn async_main() -> Result<()> {
             ssh_port,
             display,
             memory,
-            smp,
+            cpus,
+            disk_size,
             vm_dir,
             qemu_dir,
             username,
@@ -474,7 +491,8 @@ async fn async_main() -> Result<()> {
                 ssh_port,
                 display,
                 memory,
-                smp,
+                cpus,
+                disk_size,
                 vm_dir,
                 qemu_dir,
                 username,
@@ -495,6 +513,9 @@ async fn async_main() -> Result<()> {
             recovery,
             auto_updates,
             install_timeout_secs,
+            memory,
+            cpus,
+            disk_size,
         } => {
             cmd_install(
                 usb_image,
@@ -506,6 +527,9 @@ async fn async_main() -> Result<()> {
                 recovery,
                 auto_updates,
                 install_timeout_secs,
+                memory,
+                cpus,
+                disk_size,
             )
             .await
         }
@@ -572,5 +596,77 @@ async fn async_main() -> Result<()> {
             dir,
             allow_unverified,
         } => cmd_fetch_wimlib(wimlib_tag, dir, allow_unverified).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn run_accepts_docker_sizing() {
+        // --memory in Docker syntax, --cpus primary, --disk-size in GB syntax.
+        let cli = Cli::try_parse_from([
+            "wh",
+            "run",
+            "--memory",
+            "8g",
+            "--cpus",
+            "8",
+            "--disk-size",
+            "128g",
+        ])
+        .unwrap();
+        let Cmd::Run {
+            memory,
+            cpus,
+            disk_size,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(memory, 8192);
+        assert_eq!(cpus, 8);
+        assert_eq!(disk_size, 128);
+    }
+
+    #[test]
+    fn run_smp_alias_and_defaults() {
+        // Legacy --smp still maps to cpus; bare --memory digits are rejected.
+        let cli = Cli::try_parse_from(["wh", "run", "--smp", "2"]).unwrap();
+        let Cmd::Run {
+            memory,
+            cpus,
+            disk_size,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!((memory, cpus, disk_size), (4096, 2, 64));
+        // Bare digits keep the old integer meaning (MB for memory, GB disk);
+        // toy sizes hit the floors.
+        let cli = Cli::try_parse_from(["wh", "run", "--memory", "4096"]).unwrap();
+        let Cmd::Run { memory, .. } = cli.cmd else {
+            panic!("expected run");
+        };
+        assert_eq!(memory, 4096);
+        assert!(Cli::try_parse_from(["wh", "run", "--memory", "512m"]).is_err());
+        assert!(Cli::try_parse_from(["wh", "run", "--disk-size", "8g"]).is_err());
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn overlay_takes_bare_overlay_first() {
+        // `overlay` (required) precedes `base` (optional): a single
+        // positional lands on overlay instead of erroring on a missing one.
+        let cli = Cli::try_parse_from(["wh", "overlay", "delta.qcow2"]).unwrap();
+        let Cmd::Overlay { base, overlay, .. } = cli.cmd else {
+            panic!("expected overlay");
+        };
+        assert_eq!(overlay, PathBuf::from("delta.qcow2"));
+        assert_eq!(base, None);
     }
 }

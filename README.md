@@ -17,6 +17,32 @@ cargo run -- run \
   --win-iso ~/Downloads/Win11.iso
 ```
 
+Sizing is Docker-style: `--memory 8g --cpus 8 --disk-size 128g`
+(defaults `4g`, `4`, `64g`). Bare digits keep the old integer meaning
+(MB for memory, GB for disk); floors are 2g RAM and 32g disk.
+`--smp` still works as an alias of `--cpus`.
+Sizing applies to installs too, so `run --win-iso` honors the same flags.
+
+## Where things live
+
+Everything lives under one cache root, announced at startup as
+`cache: <path> (<source>)`. Resolution order: `$WINDOWS_HEADLESS_*_DIR`
+env override, then `<project>/.cache` (project discovery), then the OS
+user cache dir. Layout:
+
+```text
+<cache>/
+  qemu-portable/<tag>/...   # portable QEMU tree (bin/qemu-system-*, qemu-img)
+  wimlib-portable/<tag>/... # wimlib-imagex used to build installer media
+  iso/                      # downloaded virtio-win.iso + OpenSSH zips (+ .sha256)
+  media/winusb.dmg          # built installer image (+ .json provenance sidecar)
+  vms/win11/                # the VM: disk.qcow2, VARS.fd, qemu.pid,
+                            # install.log (QEMU output), screenshots/*.png
+```
+
+Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
+`$WINDOWS_HEADLESS_MEDIA_DIR`, `$WINDOWS_HEADLESS_VM_DIR`.
+
 Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
 
 > Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.

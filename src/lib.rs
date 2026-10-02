@@ -12,6 +12,7 @@ pub mod qemu;
 #[cfg(feature = "downloader")]
 pub mod qemu_portable;
 pub mod qmp;
+pub mod sizes;
 pub mod ssh;
 pub mod storage;
 pub mod timeouts;

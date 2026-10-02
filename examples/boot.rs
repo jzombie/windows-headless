@@ -5,7 +5,7 @@ use windows_headless::{HeadlessVmBuilder, PROVEN_SSH_PORT, WindowsVersion};
 /// guest down cleanly. There is no detach path.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut vm = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval)
+    let mut vm = HeadlessVmBuilder::new(WindowsVersion::Win11)
         .disk_size_gb(64)
         .memory_mb(4096)
         .smp_cores(4)

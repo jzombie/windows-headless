@@ -6,35 +6,14 @@ on:
   pull_request:
 
 jobs:
-  test-vm-build:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable KVM permissions
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger
-
-      - name: Install QEMU & dependencies
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils netcat-openbsd
-
-      - name: Free disk space (14GB runner limit)
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost 2>/dev/null || true
-          df -h
-
-      - name: Cache ISOs + base image
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            iso/Win11_Enterprise_Eval.iso
-            iso/virtio-win.iso
-            base.qcow2
-          key: windows-eval-v1
-
+      # No ISO in CI: Eval media lives behind Microsoft's interactive
+      # EvalCenter form, so no job here boots a VM. The signal is unit
+      # tests plus live pin verification (release metadata + hashes only).
       - name: Unit tests (no VM)
         run: cargo test --lib
 
@@ -43,27 +22,3 @@ jobs:
         # OpenSSH zips. Catches rotated assets / stale pins without a full
         # install; runs on every push and PR.
         run: cargo run --bin windows-headless -- verify-pins
-
-      - name: Build base (cache miss only)
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p iso
-          test -f iso/virtio-win.iso || curl -L -o iso/virtio-win.iso "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
-          cargo run --bin windows-headless -- gen --unattend-dir ./unattend_dir
-          qemu-img create -f qcow2 base.qcow2 64G
-          qemu-system-x86_64 \
-            -accel kvm -m 4096 -smp 4 \
-            -drive file=base.qcow2,format=qcow2,if=virtio \
-            -drive file=iso/Win11_Enterprise_Eval.iso,media=cdrom,readonly=on \
-            -drive file=iso/virtio-win.iso,media=cdrom,readonly=on \
-            -drive file=fat:ro:./unattend_dir,format=raw,if=ide \
-            -netdev user,id=n1,hostfwd=tcp::2222-:22 \
-            -device virtio-net-pci,netdev=n1 \
-            -display none \
-            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-            -qmp unix:/tmp/qemu-qmp.sock,server,nowait &
-          for i in $(seq 1 60); do
-            nc -z -w5 127.0.0.1 2222 2>/dev/null && echo OPEN && break
-            echo "waiting ($i/60)"; sleep 15
-          done
-          ssh -o StrictHostKeyChecking=no -p 2222 AdminUser@127.0.0.1 "cmd.exe /c ver"

@@ -426,8 +426,12 @@ pub struct RunArgs {
     pub disk: Option<String>,
     pub ssh_port: u16,
     pub display: String,
+    /// Guest RAM in MB (parsed from Docker syntax by clap `value_parser`).
     pub memory: u32,
-    pub smp: u32,
+    /// Guest vCPUs (`--cpus`; `--smp` is an alias).
+    pub cpus: u32,
+    /// New-disk size in GB (install path only; parsed from Docker syntax).
+    pub disk_size: u32,
     pub vm_dir: Option<PathBuf>,
     pub qemu_dir: Option<PathBuf>,
     pub username: String,
@@ -484,8 +488,11 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             // the guest shell. Explicit `--win-iso` only — never silent.
             Some(iso) => {
                 eprintln!(
-                    "disk {disk} missing — installing from {} ...",
-                    iso.display()
+                    "disk {disk} missing — installing from {} (new {}G disk, {} MB RAM, {} vCPUs) ...",
+                    iso.display(),
+                    a.disk_size,
+                    a.memory,
+                    a.cpus,
                 );
                 let mut session = install_to_ready(
                     None,
@@ -496,6 +503,9 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     false,
                     false,
                     a.install_timeout_secs,
+                    a.memory,
+                    a.cpus,
+                    a.disk_size,
                 )
                 .await?;
                 finish_install_capture(&mut session).await;
@@ -506,11 +516,11 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             ),
         }
     }
-    let mut b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval)
+    let mut b = HeadlessVmBuilder::new(WindowsVersion::Win11)
         .ssh_port(a.ssh_port)
         .display(a.display.clone())
         .memory_mb(a.memory)
-        .smp_cores(a.smp)
+        .smp_cores(a.cpus)
         .workdir(vm_dir);
     match a.qemu_dir {
         Some(d) => b = b.qemu_dir(d),
@@ -524,8 +534,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "booting {disk} ({} MB, {} cores, display {})",
-        a.memory, a.smp, a.display
+        "booting {disk} ({} MB RAM, {} vCPUs, display {})",
+        a.memory, a.cpus, a.display
     );
     eprintln!(
         "waiting for SSH on {PROVEN_SSH_HOST}:{} (up to {} min) ...",
@@ -567,7 +577,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             // "guest has not initialized the display" vs a Windows
             // prompt — neither is guessable from the timeout alone).
             if r.is_err() {
-                take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
+                let _ = take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
             }
             r?;
         }
@@ -604,7 +614,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         } => {
             // Wedged/fatal-signature guest: same evidence gap as the
             // timeout arm — capture the screen before it is torn down.
-            take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
+            let _ = take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
             eprintln!("stopping dead guest...");
             vm.kill().await?;
             let _ = std::fs::remove_file(pidfile);
@@ -694,7 +704,113 @@ async fn finish_install_capture(session: &mut InstallSession) {
         h.abort();
     }
     // Final frame after victory: the desktop as proven, not mid-install.
-    take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await;
+    let _ = take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await;
+}
+
+/// Inputs for the install-time QEMU argv (pure constructor below): every
+/// runtime-resolved path plus the user sizing, so tests can assert the
+/// flags reach QEMU without spawning anything.
+pub(crate) struct InstallQemuArgv<'a> {
+    pub machine: &'a str,
+    pub accel: &'a str,
+    pub cpu: &'a str,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub code_tpl: &'a Path,
+    pub vars_fd: &'a Path,
+    pub serial_log: &'a str,
+    pub mon_sock: &'a str,
+    pub qmp_sock: &'a str,
+    pub usb_image: &'a Path,
+    pub target: &'a str,
+    pub arch: Architecture,
+}
+
+/// `qemu-img create` args (binary excluded): carries the user disk size.
+/// `-q` silences the `Formatting ...` line (our own banner says it).
+pub(crate) fn qemu_img_create_args(target: &str, disk_size_gb: u32) -> Vec<String> {
+    vec![
+        "create".into(),
+        "-q".into(),
+        "-f".into(),
+        "qcow2".into(),
+        target.into(),
+        format!("{disk_size_gb}G"),
+    ]
+}
+
+/// Installer QEMU argv (binary excluded): `-m`/`-smp` carry the user sizing.
+pub(crate) fn install_qemu_argv(s: &InstallQemuArgv) -> Vec<String> {
+    let mut argv = vec![
+        "-M".into(),
+        s.machine.to_string(),
+        "-accel".into(),
+        s.accel.to_string(),
+        "-cpu".into(),
+        s.cpu.to_string(),
+        "-m".into(),
+        s.memory_mb.to_string(),
+        "-smp".into(),
+        s.cpus.to_string(),
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,file={},readonly=on",
+            s.code_tpl.display()
+        ),
+        "-drive".into(),
+        format!("if=pflash,format=raw,file={}", s.vars_fd.display()),
+        "-display".into(),
+        PROVEN_VNC_DISPLAY.to_string(),
+        "-serial".into(),
+        format!("file:{}", s.serial_log),
+        "-drive".into(),
+        format!(
+            "file={},format=raw,if=none,id=usbstick",
+            s.usb_image.display()
+        ),
+        "-netdev".into(),
+        format!("user,id=n1,hostfwd=tcp::{}-:22", PROVEN_SSH_PORT),
+        "-device".into(),
+        "virtio-net-pci,netdev=n1".into(),
+        "-monitor".into(),
+        crate::ipc::qemu_arg(s.mon_sock),
+        "-qmp".into(),
+        crate::ipc::qemu_arg(s.qmp_sock),
+    ];
+    // xHCI first: neither q35 nor virt ships a USB bus, so usb-storage and
+    // the ARM64 input devices below would be bus-less without it.
+    argv.push("-device".into());
+    argv.push("qemu-xhci,id=xhci".into());
+    // ARM64 virt ships with NO input/display devices of its own:
+    // USB keyboard (send-key needs it) + USB tablet (VNC
+    // pointer needs it), and ramfb as the one framebuffer (single
+    // console: VNC and screendump keep working after Windows takes
+    // over, unlike virtio-gpu). x86/pc has PS/2 + VGA by default.
+    if s.arch == Architecture::Arm64 {
+        argv.push("-device".into());
+        argv.push("usb-kbd".into());
+        argv.push("-device".into());
+        argv.push("usb-tablet".into());
+        argv.push("-device".into());
+        argv.push("ramfb".into());
+    }
+    // Removable USB media (never ide-hd). Two separate things decide
+    // whether Setup finds its media and where it installs — they were
+    // conflated here before, and both were verified live:
+    //   * partition type (media.rs): WinPE letters a Microsoft Basic Data
+    //     FAT32 volume, but mounts an ESP — or any GUID it won't letter —
+    //     Hidden with no drive letter, so Setup never sees
+    //     sources/install.swm and parks at "Install driver to show hardware";
+    //   * enumeration order: USB storage lands behind the NVMe (Disk 0 =
+    //     the target), while ide-hd came first (Disk 0 = the 10 GB media),
+    //     and the unattend installs to Disk 0.
+    argv.push("-device".into());
+    argv.push("usb-storage,drive=usbstick,removable=true,bootindex=1".into());
+    argv.push("-drive".into());
+    argv.push(format!("file={},format=qcow2,if=none,id=tgt", s.target));
+    argv.push("-device".into());
+    argv.push("nvme,drive=tgt,serial=nvme1,bootindex=0".into());
+    argv
 }
 
 /// Proven NVMe+USB unattended install: installer USB + NVMe target,
@@ -709,7 +825,7 @@ async fn finish_install_capture(session: &mut InstallSession) {
 /// `shell_then_wait` + `finish_install_capture`.
 ///
 /// Run from the repo root (USB media must already exist).
-/// Nine params is the honest shape (one orchestrator for all install
+/// Twelve params is the honest shape (one orchestrator for all install
 /// stages); an args struct would just relocate the list.
 #[allow(clippy::too_many_arguments)]
 async fn install_to_ready(
@@ -721,6 +837,9 @@ async fn install_to_ready(
     recovery: bool,
     auto_updates: bool,
     install_timeout_secs: u64,
+    memory_mb: u32,
+    cpus: u32,
+    disk_size_gb: u32,
 ) -> Result<InstallSession> {
     // Sockets, serial log, SSH port and VNC settings match what `run`
     // boots: every endpoint is scoped to this VM dir (never /tmp —
@@ -749,7 +868,10 @@ async fn install_to_ready(
             // Explicit `--win-iso` only — never silent (setup downloads).
             #[cfg(feature = "downloader")]
             Some(iso) => {
-                eprintln!("USB image missing — building from {} ...", iso.display());
+                eprintln!(
+                    "USB installer media missing — building it from {} (one-time; downloads tools, then builds a ~7 GB image) ...",
+                    iso.display()
+                );
                 cmd_setup(None, None).await?;
                 cmd_build_media(BuildMediaArgs {
                     win_iso: iso,
@@ -834,9 +956,11 @@ async fn install_to_ready(
         )
     })?;
     let _ = std::fs::remove_file(&target);
-    eprintln!("installing to {target_s} ...");
+    eprintln!(
+        "installing Windows to {target_s} (new {disk_size_gb}G disk, {memory_mb} MB RAM, {cpus} vCPUs) ..."
+    );
     let st = tokio::process::Command::new(&img_bin)
-        .args(["create", "-f", "qcow2", &target_s, "64G"])
+        .args(qemu_img_create_args(&target_s, disk_size_gb))
         .status()
         .await?;
     if !st.success() {
@@ -846,7 +970,7 @@ async fn install_to_ready(
         crate::ipc::stale_remove(s);
     }
     let out = std::fs::File::create(&run_log)?;
-    eprintln!("install log: {}", run_log.display());
+    eprintln!("QEMU output log: {}", run_log.display());
     // Same probe as `run`/boot argv (unattend::resolve_accel): Linux
     // without usable /dev/kvm (OrbStack, containers) falls back to tcg
     // instead of dying on `-accel kvm`. CPU follows the accel: `host`
@@ -854,83 +978,24 @@ async fn install_to_ready(
     // is too old for Windows 11 ARM64).
     let (_, accel) = auto_detect_platform();
     let cpu = if accel == "tcg" { "max" } else { "host" };
-    if accel == "tcg" {
-        eprintln!(
-            "warning: no usable /dev/kvm — installing under TCG emulation (5-15x slower; for full speed run on the macOS host with hvf or bare-metal Linux with KVM)"
-        );
-    }
+    // (No extra warning here: resolve_accel already warned via tracing.)
     let machine = crate::qemu::machine_for(arch);
     let mut child = tokio::process::Command::new(&sys_bin);
-    child.args([
-        "-M",
+    child.args(install_qemu_argv(&InstallQemuArgv {
         machine,
-        "-accel",
         accel,
-        "-cpu",
         cpu,
-        "-m",
-        "4096",
-        "-smp",
-        "4",
-        "-drive",
-        &format!(
-            "if=pflash,format=raw,file={},readonly=on",
-            code_tpl.display()
-        ),
-        "-drive",
-        &format!("if=pflash,format=raw,file={}", vars_fd.display()),
-        "-display",
-        PROVEN_VNC_DISPLAY,
-        "-serial",
-        &format!("file:{serial_log}"),
-        "-drive",
-        &format!(
-            "file={},format=raw,if=none,id=usbstick",
-            usb_image.display()
-        ),
-        "-netdev",
-        &format!("user,id=n1,hostfwd=tcp::{}-:22", PROVEN_SSH_PORT),
-        "-device",
-        "virtio-net-pci,netdev=n1",
-        "-monitor",
-        &crate::ipc::qemu_arg(&mon_sock),
-        "-qmp",
-        &crate::ipc::qemu_arg(&qmp_sock),
-    ]);
-    // xHCI first: neither q35 nor virt ships a USB bus, so usb-storage and
-    // the ARM64 input devices below would be bus-less without it.
-    child.arg("-device").arg("qemu-xhci,id=xhci");
-    // ARM64 virt ships with NO input/display devices of its own:
-    // USB keyboard (send-key needs it) + USB tablet (VNC
-    // pointer needs it), and ramfb as the one framebuffer (single
-    // console: VNC and screendump keep working after Windows takes
-    // over, unlike virtio-gpu). x86/pc has PS/2 + VGA by default.
-    if arch == Architecture::Arm64 {
-        child
-            .arg("-device")
-            .arg("usb-kbd")
-            .arg("-device")
-            .arg("usb-tablet")
-            .arg("-device")
-            .arg("ramfb");
-    }
-    // Removable USB media (never ide-hd). Two separate things decide
-    // whether Setup finds its media and where it installs — they were
-    // conflated here before, and both were verified live:
-    //   * partition type (media.rs): WinPE letters a Microsoft Basic Data
-    //     FAT32 volume, but mounts an ESP — or any GUID it won't letter —
-    //     Hidden with no drive letter, so Setup never sees
-    //     sources/install.swm and parks at "Install driver to show hardware";
-    //   * enumeration order: USB storage lands behind the NVMe (Disk 0 =
-    //     the target), while ide-hd came first (Disk 0 = the 10 GB media),
-    //     and the unattend installs to Disk 0.
-    child
-        .arg("-device")
-        .arg("usb-storage,drive=usbstick,removable=true,bootindex=1")
-        .arg("-drive")
-        .arg(format!("file={target_s},format=qcow2,if=none,id=tgt"))
-        .arg("-device")
-        .arg("nvme,drive=tgt,serial=nvme1,bootindex=0");
+        memory_mb,
+        cpus,
+        code_tpl: &code_tpl,
+        vars_fd: &vars_fd,
+        serial_log: &serial_log,
+        mon_sock: &mon_sock,
+        qmp_sock: &qmp_sock,
+        usb_image: &usb_image,
+        target: &target_s,
+        arch,
+    }));
     child
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
@@ -953,7 +1018,7 @@ async fn install_to_ready(
     let mut child = child.spawn()?;
     let child_pid = child.id();
     eprintln!(
-        "QEMU spawned (pid {child_pid:?}); waiting up to {} s for monitor ...",
+        "QEMU started (pid {child_pid:?}); waiting for the monitor (up to {}s) ...",
         timeouts::MONITOR_CONNECT_SECS
     );
     // Retry the REAL handshake, never a probe connect: QEMU's listen
@@ -988,11 +1053,16 @@ async fn install_to_ready(
         .await?;
     let mon = std::sync::Arc::new(mon);
     let url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string());
-    eprintln!("VNC {url} (password set); waiting for SSH ...");
+    eprintln!(
+        "Windows installer is running — watch it at {url} (VNC password: {PROVEN_VNC_PASSWORD})."
+    );
+    eprintln!(
+        "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
+    );
     let screenshots = if screenshots_every_secs > 0 {
         let dir = screenshots_dir(&vm_dir);
         eprintln!(
-            "screendumps every {screenshots_every_secs}s -> {}",
+            "Saving a screenshot every {screenshots_every_secs}s until then → {}",
             dir.display()
         );
         Some(spawn_screenshots(
@@ -1085,6 +1155,9 @@ pub async fn cmd_install(
     recovery: bool,
     auto_updates: bool,
     install_timeout_secs: u64,
+    memory_mb: u32,
+    cpus: u32,
+    disk_size_gb: u32,
 ) -> Result<()> {
     let mut session = install_to_ready(
         usb_image,
@@ -1095,6 +1168,9 @@ pub async fn cmd_install(
         recovery,
         auto_updates,
         install_timeout_secs,
+        memory_mb,
+        cpus,
+        disk_size_gb,
     )
     .await?;
     finish_install_capture(&mut session).await;
@@ -1895,12 +1971,13 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 
 /// One screendump frame: `screendump` to PPM, converted in-crate to PNG
 /// (README-displayable, ~6 KB vs 1.4 MB), PPM deleted. Frames land as
-/// `<screenshots_dir>/frame-<epoch>.png`.
+/// `<screenshots_dir>/screenshot-<epoch>.png`.
 /// Best-effort (logs, never fails): the monitor may be busy mid-command
 /// and a missed frame is not worth failing an install over.
-async fn take_screenshot(mon: &crate::ipc::Monitor, screenshots_dir: &Path) {
+/// Returns the PNG path on success so callers can announce it.
+async fn take_screenshot(mon: &crate::ipc::Monitor, screenshots_dir: &Path) -> Option<PathBuf> {
     if std::fs::create_dir_all(screenshots_dir).is_err() {
-        return;
+        return None;
     }
     let stem = screenshots_dir.join(format!(
         "{SCREENSHOT_PREFIX}{}",
@@ -1916,22 +1993,23 @@ async fn take_screenshot(mon: &crate::ipc::Monitor, screenshots_dir: &Path) {
         .await;
     if let Err(e) = shot {
         eprintln!("warning: screendump failed: {e:#}");
-        return;
+        return None;
     }
-    match std::fs::read(&ppm)
+    let result = std::fs::read(&ppm)
         .map_err(anyhow::Error::from)
         .and_then(|d| {
             let (w, h, rgb) = parse_ppm_p6(&d)?;
             write_png(&png_path, w, h, &rgb)
-        }) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&ppm);
-            eprintln!("shot {}", png_path.display());
+        });
+    // Always clean up the raw PPM: success deletes it anyway, and a failed
+    // conversion must not leak multi-MB dumps on every cadence tick.
+    let _ = std::fs::remove_file(&ppm);
+    match result {
+        Ok(_) => Some(png_path),
+        Err(e) => {
+            eprintln!("warning: ppm->png failed ({e:#})");
+            None
         }
-        Err(e) => eprintln!(
-            "warning: ppm->png failed ({e:#}); keeping {}",
-            ppm.display()
-        ),
     }
 }
 
@@ -2045,14 +2123,28 @@ fn spawn_screenshots(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // First frame immediately (proves the display is alive early),
-        // then on cadence.
-        take_screenshot(&mon, &screenshots_dir).await;
+        // then on cadence. Numbered, basename-only (the dir was announced
+        // once above), so the log reads as progress toward the SSH answer.
+        let mut n = 0u64;
+        let announce = |n: u64, p: PathBuf| {
+            eprintln!(
+                "screenshot {n}: {}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+        };
+        if let Some(p) = take_screenshot(&mon, &screenshots_dir).await {
+            n += 1;
+            announce(n, p);
+        }
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate tick
         loop {
             ticker.tick().await;
-            take_screenshot(&mon, &screenshots_dir).await;
+            if let Some(p) = take_screenshot(&mon, &screenshots_dir).await {
+                n += 1;
+                announce(n, p);
+            }
         }
     })
 }
@@ -2241,6 +2333,51 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn install_fixture(memory_mb: u32, cpus: u32) -> (Vec<String>, Vec<String>) {
+        let dir = std::env::temp_dir();
+        let code = dir.join("code.fd");
+        let vars = dir.join("vars.fd");
+        let usb = dir.join("usb.dmg");
+        let spec = InstallQemuArgv {
+            machine: "virt",
+            accel: "tcg",
+            cpu: "max",
+            memory_mb,
+            cpus,
+            code_tpl: &code,
+            vars_fd: &vars,
+            serial_log: "serial.log",
+            mon_sock: "mon.sock",
+            qmp_sock: "qmp.sock",
+            usb_image: &usb,
+            target: "disk.qcow2",
+            arch: Architecture::Arm64,
+        };
+        (
+            install_qemu_argv(&spec),
+            qemu_img_create_args("disk.qcow2", 128),
+        )
+    }
+
+    #[test]
+    fn install_sizing_reaches_qemu_argv() {
+        // The flags a user passes must be the bytes QEMU gets: no QEMU
+        // needed, just the pure argv constructors.
+        let (argv, img) = install_fixture(8192, 8);
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-m"), "8192");
+        assert_eq!(at("-smp"), "8");
+        assert_eq!(img.last().unwrap(), "128G");
+        // Defaults stay proven-shaped.
+        let (argv, img) = install_fixture(4096, 4);
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-m"), "4096");
+        assert_eq!(at("-smp"), "4");
+        let img64 = qemu_img_create_args("disk.qcow2", 64);
+        assert_eq!(img64.last().unwrap(), "64G");
+        assert_eq!(img[..5], img64[..5]);
+    }
 
     #[test]
     fn ppm_p6_roundtrip() {

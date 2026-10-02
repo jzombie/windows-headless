@@ -11,7 +11,7 @@ use crate::unattend::{Architecture, VmConfig, auto_detect_platform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsVersion {
-    Win11EnterpriseEval,
+    Win11,
 }
 
 /// Proven topology: the exact QEMU configuration `install`
@@ -770,6 +770,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builder_sizing_reaches_boot_argv() {
+        // Same flags-through-argv proof for the boot path: what the
+        // builder holds is what QEMU gets, no VM needed.
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11)
+            .memory_mb(8192)
+            .smp_cores(8);
+        let argv = b.boot_argv("d.qcow2");
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-m"), "8192");
+        assert_eq!(at("-smp"), "8");
+    }
+
+    #[test]
     fn vnc_display_matches_host() {
         // PROVEN_VNC_DISPLAY is QEMU syntax (can't concat! a const into
         // it), so this test keeps its bind address glued to PROVEN_SSH_HOST.
@@ -782,8 +795,7 @@ mod tests {
     #[test]
     fn vvfat_never_virtio() {
         // x86_64/pc: inbox IDE.
-        let x86 =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Amd64);
+        let x86 = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Amd64);
         let argv = x86.install_argv("d.qcow2", "w.iso", "v.iso", None);
         let vvfat = argv.iter().find(|a| a.starts_with("file=fat:")).unwrap();
         assert!(
@@ -791,8 +803,7 @@ mod tests {
             "vvfat must be if=ide, got {vvfat}"
         );
         // ARM64/virt has no IDE bus: USB mass storage (inbox USBSTOR).
-        let arm =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Arm64);
+        let arm = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Arm64);
         let argv = arm.install_argv("d.qcow2", "w.iso", "v.iso", None);
         let vvfat = argv.iter().find(|a| a.starts_with("file=fat:")).unwrap();
         assert!(vvfat.contains("if=none"), "got {vvfat}");
@@ -831,7 +842,7 @@ mod tests {
 
     #[test]
     fn unattend_iso_replaces_vvfat() {
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         let argv = b.install_argv("d.qcow2", "w.iso", "v.iso", Some("u.iso"));
         assert!(
             argv.iter()
@@ -842,7 +853,7 @@ mod tests {
 
     #[test]
     fn ephemeral_boot_has_no_install_media() {
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         let argv = b.boot_argv("overlay.qcow2");
         assert!(!argv.iter().any(|a| a.starts_with("file=fat:")));
         assert!(!argv.iter().any(|a| a.contains("media=cdrom")));
@@ -861,7 +872,7 @@ mod tests {
 
     #[test]
     fn portable_dir_overrides_path_lookup() {
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         assert_eq!(b.system_bin(), b.config.arch.qemu_binary());
         assert_eq!(b.img_bin(), PathBuf::from("qemu-img"));
 
@@ -883,8 +894,8 @@ mod tests {
     fn machine_type_is_pinned_on_both_arches() {
         // Shared NIC shape (incl. romfile= PXE-ROM suppression) on both.
         for b in [
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval),
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Arm64),
+            HeadlessVmBuilder::new(WindowsVersion::Win11),
+            HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Arm64),
         ] {
             let argv = b.install_argv("d.qcow2", "w.iso", "v.iso", None);
             assert!(
@@ -892,8 +903,7 @@ mod tests {
                     .any(|a| a == "virtio-net-pci,netdev=n1,romfile=")
             );
         } // qemu-system-aarch64 has no default machine: -M virt is required.
-        let arm =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Arm64);
+        let arm = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Arm64);
         for argv in [
             arm.install_argv("d.qcow2", "w.iso", "v.iso", None),
             arm.boot_argv("d.qcow2"),
@@ -903,8 +913,7 @@ mod tests {
         }
         // x86 pins q35 — the exact topology install wrote NVRAM on
         // (default `pc` + q35-written VARS hangs OVMF, machine_for).
-        let x86 =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Amd64);
+        let x86 = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Amd64);
         for argv in [
             x86.install_argv("d.qcow2", "w.iso", "v.iso", None),
             x86.boot_argv("d.qcow2"),
@@ -917,7 +926,7 @@ mod tests {
     #[test]
     fn firmware_is_portable_tree_only() {
         // No --qemu-dir: no firmware, never host paths.
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         assert_eq!(b.qemu_dir, None);
         assert!(b.firmware().is_none());
         assert!(b.require_firmware().is_err());
@@ -928,7 +937,7 @@ mod tests {
         std::fs::create_dir_all(&fw_dir).unwrap();
         std::fs::write(fw_dir.join("edk2-aarch64-code.fd"), b"fake-code").unwrap();
         std::fs::write(fw_dir.join("edk2-arm-vars.fd"), b"fake-vars").unwrap();
-        let p = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval)
+        let p = HeadlessVmBuilder::new(WindowsVersion::Win11)
             .arch(Architecture::Arm64)
             .qemu_dir(tmp.path().join("qemu-portable"))
             .workdir(tmp.path().join("vm"));
