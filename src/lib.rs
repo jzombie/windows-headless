@@ -23,7 +23,7 @@ pub use media::{
     MediaSpec, build_installer_media, extract_iso_file_to_disk, extract_virtio_netkvm, split_wim,
 };
 pub use qemu::{
-    HeadlessVm, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
+    Display, HeadlessVm, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
     PROVEN_VNC_PASSWORD, WindowsVersion, qmp_alive, vnc_url,
 };
 #[cfg(feature = "downloader")]

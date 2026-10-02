@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::ipc::{MON_SOCK_NAME, QMP_SOCK_NAME, SERIAL_LOG_NAME, vm_endpoint};
 use crate::qemu::{
-    HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY, PROVEN_VNC_PASSWORD,
-    WindowsVersion, qmp_alive, vnc_url,
+    Display, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
+    PROVEN_VNC_PASSWORD, WindowsVersion, qmp_alive, vnc_url,
 };
 use crate::storage::DiskManager;
 use crate::timeouts;
@@ -425,7 +425,7 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
 pub struct RunArgs {
     pub disk: Option<String>,
     pub ssh_port: u16,
-    pub display: String,
+    pub display: crate::qemu::Display,
     /// Guest RAM in MB (parsed from Docker syntax by clap `value_parser`).
     pub memory: u32,
     /// Guest vCPUs (`--cpus`; `--smp` is an alias).
@@ -494,20 +494,20 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     a.memory,
                     a.cpus,
                 );
-                let mut session = install_to_ready(
-                    None,
-                    Some(iso),
-                    timeouts::SCREENSHOTS_EVERY_SECS,
-                    &a.username,
-                    &a.password,
-                    false,
-                    false,
-                    a.install_timeout_secs,
-                    a.memory,
-                    a.cpus,
-                    a.disk_size,
-                    &a.display,
-                )
+                let mut session = install_to_ready(InstallParams {
+                    usb_image: None,
+                    win_iso: Some(iso),
+                    screenshots_every_secs: timeouts::SCREENSHOTS_EVERY_SECS,
+                    username: a.username.clone(),
+                    password: a.password.clone(),
+                    recovery: false,
+                    auto_updates: false,
+                    install_timeout_secs: a.install_timeout_secs,
+                    memory_mb: a.memory,
+                    cpus: a.cpus,
+                    disk_size_gb: a.disk_size,
+                    display: a.display.clone(),
+                })
                 .await?;
                 finish_install_capture(&mut session).await;
                 session.child.kill().await?;
@@ -536,7 +536,9 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     }
     eprintln!(
         "booting {disk} ({} MB RAM, {} vCPUs, display {})",
-        a.memory, a.cpus, a.display
+        a.memory,
+        a.cpus,
+        a.display.as_arg()
     );
     eprintln!(
         "waiting for SSH on {PROVEN_SSH_HOST}:{} (up to {} min) ...",
@@ -554,10 +556,10 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         || vm.child.try_wait().map(|o| o.is_none()).unwrap_or(false),
     )
     .await?;
-    if a.display.starts_with("vnc=") {
+    if a.display.is_vnc() {
         mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
             .await?;
-        let url = vnc_url(&a.display).unwrap_or_else(|| a.display.clone());
+        let url = vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg());
         eprintln!("VNC {url} (password {PROVEN_VNC_PASSWORD})");
     }
     eprintln!("QEMU launched; guest is booting ...");
@@ -717,7 +719,7 @@ pub(crate) struct InstallQemuArgv<'a> {
     pub cpu: &'a str,
     pub memory_mb: u32,
     pub cpus: u32,
-    pub display: &'a str,
+    pub display: Display,
     pub code_tpl: &'a Path,
     pub vars_fd: &'a Path,
     pub serial_log: &'a str,
@@ -815,6 +817,23 @@ pub(crate) fn install_qemu_argv(s: &InstallQemuArgv) -> Vec<String> {
     argv
 }
 
+/// One orchestrator for all install stages: grouping the params in a
+/// struct beats counting them in a lint attribute.
+pub struct InstallParams {
+    pub usb_image: Option<PathBuf>,
+    pub win_iso: Option<PathBuf>,
+    pub screenshots_every_secs: u64,
+    pub username: String,
+    pub password: String,
+    pub recovery: bool,
+    pub auto_updates: bool,
+    pub install_timeout_secs: u64,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub disk_size_gb: u32,
+    pub display: crate::qemu::Display,
+}
+
 /// Proven NVMe+USB unattended install: installer USB + NVMe target,
 /// answer file, probe-gated SSH wait. Both platforms present the media
 /// as removable USB storage (bootindex 1) behind xHCI and the target as
@@ -827,23 +846,7 @@ pub(crate) fn install_qemu_argv(s: &InstallQemuArgv) -> Vec<String> {
 /// `shell_then_wait` + `finish_install_capture`.
 ///
 /// Run from the repo root (USB media must already exist).
-/// Thirteen params is the honest shape (one orchestrator for all install
-/// stages); an args struct would just relocate the list.
-#[allow(clippy::too_many_arguments)]
-async fn install_to_ready(
-    usb_image: Option<PathBuf>,
-    win_iso: Option<PathBuf>,
-    screenshots_every_secs: u64,
-    username: &str,
-    password: &str,
-    recovery: bool,
-    auto_updates: bool,
-    install_timeout_secs: u64,
-    memory_mb: u32,
-    cpus: u32,
-    disk_size_gb: u32,
-    display: &str,
-) -> Result<InstallSession> {
+async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     // Sockets, serial log, SSH port and VNC settings match what `run`
     // boots: every endpoint is scoped to this VM dir (never /tmp —
     // world-writable-sticky, symlink squatting, cross-VM collisions).
@@ -864,9 +867,9 @@ async fn install_to_ready(
     // firmware state survives its boots.
     let vars_fd = vm_dir.join(crate::paths::VARS_FILE);
     let run_log = vm_dir.join(crate::paths::INSTALL_LOG);
-    let usb_image = usb_image.unwrap_or(default_media_image()?);
+    let usb_image = p.usb_image.unwrap_or(default_media_image()?);
     if !usb_image.is_file() {
-        match win_iso {
+        match p.win_iso {
             // Chain: fetch deps + build the USB image, then install from it.
             // Explicit `--win-iso` only — never silent (setup downloads).
             #[cfg(feature = "downloader")]
@@ -884,8 +887,8 @@ async fn install_to_ready(
                     openssh_zip: None,
                     out: Some(usb_image.clone()),
                     wimlib_bin: None,
-                    username: username.to_string(),
-                    password: password.to_string(),
+                    username: p.username.clone(),
+                    password: p.password.clone(),
                     locale: "en-US".to_string(),
                     // Chain runs only when the image is absent — nothing to force.
                     force: false,
@@ -960,10 +963,11 @@ async fn install_to_ready(
     })?;
     let _ = std::fs::remove_file(&target);
     eprintln!(
-        "installing Windows to {target_s} (new {disk_size_gb}G disk, {memory_mb} MB RAM, {cpus} vCPUs) ..."
+        "installing Windows to {target_s} (new {}G disk, {} MB RAM, {} vCPUs) ...",
+        p.disk_size_gb, p.memory_mb, p.cpus
     );
     let st = tokio::process::Command::new(&img_bin)
-        .args(qemu_img_create_args(&target_s, disk_size_gb))
+        .args(qemu_img_create_args(&target_s, p.disk_size_gb))
         .status()
         .await?;
     if !st.success() {
@@ -988,9 +992,9 @@ async fn install_to_ready(
         machine,
         accel,
         cpu,
-        memory_mb,
-        cpus,
-        display,
+        memory_mb: p.memory_mb,
+        cpus: p.cpus,
+        display: p.display.clone(),
         code_tpl: &code_tpl,
         vars_fd: &vars_fd,
         serial_log: &serial_log,
@@ -1054,16 +1058,16 @@ async fn install_to_ready(
             }
         };
     // VNC-only step (same guard as the boot path): cocoa/gtk/sdl have
-    // no VNC server to password-protect.
-    if display.starts_with("vnc=") {
-        mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
+    // no VNC server to p.password-protect.
+    if p.display.is_vnc() {
+        mon.command(&format!("change vnc p.password {PROVEN_VNC_PASSWORD}"))
             .await?;
     }
     let mon = std::sync::Arc::new(mon);
-    let url = vnc_url(display).unwrap_or_else(|| display.to_string());
-    if display.starts_with("vnc=") {
+    let url = vnc_url(&p.display.as_arg()).unwrap_or_else(|| p.display.as_arg());
+    if p.display.is_vnc() {
         eprintln!(
-            "Windows installer is running — watch it at {url} (VNC password: {PROVEN_VNC_PASSWORD})."
+            "Windows installer is running — watch it at {url} (VNC p.password: {PROVEN_VNC_PASSWORD})."
         );
     } else {
         eprintln!("Windows installer is running on the {url} display.");
@@ -1071,16 +1075,17 @@ async fn install_to_ready(
     eprintln!(
         "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
     );
-    let screenshots = if screenshots_every_secs > 0 {
+    let screenshots = if p.screenshots_every_secs > 0 {
         let dir = screenshots_dir(&vm_dir);
         eprintln!(
-            "Saving a screenshot every {screenshots_every_secs}s until then → {}",
+            "Saving a screenshot every {}s until then → {}",
+            p.screenshots_every_secs,
             dir.display()
         );
         Some(spawn_screenshots(
             std::sync::Arc::clone(&mon),
             dir,
-            Duration::from_secs(screenshots_every_secs),
+            Duration::from_secs(p.screenshots_every_secs),
         ))
     } else {
         None
@@ -1099,11 +1104,11 @@ async fn install_to_ready(
             // fast on a guest that stops moving, so this only bounds how
             // long a *slow* host may keep applying the image (hours on a
             // ~1 MB/s machine).
-            Duration::from_secs(install_timeout_secs),
-            username,
-            password,
-            recovery,
-            auto_updates,
+            Duration::from_secs(p.install_timeout_secs),
+            &p.username,
+            &p.password,
+            p.recovery,
+            p.auto_updates,
             &scope,
         ) => {
             let banner = r?;
@@ -1111,7 +1116,7 @@ async fn install_to_ready(
             // sidecar, plus a README table refresh when the markers exist.
             // Best-effort throughout — images built before sidecars existed
             // still install fine, they just leave no record. (The probe
-            // already authenticated as `username`, so the CLI value is
+            // already authenticated as `p.username`, so the CLI value is
             // authoritative for the ready line.)
             match crate::provenance::TestRecord::load_sidecar(&usb_image) {
                 Ok(prov) => {
@@ -1131,7 +1136,7 @@ async fn install_to_ready(
                 }
                 Err(e) => eprintln!("warning: no sidecar, skipping test record: {e:#}"),
             }
-            eprintln!("ready — ssh -p {} {username}@{PROVEN_SSH_HOST}", PROVEN_SSH_PORT);
+            eprintln!("ready — ssh -p {} {}@{PROVEN_SSH_HOST}", PROVEN_SSH_PORT, p.username);
         }
         _ = shutdown_signal() => {
             eprintln!("interrupted; stopping guest...");
@@ -1154,46 +1159,18 @@ async fn install_to_ready(
 
 /// Standalone `install`: full install, then supervise the VM for a human
 /// via the shared tail (final frame + optional shell + Ctrl-C wait + kill).
-/// Nine params mirrors the core's honest shape; `shell` only affects this
-/// tail, never the install itself.
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_install(
-    usb_image: Option<PathBuf>,
-    win_iso: Option<PathBuf>,
-    screenshots_every_secs: u64,
-    username: &str,
-    password: &str,
-    shell: bool,
-    recovery: bool,
-    auto_updates: bool,
-    install_timeout_secs: u64,
-    memory_mb: u32,
-    cpus: u32,
-    disk_size_gb: u32,
-    display: &str,
-) -> Result<()> {
-    let mut session = install_to_ready(
-        usb_image,
-        win_iso,
-        screenshots_every_secs,
-        username,
-        password,
-        recovery,
-        auto_updates,
-        install_timeout_secs,
-        memory_mb,
-        cpus,
-        disk_size_gb,
-        display,
-    )
-    .await?;
+/// `shell` only affects this tail, never the install itself.
+pub async fn cmd_install(p: InstallParams, shell: bool) -> Result<()> {
+    let username = p.username.clone();
+    let password = p.password.clone();
+    let mut session = install_to_ready(p).await?;
     finish_install_capture(&mut session).await;
     shell_then_wait(
         shell,
         PROVEN_SSH_HOST,
         PROVEN_SSH_PORT,
-        username,
-        password,
+        &username,
+        &password,
         "press Ctrl-C to shut the VM down cleanly",
     )
     .await?;
@@ -2360,7 +2337,7 @@ mod tests {
             cpu: "max",
             memory_mb,
             cpus,
-            display: "vnc=127.0.0.1:10,password=on",
+            display: Display::Vnc("vnc=127.0.0.1:10,password=on".to_string()),
             code_tpl: &code,
             vars_fd: &vars,
             serial_log: "serial.log",
@@ -2410,7 +2387,7 @@ mod tests {
             cpu: "max",
             memory_mb: 4096,
             cpus: 4,
-            display: "cocoa",
+            display: Display::Cocoa,
             code_tpl: &code,
             vars_fd: &vars,
             serial_log: "serial.log",

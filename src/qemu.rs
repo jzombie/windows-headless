@@ -14,6 +14,53 @@ pub enum WindowsVersion {
     Win11,
 }
 
+/// QEMU `-display` backend: the closed set this tool supports. Anything
+/// else QEMU accepts is rejected at the CLI so a typo fails fast instead
+/// of dying deep in QEMU startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Display {
+    None,
+    Cocoa,
+    Gtk,
+    Vnc(String),
+}
+
+impl Display {
+    /// Parse a `--display` value: `none`, `cocoa`, `gtk`, or `vnc=<spec>`.
+    /// Clap `value_parser` shape: `Err(String)` renders as a clean CLI error.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Display::None),
+            "cocoa" => Ok(Display::Cocoa),
+            "gtk" => Ok(Display::Gtk),
+            s if s.starts_with("vnc=") => Ok(Display::Vnc(s.to_string())),
+            _ => Err(format!(
+                "unsupported --display '{s}' (want none|cocoa|gtk|vnc=<spec>)"
+            )),
+        }
+    }
+
+    /// The `-display` argv value.
+    pub fn as_arg(&self) -> String {
+        match self {
+            Display::None => "none".to_string(),
+            Display::Cocoa => "cocoa".to_string(),
+            Display::Gtk => "gtk".to_string(),
+            Display::Vnc(spec) => spec.clone(),
+        }
+    }
+
+    pub fn is_vnc(&self) -> bool {
+        matches!(self, Display::Vnc(_))
+    }
+}
+
+impl std::fmt::Display for Display {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_arg())
+    }
+}
+
 /// Proven topology: the exact QEMU configuration `install`
 /// demonstrated live (SSH banner, zero clicks). `run` boots this same
 /// configuration minus the USB installer stick. Every default below and
@@ -76,8 +123,8 @@ pub struct HeadlessVmBuilder {
     pub smp_cores: u32,
     pub ssh_host: String,
     pub ssh_port: u16,
-    /// `-display` spec (`none`, `cocoa`, `gtk`, `vnc=127.0.0.1:0`).
-    pub display: String,
+    /// `-display` backend (`none`, `cocoa`, `gtk`, or `vnc=<spec>`).
+    pub display: Display,
     pub monitor_socket: String,
     pub qmp_socket: String,
     /// Guest serial log path (per-VM, next to the disk — never `/tmp`).
@@ -105,7 +152,7 @@ impl HeadlessVmBuilder {
             smp_cores: 4,
             ssh_host: PROVEN_SSH_HOST.to_string(),
             ssh_port: PROVEN_SSH_PORT,
-            display: PROVEN_VNC_DISPLAY.to_string(),
+            display: Display::Vnc(PROVEN_VNC_DISPLAY.to_string()),
             monitor_socket: crate::ipc::vm_endpoint(
                 std::path::Path::new("."),
                 crate::ipc::MON_SOCK_NAME,
@@ -161,12 +208,12 @@ impl HeadlessVmBuilder {
         self
     }
     pub fn vnc(mut self, spec: impl Into<String>) -> Self {
-        self.display = format!("vnc={}", spec.into());
+        self.display = Display::Vnc(format!("vnc={}", spec.into()));
         self
     }
-    /// Raw `-display` spec: `none`, `cocoa`, `gtk`, `vnc=127.0.0.1:0`.
-    pub fn display(mut self, spec: impl Into<String>) -> Self {
-        self.display = spec.into();
+    /// Display backend directly.
+    pub fn display(mut self, d: Display) -> Self {
+        self.display = d;
         self
     }
     pub fn monitor_socket(mut self, s: impl Into<String>) -> Self {
@@ -430,7 +477,7 @@ impl HeadlessVmBuilder {
         a.push(format!("file:{}", self.serial_log));
         a.extend(self.net_args());
         a.push("-display".into());
-        a.push(self.display.clone());
+        a.push(self.display.as_arg());
         a.push("-monitor".into());
         a.push(crate::ipc::qemu_arg(&self.monitor_socket));
         a.push("-qmp".into());
@@ -490,7 +537,7 @@ impl HeadlessVmBuilder {
         a.push("nvme,drive=tgt,serial=nvme1,bootindex=0".into());
         a.extend(self.net_args());
         a.push("-display".into());
-        a.push(self.display.clone());
+        a.push(self.display.as_arg());
         a.push("-serial".into());
         a.push(format!("file:{}", self.serial_log));
         a.push("-monitor".into());
@@ -780,6 +827,22 @@ mod tests {
         let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
         assert_eq!(at("-m"), "8192");
         assert_eq!(at("-smp"), "8");
+    }
+
+    #[test]
+    fn display_parse_rejects_typos() {
+        assert_eq!(Display::parse("cocoa").unwrap(), Display::Cocoa);
+        assert_eq!(Display::parse("none").unwrap(), Display::None);
+        assert_eq!(
+            Display::parse("vnc=127.0.0.1:10,password=on")
+                .unwrap()
+                .as_arg(),
+            "vnc=127.0.0.1:10,password=on"
+        );
+        assert!(Display::parse("x11").is_err());
+        assert!(Display::parse("vnc").is_err());
+        assert!(!Display::Cocoa.is_vnc());
+        assert!(Display::parse("vnc=127.0.0.1:0").unwrap().is_vnc());
     }
 
     #[test]

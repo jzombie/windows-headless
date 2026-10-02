@@ -12,8 +12,9 @@ use windows_headless::commands::{
 use windows_headless::{
     Architecture, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
     commands::{
-        BuildMediaArgs, GenArgs, GuestArgs, GuestOp, ReportArgs, RunArgs, cmd_build_media, cmd_gen,
-        cmd_guest, cmd_install, cmd_overlay, cmd_report, cmd_run, cmd_stop,
+        BuildMediaArgs, GenArgs, GuestArgs, GuestOp, InstallParams, ReportArgs, RunArgs,
+        cmd_build_media, cmd_gen, cmd_guest, cmd_install, cmd_overlay, cmd_report, cmd_run,
+        cmd_stop,
     },
 };
 
@@ -54,9 +55,9 @@ enum Cmd {
         disk: Option<String>,
         #[arg(long, default_value_t = PROVEN_SSH_PORT)]
         ssh_port: u16,
-        /// `-display` spec: `none`, `cocoa`, `gtk`, `vnc=127.0.0.1:0`.
-        #[arg(long, default_value = PROVEN_VNC_DISPLAY)]
-        display: String,
+        /// Display backend: `none`, `cocoa`, `gtk`, or `vnc=<spec>`.
+        #[arg(long, default_value = PROVEN_VNC_DISPLAY, value_parser = windows_headless::Display::parse)]
+        display: windows_headless::Display,
         /// Guest RAM: Docker syntax (`512m`, `4g`; bare digits are MB).
         /// Minimum 2g; Windows 11 setup needs 4g.
         #[arg(long, default_value = "4g", value_parser = windows_headless::sizes::parse_memory_mb)]
@@ -156,10 +157,10 @@ enum Cmd {
         /// Minimum 32g.
         #[arg(long, default_value = "64g", value_parser = windows_headless::sizes::parse_disk_gb)]
         disk_size: u32,
-        /// `-display` spec for the install VM (`cocoa` opens a window;
+        /// Display backend for the install VM (`cocoa` opens a window;
         /// default VNC, same as `run`).
-        #[arg(long, default_value = PROVEN_VNC_DISPLAY)]
-        display: String,
+        #[arg(long, default_value = PROVEN_VNC_DISPLAY, value_parser = windows_headless::Display::parse)]
+        display: windows_headless::Display,
     },
     /// Build the USB installer image from the Windows ISO (pure Rust +
     /// vendored `wimlib-imagex`; no host tools). Output defaults to the
@@ -523,19 +524,21 @@ async fn async_main() -> Result<()> {
             display,
         } => {
             cmd_install(
-                usb_image,
-                win_iso,
-                screenshots_every_secs,
-                &username,
-                &password,
+                InstallParams {
+                    usb_image,
+                    win_iso,
+                    screenshots_every_secs,
+                    username,
+                    password,
+                    recovery,
+                    auto_updates,
+                    install_timeout_secs,
+                    memory_mb: memory,
+                    cpus,
+                    disk_size_gb: disk_size,
+                    display,
+                },
                 want_shell(shell),
-                recovery,
-                auto_updates,
-                install_timeout_secs,
-                memory,
-                cpus,
-                disk_size,
-                &display,
             )
             .await
         }
