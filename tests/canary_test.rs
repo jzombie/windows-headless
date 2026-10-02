@@ -27,6 +27,10 @@ async fn test_latest_windows_headless_pipeline() {
     })
     .await
     .unwrap();
+    // The ISO has served its purpose (media built, provenance sidecar
+    // records its hash): delete it now so the hours-long install has
+    // disk headroom. CI-only path — this test solely runs on LATEST_WIN11_ISO.
+    std::fs::remove_file(&iso).ok();
     // Proven sizing defaults; failure screenshots land in the VM dir and
     // are uploaded by CI. unwrap = red canary with logs attached.
     cmd_install(
