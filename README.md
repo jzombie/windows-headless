@@ -1,6 +1,6 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One binary, no server, no GUI.
+Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI.
 
 **STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. macOS users: see [Gatekeeper requirement](#macos-gatekeeper-requirement).**
 
@@ -11,16 +11,12 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 > builds from source first.
 
 ```sh
-# Build the installer image from your ISO (downloads required tools on first run)
-cargo run -- build \
-  --win-iso ~/Downloads/Win11.iso
+# One command: build the installer, boot the VM, land at a Command Prompt.
+cargo run -- run --win-iso ~/Downloads/Win11.iso
 
-# Boot the VM and wait for SSH
+# ...or in two steps: build once, boot any time.
+cargo run -- build --win-iso ~/Downloads/Win11.iso
 cargo run -- run
-
-# Or build and boot in one command
-cargo run -- run \
-  --win-iso ~/Downloads/Win11.iso
 ```
 
 Sizing is Docker-style: `--memory 8g --cpus 8 --disk-size 128g`

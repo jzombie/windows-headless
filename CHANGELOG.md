@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ## [Unreleased]
 
-First public shape (`0.1.0-alpha`): one binary takes a Microsoft ISO and
+First public shape (`0.1.0-alpha`): one command takes a Microsoft ISO and
 hands back SSH into a headless Windows 11 VM. Tested on macOS (Apple
 Silicon) and Linux (amd64 + arm64); Intel Macs are not supported.
 
