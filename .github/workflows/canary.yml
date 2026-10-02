@@ -90,6 +90,24 @@ jobs:
       - name: Unattended install (the canary)
         run: cargo run -- install
 
+      # A green install appends its own proof (tested-isos.jsonl + README
+      # table, clean tree so no dirty `*`). Human-merged by design: the
+      # Tested table is a trust statement, and the diff (ISO name, commit,
+      # result) deserves a glance before it becomes the project's word.
+      - name: Open proof PR
+        if: success()
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: canary/proof-${{ github.run_id }}
+          commit-message: "canary: prove latest Windows ISO installs unattended"
+          title: "Canary proof: latest Windows ISO installs unattended"
+          body: |
+            Weekly canary went green. Proof is the `tested-isos.jsonl` line plus the regenerated README table in this diff.
+            Run logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          add-paths: |
+            tested-isos.jsonl
+            README.md
+
       - name: Upload time-lapse screenshots
         if: failure()
         uses: actions/upload-artifact@v4
