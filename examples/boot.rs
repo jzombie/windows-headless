@@ -1,5 +1,5 @@
-use std::time::Duration;
-use windows_headless::{HeadlessVmBuilder, WindowsVersion};
+use windows_headless::timeouts;
+use windows_headless::{HeadlessVmBuilder, PROVEN_SSH_PORT, WindowsVersion};
 
 /// Supervised boot: the example owns QEMU — Ctrl-C / SIGTERM shuts the
 /// guest down cleanly. There is no detach path.
@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
         .disk_size_gb(64)
         .memory_mb(4096)
         .smp_cores(4)
-        .ssh_port(2222)
+        .ssh_port(PROVEN_SSH_PORT)
         .build_and_start(
             "win11.qcow2",
             "iso/Win11_Enterprise_Eval.iso",
@@ -17,10 +17,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
     println!("Waiting for Windows setup to complete over SSH...");
-    vm.wait_for_ssh(Duration::from_secs(900)).await?;
-    println!("Windows VM is ready! SSH on 127.0.0.1:2222 (Ctrl-C stops it)");
+    vm.wait_for_ssh(timeouts::EXAMPLE_SSH_DEADLINE).await?;
+    println!(
+        "Windows VM is ready! SSH on 127.0.0.1:{} (Ctrl-C stops it)",
+        PROVEN_SSH_PORT
+    );
     tokio::signal::ctrl_c().await?;
-    vm.shutdown_graceful(Duration::from_secs(90)).await?;
+    vm.shutdown_graceful(timeouts::EXAMPLE_SHUTDOWN_GRACE)
+        .await?;
     println!("stopped");
     Ok(())
 }

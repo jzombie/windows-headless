@@ -2,15 +2,16 @@ use anyhow::{Context, Result};
 use serde_json::{Value as Json, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-/// Hand-rolled QMP client: Unix socket + newline-delimited JSON.
-/// No `qapi` dependency; `id`-based demux of responses vs async `event`s.
+/// Hand-rolled QMP client: transport-agnostic socket + newline-delimited
+/// JSON. No `qapi` dependency; `id`-based demux of responses vs async
+/// `event`s. One client = one session: single-client transports
+/// (Windows named pipes) refuse overlap, so callers connect, act, and
+/// drop — never hold two clients to the same endpoint.
 pub struct QmpClient {
-    writer: OwnedWriteHalf,
-    reader: BufReader<OwnedReadHalf>,
+    writer: tokio::io::WriteHalf<crate::ipc::Stream>,
+    reader: BufReader<tokio::io::ReadHalf<crate::ipc::Stream>>,
     next_id: AtomicU64,
     pub events: mpsc::UnboundedReceiver<Json>,
     event_tx: mpsc::UnboundedSender<Json>,
@@ -18,10 +19,8 @@ pub struct QmpClient {
 
 impl QmpClient {
     pub async fn connect(path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(path)
-            .await
-            .with_context(|| format!("connect QMP {path}"))?;
-        let (rh, wh) = stream.into_split();
+        let stream = crate::ipc::connect(path).await?;
+        let (rh, wh) = tokio::io::split(stream);
         let (tx, rx) = mpsc::unbounded_channel();
         let mut c = Self {
             writer: wh,

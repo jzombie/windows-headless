@@ -1,5 +1,8 @@
 # Rust build output
-/target/
+target/
 
 # Project-scoped ISO / artifact cache (managed by cache-manager, no eviction)
 .cache/
+
+.codegraph
+*.patch

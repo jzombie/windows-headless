@@ -38,6 +38,12 @@ jobs:
       - name: Unit tests (no VM)
         run: cargo test --lib
 
+      - name: Verify pinned artifacts (no VM, no archives)
+        # Hash-only sources (SHA256SUMS.txt, virtio sidecar) plus two ~5 MB
+        # OpenSSH zips. Catches rotated assets / stale pins without a full
+        # install; runs on every push and PR.
+        run: cargo run --bin windows-headless -- verify-pins
+
       - name: Build base (cache miss only)
         if: steps.cache.outputs.cache-hit != 'true'
         run: |

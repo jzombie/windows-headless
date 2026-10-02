@@ -1,85 +1,68 @@
 # windows-headless
 
-Minimal-dependency headless Windows 11 VM provisioning: download Eval +
-VirtIO ISOs, render a hardened `autounattend.xml` into a vvfat folder,
-boot QEMU headless, poll SSH.
+Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One binary, no server, no GUI.
 
-## Quick start
+**STATUS EXPERIMENTAL: [tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. macOS users: see [Gatekeeper requirement](#macos-gatekeeper-requirement).**
 
-```bash
-# One-time: portable QEMU + VirtIO drivers into ./.cache (no system QEMU needed)
-cargo run -- fetch-qemu
-cargo run -- fetch          # skips Eval ISO if you already have one on disk
+```sh
+# Build the installer image from your ISO (downloads required tools on first run)
+cargo run -- build \
+  --win-iso ~/Downloads/Win11.iso
 
-# Install Windows 11 ARM64 with a visible window, everything in ./.cache
+# Boot the VM and wait for SSH
+cargo run -- run
+
+# Or build and boot in one command
 cargo run -- run \
-  --win-iso ~/Downloads/Win11_25H2_English_Arm64_v2.iso \
-  --virtio-iso ./.cache/iso/virtio-win.iso \
-  --display cocoa \
-  --qemu-dir ./.cache/qemu-portable/<version>/qemu-portable
-
-# Later: SSH in (self-installed, no desktop login needed)
-ssh -o StrictHostKeyChecking=no -p 2222 AdminUser@127.0.0.1 "cmd.exe /c ver"
+  --win-iso ~/Downloads/Win11.iso
 ```
 
-`run` defaults the disk to `./.cache/vms/win11/disk.qcow2` and the answer
-file to `./.cache/vms/win11/unattend/autounattend.xml` (override with
-`--disk`, `--unattend-dir`, `--vm-dir`). Tune with `--memory 8192 --smp 8`.
-`run` auto-answers the ISO's "press any key to boot from CD" prompt via
-QMP `send-key` (two bounded taps); stale monitor/QMP socket files are
-unlinked on launch so reruns don't fail to bind.
+Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
 
-## Lifecycle (never orphans)
+> Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
 
-The CLI is a supervisor that owns QEMU: `run`/`boot` block until Ctrl-C /
-SIGTERM, then ACPI-shutdown the guest (90s grace, SIGKILL fallback) and
-exit. Three layers enforce it: `kill_on_drop(true)` on the child handle
-(any drop path kills QEMU — no detach exists), explicit signal handling
-(signals don't unwind, so this is what actually covers SIGTERM), and
-`<vm-dir>/qemu.pid` + `stop` (QMP `quit`) for VMs from older binaries.
-`run` also refuses to start over a live VM or stale disk (`--force`
-recreates, refused while alive).
+## Tested
 
-## ISO cache (cache-manager, no eviction)
+Proven installs, logged automatically by `install` to [tested-isos.jsonl](./tested-isos.jsonl) (`*` = built from a dirty tree). Regenerate with `cargo run -- report --readme README.md`.
 
-`fetch` downloads both ISOs into `$WINDOWS_HEADLESS_ISO_DIR/iso`, else
-`<project>/.cache/iso` (anchored to the workspace root via discovery, so
-plain `cargo run` from this repo caches in `./.cache`, gitignored). Reruns
-skip files already present; `--virtio-sha256 <hex>` re-downloads on hash
-mismatch. Every file is magic-checked (`CD001`): bot-wall HTML saved as
-`.iso` is deleted and reported, never booted. No `EvictPolicy` is ever
-applied — no `max_bytes` cap, no LRU.
-ISOs are multi-GB with time-limited Eval URLs, so size-capped eviction
-would force surprise re-downloads. Downloads land on a `.part` sibling
-first, so an interrupted run never leaves a truncated file the cache
-mistakes for valid.
+<!-- TESTED-BEGIN -->
+| Date | ISO | Arch | Accel | Host | QEMU | wimlib | virtio | Commit | Result |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-01 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | hvf | macos 26.6.2 | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [29b32fc](https://github.com/jzombie/windows-headless/commit/29b32fc96e3d) | ssh-banner |
+<!-- TESTED-END -->
 
-If Fedora's bot-check blocks scripted downloads ("Making sure you're not
-a bot" saved as `.iso`): open
-`https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso`
-in a real browser and save it as `./.cache/iso/virtio-win.iso` (or pass
-any mirror via `fetch --virtio-iso-url <url>`). `fetch`/`run` validate
-whatever is there and keep it without re-downloading.
+## Not tested
 
-## Key facts
+Proven so far: English retail ISO on macOS Apple Silicon, linux/amd64, and linux/arm64 (see table above). Everything below is untested. It may work, fail loudly, or fail silently. Reports with logs welcome.
 
-- Answer file via vvfat: `-drive file=fat:ro:./unattend_dir,format=raw,if=ide`
-  (never `if=virtio` — WinPE reads it before vioscsi loads; never modify the
-  dir while the VM runs). Opt-in `--unattend-iso` secondary CD-ROM for
-  strict CI.
-- VirtIO drivers: Fedora **stable-virtio**
-  (`fedorapeople.org/.../stable-virtio/virtio-win.iso`), the RedHat-signed
-  industry source used by Proxmox/libvirt.
-- SSH needs no desktop: `sshd` starts at the lock screen; no `AutoLogon` by
-  default (`--autologon` opt-in).
-- Debug hangs: `-monitor` + `screendump /tmp/x.ppm`, or swap
-  `-display none` → `-display vnc=127.0.0.1:0`.
-- Snapshots: golden-master offline overlays (`qemu-img create -b`, clean
-  `Stop-Computer -Force` first) for caching; live QMP
-  `blockdev-snapshot-sync` / `savevm` for zero-downtime checkpoints.
-- Canary: weekly latest-ISO job with 25 min SSH timeout + PPM artifact;
-  new screens get bypassed via `docs/oobe-bypass-runbook.md`.
-- Eval ISO sourcing: no page scraper (EvalCenter links require the
-  interactive form). Paste a fresh time-limited browser link via
-  `fetch --win-iso-url` / `WIN11_EVAL_ISO_URL`;
-  canary CI uses Fido; Mido.sh is a shell-script alternative.
+- **Non-English installs.** Only `en-US` media has been tested. The `run --win-iso` / `install --win-iso` chain rebuilds media as `en-US`, the answer file selects the `Windows 11 Pro` image name, and parts of guest verification parse English command output.
+- **Other hosts.** `macos / aarch64`, `linux / amd64`, and `linux / aarch64` have logged installs (see table above). The `linux / aarch64` runs to date were evaluated inside an OrbStack Linux VM (nested virtualization), not on bare metal. Accel is recorded per run in the table.
+- **No mixed archs.** Guest arch must match host arch (ARM Windows on macOS Apple Silicon, x64 Windows on x64 Linux). HVF/KVM require it. Cross-arch guests (x64 Windows on macOS) are untested and unsupported; they fall back to TCG emulation at a 5x to 15x slowdown if they boot at all.
+- **Eval / Enterprise / OEM media.** Proven installs used retail ISOs (see table above). Eval, Enterprise, and OEM media have never been exercised against this [answer file](./templates/autounattend.xml).
+
+## Download Integrity & Security
+
+The provisioning pipeline downloads third-party binaries. Hash verification is enforced as follows:
+
+| Artifact | Source | Hash Enforced? | Security Guarantee |
+|---|---|---|---|
+| **`qemu-portable`** & **`wimlib-portable`** | Auto-download ([qemu](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) · [wimlib](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **`virtio-win.iso`** | Auto-download ([drivers](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **OpenSSH Archive** | Auto-download ([releases](https://github.com/PowerShell/Win32-OpenSSH/releases/tag/10.0.0.0p2-Preview)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **Windows 11 ISO** | User-supplied | **NO (Opt-in)** | Microsoft URLs rotate. Validated via TLS and ISO9660 magic bytes only, unless pinned explicitly via `--win-iso-sha256`. |
+
+*Security Note:* For all auto-downloaded components, the trust root is the source code (`src/pins.rs`). The tool will immediately abort if a downloaded payload does not match its hardcoded hash. If you choose to override default downloads using custom URLs (such as `--virtio-iso-url`), those payloads rely solely on TLS unless you explicitly provide their matching hash flags.
+
+Run `cargo run --bin windows-headless -- verify-pins` to check every pin without installing anything. It covers all platforms (macos-arm64, linux-x86_64, linux-aarch64) from any single runner: release metadata is platform-independent, so one CI job verifies every arch.
+
+### macOS Gatekeeper Requirement
+
+macOS hosts are fully supported.
+
+One-time setup: the portable QEMU and wimlib binaries are adhoc-signed (not notarized), so Gatekeeper blocks them until the quarantine flag is cleared from the cache directory.
+
+Either set `WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP=1` to let provisioning clear it automatically, or run `xattr -dr com.apple.quarantine <cache-dir>` yourself once. Without one of these, provisioning stops with an error before downloading anything (fail-closed by design, not a malfunction).
+
+## License
+
+`windows-headless` is primarily distributed under the terms of both the [MIT license](./LICENSE-MIT) and the [Apache License (Version 2.0)](./LICENSE-APACHE).

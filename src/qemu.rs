@@ -6,11 +6,65 @@ use tokio::process::{Child, Command};
 use crate::qmp::QmpClient;
 use crate::ssh;
 use crate::storage::DiskManager;
+use crate::timeouts;
 use crate::unattend::{Architecture, VmConfig, auto_detect_platform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsVersion {
     Win11EnterpriseEval,
+}
+
+/// Proven topology: the exact QEMU configuration `install`
+/// demonstrated live (SSH banner, zero clicks). `run` boots this same
+/// configuration minus the USB installer stick. Every default below and
+/// every CLI default mirrors these — no parallel hardcodings.
+pub const PROVEN_SSH_PORT: u16 = 2232;
+/// Loopback bind for SSH forwarding and VNC. Single source of truth:
+/// every connect, message, and fallback below references this — never a
+/// literal (the VNC `-display` spec string is the one exception: QEMU
+/// syntax, kept in sync by the `vnc_display_matches_host` test).
+pub const PROVEN_SSH_HOST: &str = "127.0.0.1";
+/// Endpoint locations moved to `ipc` (per-VM-dir, never `/tmp`): file
+/// names are [`crate::ipc::MON_SOCK_NAME`] etc., resolved with
+/// [`crate::ipc::vm_endpoint`].
+// QEMU VNC `host:DISPLAY` takes a display NUMBER, not a TCP port:
+// TCP port = 5900 + display, so :10 listens on 5910 (matches vnc_url()
+// below and every netstat we ever captured).
+pub const PROVEN_VNC_DISPLAY: &str = "vnc=127.0.0.1:10,password=on";
+/// Classic VNC caps passwords at 8 chars.
+pub const PROVEN_VNC_PASSWORD: &str = "demo2026";
+
+/// Guest machine type per arch — one source of truth for install and run.
+///
+/// The machine type is part of the proven topology: OVMF's NVRAM (VARS.fd)
+/// records Boot#### device paths against the PCI layout of the machine it
+/// was written on, and those entries are *not* portable across machine
+/// types. Observed live: a q35-written VARS booted on the default `pc`
+/// (i440fx) hung OVMF before console init — "Guest has not initialized the
+/// display (yet)" forever, zero disk writes, SSH deadline — while the same
+/// disk+VARS booted fine on q35. Install writes VARS on q35, so run must
+/// boot q35. Never let the two argv builders drift apart again.
+pub fn machine_for(arch: Architecture) -> &'static str {
+    match arch {
+        Architecture::Amd64 => "q35",
+        Architecture::Arm64 => "virt",
+    }
+}
+
+/// `vnc=127.0.0.1:10,...` → `vnc://127.0.0.1:5910` (port 5900+N).
+/// Returns None for non-VNC displays. The printed URL always matches
+/// the actual display spec — never a hardcoded port.
+pub fn vnc_url(display: &str) -> Option<String> {
+    let spec = display.strip_prefix("vnc=")?;
+    let addr = spec.split(',').next()?;
+    let (host, disp) = addr.rsplit_once(':')?;
+    let n: u16 = disp.parse().ok()?;
+    let host = if host.is_empty() {
+        PROVEN_SSH_HOST
+    } else {
+        host
+    };
+    Some(format!("vnc://{host}:{}", 5900 + n))
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +80,10 @@ pub struct HeadlessVmBuilder {
     pub display: String,
     pub monitor_socket: String,
     pub qmp_socket: String,
+    /// Guest serial log path (per-VM, next to the disk — never `/tmp`).
+    /// Re-resolved by [`HeadlessVmBuilder::workdir`]; set explicitly only
+    /// after `workdir()`.
+    pub serial_log: String,
     pub unattend_dir: PathBuf,
     pub workdir: PathBuf,
     /// Portable tree root (the extracted `qemu-portable` dir holding
@@ -45,12 +103,22 @@ impl HeadlessVmBuilder {
             disk_size_gb: 64,
             memory_mb: 4096,
             smp_cores: 4,
-            ssh_host: "127.0.0.1".to_string(),
-            ssh_port: 2222,
-            display: "none".to_string(),
-            monitor_socket: "/tmp/qemu-monitor.sock".to_string(),
-            qmp_socket: "/tmp/qemu-qmp.sock".to_string(),
-            unattend_dir: PathBuf::from("./unattend_dir"),
+            ssh_host: PROVEN_SSH_HOST.to_string(),
+            ssh_port: PROVEN_SSH_PORT,
+            display: PROVEN_VNC_DISPLAY.to_string(),
+            monitor_socket: crate::ipc::vm_endpoint(
+                std::path::Path::new("."),
+                crate::ipc::MON_SOCK_NAME,
+            ),
+            qmp_socket: crate::ipc::vm_endpoint(
+                std::path::Path::new("."),
+                crate::ipc::QMP_SOCK_NAME,
+            ),
+            serial_log: crate::ipc::vm_endpoint(
+                std::path::Path::new("."),
+                crate::ipc::SERIAL_LOG_NAME,
+            ),
+            unattend_dir: PathBuf::from(crate::paths::FALLBACK_UNATTEND_DIR),
             workdir: PathBuf::from("."),
             qemu_dir: None,
         }
@@ -121,12 +189,25 @@ impl HeadlessVmBuilder {
     }
     /// Working dir anchor for per-VM state (defaults to `.`).
     pub fn workdir(mut self, d: PathBuf) -> Self {
+        // Endpoints follow the VM dir (per-VM sockets, never /tmp):
+        // explicit socket setters apply after workdir(), not before.
+        self.monitor_socket = crate::ipc::vm_endpoint(&d, crate::ipc::MON_SOCK_NAME);
+        self.qmp_socket = crate::ipc::vm_endpoint(&d, crate::ipc::QMP_SOCK_NAME);
+        self.serial_log = crate::ipc::vm_endpoint(&d, crate::ipc::SERIAL_LOG_NAME);
         self.workdir = d;
         self
     }
 
     fn accel(&self) -> &'static str {
         auto_detect_platform().1
+    }
+
+    /// CPU model matching the accelerator: `host` passthrough on hardware
+    /// accel (required for Windows 11 setup CPU checks to see something
+    /// modern), `max` under TCG (the `virt` default is too old for Windows
+    /// 11 ARM64, and `-cpu host` needs KVM/HVF to mean anything).
+    fn cpu_model(&self) -> &'static str {
+        if self.accel() == "tcg" { "max" } else { "host" }
     }
 
     /// UEFI firmware for this guest arch: read-only CODE plus a writable
@@ -136,13 +217,7 @@ impl HeadlessVmBuilder {
     /// NVRAM boot variables, and Setup needs them to persist across its
     /// mid-install reboots.
     pub fn firmware(&self) -> Option<(PathBuf, PathBuf)> {
-        let (code_names, vars_names): (&[&str], &[&str]) = match self.config.arch {
-            Architecture::Amd64 => (
-                &["edk2-x86_64-code.fd", "OVMF_CODE.fd"],
-                &["edk2-i386-vars.fd", "OVMF_VARS.fd"],
-            ),
-            Architecture::Arm64 => (&["edk2-aarch64-code.fd"], &["edk2-arm-vars.fd"]),
-        };
+        let (code_names, vars_names) = self.config.arch.firmware_names();
         let q = self.qemu_dir.as_ref()?;
         let dir = q.join("share/qemu");
         let code = code_names
@@ -160,29 +235,51 @@ impl HeadlessVmBuilder {
     /// Seeded once from the portable template; never shared between VMs
     /// (locking collisions) and never written back to the template.
     pub fn vars_file(&self) -> PathBuf {
-        self.workdir.join("VARS.fd")
+        self.workdir.join(crate::paths::VARS_FILE)
     }
 
-    /// Seed the private VARS copy if absent. Must run before argv build.
-    pub fn ensure_vars(&self) -> Result<PathBuf> {
+    /// Copy the firmware VARS template into the private NVRAM file. Must
+    /// run before argv build (the pflash arg names the file).
+    ///
+    /// `refresh == true` (install / ISO-boot flows): always overwrite, so
+    /// OVMF starts with clean NVRAM — a reused VARS carries phantom boot
+    /// entries that shadow `-boot d` and prevent ISO boot
+    /// (`BlInitializeLibrary 0xc00000bb`).
+    ///
+    /// `refresh == false` (steady-state boot): seed only when absent, so
+    /// the firmware state the guest wrote last boot (BootOrder, BootNext,
+    /// policy) survives — this is the proven macOS behavior.
+    fn seed_vars(&self, refresh: bool) -> Result<PathBuf> {
         let (_, template) = self.firmware().context("missing UEFI firmware")?;
         let dest = self.vars_file();
-        if !dest.exists() {
-            if let Some(parent) = dest.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("mkdir {}", parent.display()))?;
-            }
-            std::fs::copy(&template, &dest).with_context(|| {
-                format!(
-                    "copy VARS template {} -> {}",
-                    template.display(),
-                    dest.display()
-                )
-            })?;
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
         }
+        if !refresh && dest.exists() {
+            return Ok(dest);
+        }
+        std::fs::copy(&template, &dest).with_context(|| {
+            format!(
+                "copy VARS template {} -> {}",
+                template.display(),
+                dest.display()
+            )
+        })?;
         Ok(dest)
+    }
+
+    /// Fresh NVRAM for an install or an ISO boot: overwrite every time.
+    pub fn refresh_vars(&self) -> Result<PathBuf> {
+        self.seed_vars(true)
+    }
+
+    /// Steady-state boot: overwrite only when no VARS exists yet, keeping
+    /// the guest's own firmware state across boots.
+    pub fn seed_vars_if_absent(&self) -> Result<PathBuf> {
+        self.seed_vars(false)
     }
 
     /// `qemu-system-*` binary: portable tree's when `qemu_dir` is set,
@@ -190,7 +287,7 @@ impl HeadlessVmBuilder {
     pub fn system_bin(&self) -> String {
         match &self.qemu_dir {
             Some(d) => d
-                .join("bin")
+                .join(crate::paths::PORTABLE_BIN_DIR)
                 .join(self.config.arch.qemu_binary())
                 .to_string_lossy()
                 .into_owned(),
@@ -201,8 +298,10 @@ impl HeadlessVmBuilder {
     /// `qemu-img` binary: portable tree's when `qemu_dir` is set, else PATH.
     pub fn img_bin(&self) -> PathBuf {
         match &self.qemu_dir {
-            Some(d) => d.join("bin/qemu-img"),
-            None => PathBuf::from("qemu-img"),
+            Some(d) => d
+                .join(crate::paths::PORTABLE_BIN_DIR)
+                .join(crate::paths::QEMU_IMG_NAME),
+            None => PathBuf::from(crate::paths::QEMU_IMG_NAME),
         }
     }
 
@@ -269,22 +368,18 @@ impl HeadlessVmBuilder {
             self.accel().into(),
             "-m".into(),
             self.memory_mb.to_string(),
+            "-cpu".into(),
+            self.cpu_model().into(),
         ];
-        // Host CPU passthrough on hardware accel (required for Windows 11
-        // setup CPU checks to see something modern; TCG keeps the default).
-        if self.accel() != "tcg" {
-            a.push("-cpu".into());
-            a.push("host".into());
-        }
-        // qemu-system-aarch64 has no default machine (x86 defaults to pc).
-        if self.config.arch == Architecture::Arm64 {
-            a.push("-M".into());
-            a.push("virt".into());
-        }
+        // Explicit machine on every arch (machine_for): the topology must
+        // be the one NVRAM was written on — see `machine_for`.
+        a.push("-M".into());
+        a.push(machine_for(self.config.arch).into());
         a.push("-smp".into());
         a.push(self.smp_cores.to_string());
         // UEFI firmware as two pflash drives: read-only CODE + the VM's
-        // private writable VARS (seeded by ensure_vars before argv build).
+        // private writable VARS (seeded before argv build — `refresh_vars`
+        // for install/ISO boots, `seed_vars_if_absent` for plain boots).
         // Never `-bios`: the Windows bootloader writes NVRAM boot
         // variables and Setup needs them to persist across its reboots.
         if let Some((fw_code, _)) = self.firmware() {
@@ -330,19 +425,16 @@ impl HeadlessVmBuilder {
         }
         a.extend(self.answer_drive_args(unattend_iso));
         // Guest serial log (EDK2 shouts here on `virt`): the only record
-        // when the framebuffer is dark.
+        // when the framebuffer is dark. Same path as the proven install.
         a.push("-serial".into());
-        a.push(format!(
-            "file:{}",
-            self.workdir.join("serial.log").display()
-        ));
+        a.push(format!("file:{}", self.serial_log));
         a.extend(self.net_args());
         a.push("-display".into());
         a.push(self.display.clone());
         a.push("-monitor".into());
-        a.push(format!("unix:{},server,nowait", self.monitor_socket));
+        a.push(crate::ipc::qemu_arg(&self.monitor_socket));
         a.push("-qmp".into());
-        a.push(format!("unix:{},server,nowait", self.qmp_socket));
+        a.push(crate::ipc::qemu_arg(&self.qmp_socket));
         a
     }
 
@@ -354,15 +446,13 @@ impl HeadlessVmBuilder {
             self.accel().into(),
             "-m".into(),
             self.memory_mb.to_string(),
+            "-cpu".into(),
+            self.cpu_model().into(),
         ];
-        if self.accel() != "tcg" {
-            a.push("-cpu".into());
-            a.push("host".into());
-        }
-        if self.config.arch == Architecture::Arm64 {
-            a.push("-M".into());
-            a.push("virt".into());
-        }
+        // Explicit machine on every arch (machine_for): run must boot the
+        // exact topology install wrote NVRAM on — see `machine_for`.
+        a.push("-M".into());
+        a.push(machine_for(self.config.arch).into());
         a.push("-smp".into());
         a.push(self.smp_cores.to_string());
         if let Some((fw_code, _)) = self.firmware() {
@@ -389,20 +479,24 @@ impl HeadlessVmBuilder {
             a.push("-device".into());
             a.push("ramfb".into());
         }
+        // The installed system lives on NVMe (the proven install topology):
+        // boot it on the identical controller + serial so Windows sees the
+        // same device it was installed on — not a controller change plus a
+        // minutes-long PnP re-enumeration. stornvme is inbox, so this also
+        // boots disks from the legacy virtio install flow.
         a.push("-drive".into());
-        a.push(format!("file={disk},format=qcow2,if=virtio"));
+        a.push(format!("file={disk},format=qcow2,if=none,id=tgt"));
+        a.push("-device".into());
+        a.push("nvme,drive=tgt,serial=nvme1,bootindex=0".into());
         a.extend(self.net_args());
         a.push("-display".into());
         a.push(self.display.clone());
         a.push("-serial".into());
-        a.push(format!(
-            "file:{}",
-            self.workdir.join("serial.log").display()
-        ));
+        a.push(format!("file:{}", self.serial_log));
         a.push("-monitor".into());
-        a.push(format!("unix:{},server,nowait", self.monitor_socket));
+        a.push(crate::ipc::qemu_arg(&self.monitor_socket));
         a.push("-qmp".into());
-        a.push(format!("unix:{},server,nowait", self.qmp_socket));
+        a.push(crate::ipc::qemu_arg(&self.qmp_socket));
         a
     }
 
@@ -428,12 +522,28 @@ impl HeadlessVmBuilder {
         let (bin, args) = argv.split_first().context("empty argv")?;
         // Never orphan: if the owner drops this handle (CLI exit, panic,
         // task cancel), the guest dies with it. There is no detach path.
-        Command::new(bin)
-            .args(args)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn {bin}"))
+        let mut cmd = Command::new(bin);
+        cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
+        // Own process group (Unix): a tty Ctrl-C broadcasts SIGINT to the
+        // whole foreground group. Without this, QEMU dies by signal on
+        // every Ctrl-C — bypassing graceful shutdown and risking dirty
+        // NTFS (observed live: "terminating on signal 2", then QMP gone).
+        // Only the CLI receives the keystroke; the guest exits via ACPI.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        // Same isolation on Windows: console Ctrl-C reaches every process
+        // attached to the console. CREATE_NEW_PROCESS_GROUP detaches QEMU
+        // (Ctrl-Break still would, which nobody sends by accident).
+        #[cfg(windows)]
+        {
+            /// Win32 `CREATE_NEW_PROCESS_GROUP` (no winapi dep for one flag;
+            /// tokio's `Command` carries `creation_flags` itself).
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        cmd.spawn().with_context(|| format!("spawn {bin}"))
     }
 
     /// Give QEMU a few seconds to reject bad argv, then fail fast instead
@@ -441,10 +551,16 @@ impl HeadlessVmBuilder {
     /// boot is still starting at this point, so a live child means success.
     async fn spawn_guarded(argv: &[String]) -> Result<Child> {
         let mut child = Self::spawn(argv).await?;
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        eprintln!(
+            "QEMU spawned (pid {:?}); waiting {} s ...",
+            child.id(),
+            timeouts::SPAWN_GUARD.as_secs()
+        );
+        tokio::time::sleep(timeouts::SPAWN_GUARD).await;
         match child.try_wait().context("poll qemu process")? {
             Some(status) => anyhow::bail!(
-                "QEMU exited immediately (status {status}); check its stderr above for the rejected flag"
+                "QEMU (pid {:?}) exited immediately (status {status}); check its stderr above for the rejected flag",
+                child.id(),
             ),
             None => Ok(child),
         }
@@ -454,7 +570,7 @@ impl HeadlessVmBuilder {
     /// Lets the CLI refuse double-starts and shut down cleanly instead of
     /// orphaning QEMU when the operator's shell exits.
     pub fn pidfile(&self) -> std::path::PathBuf {
-        self.workdir.join("qemu.pid")
+        self.workdir.join(crate::paths::QEMU_PIDFILE)
     }
 
     fn write_pidfile(&self, child: &Child) -> Result<()> {
@@ -469,15 +585,17 @@ impl HeadlessVmBuilder {
     /// Only unlinks when nothing is listening (live VM → keep, caller
     /// preflights that case separately). Without this QEMU's bind fails
     /// on the leftover file even though no process holds the port.
-    fn clear_stale_sockets(&self) {
+    async fn clear_stale_sockets(&self) {
         for sock in [&self.monitor_socket, &self.qmp_socket] {
-            if !qmp_alive(sock) {
-                let _ = std::fs::remove_file(sock);
+            // Never unlink a live endpoint (a running VM's socket): only
+            // stale files go. Named pipes aren't fs entries (no-op there).
+            if !crate::ipc::endpoint_alive(sock).await {
+                crate::ipc::stale_remove(sock);
             }
         }
     }
 
-    /// Full install flow: render XML → stage vvfat → seed VARS → create
+    /// Full install flow: render XML → stage vvfat → refresh VARS → create
     /// base → launch. Uses the portable `qemu-img` when `qemu_dir` is set.
     pub async fn build_and_start(
         self,
@@ -488,14 +606,15 @@ impl HeadlessVmBuilder {
         self.require_firmware()?;
         let xml = self.config.generate_unattend_xml();
         DiskManager::ensure_unattend_dir(&self.unattend_dir, &xml)?;
-        self.ensure_vars()?;
+        // Clean NVRAM: stale boot entries would shadow `-boot d`.
+        self.refresh_vars()?;
         DiskManager::create_base(
             &self.img_bin(),
             std::path::Path::new(disk),
             self.disk_size_gb,
         )
         .await?;
-        self.clear_stale_sockets();
+        self.clear_stale_sockets().await;
         let argv = self.install_argv(disk, win_iso, virtio_iso, None);
         let child = Self::spawn_guarded(&argv).await?;
         self.write_pidfile(&child)?;
@@ -509,10 +628,48 @@ impl HeadlessVmBuilder {
     /// Boot an existing (overlay) disk without install media.
     pub async fn boot_existing(self, disk: &str) -> Result<HeadlessVm> {
         self.require_firmware()?;
-        self.ensure_vars()?;
-        self.clear_stale_sockets();
+        // Keep the guest's NVRAM across boots (seed only when absent):
+        // nothing here shadows a boot device, and the guest's own
+        // BootOrder/BootNext must survive (proven macOS behavior).
+        self.seed_vars_if_absent()?;
+        self.clear_stale_sockets().await;
         let argv = self.boot_argv(disk);
-        let child = Self::spawn_guarded(&argv).await?;
+        let mut child = Self::spawn_guarded(&argv).await?;
+        // Same slow-start race as the install path (hvf startup >3 s): poll
+        // for the monitor socket FILE (bind = starting), bail only on death
+        // or timeout — never on a live child, or kill_on_drop destroys the
+        // evidence. Deliberately no connect-probe here: QEMU's listen
+        // backlog is a single slot and a probe occupies it, refusing the
+        // real VNC handshake that follows (observed ECONNREFUSED on live
+        // QEMU). The handshake itself retries (see install path).
+        // Total wait = the declared budget, split into polls of
+        // MONITOR_SOCKET_POLL_SECS (so changing either const keeps the
+        // message and the loop in agreement).
+        let polls = timeouts::MONITOR_SOCKET_WAIT_SECS / timeouts::MONITOR_SOCKET_POLL_SECS.max(1);
+        for _ in 0..polls {
+            if std::path::Path::new(&self.monitor_socket).exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait().context("poll qemu process")? {
+                anyhow::bail!(
+                    "QEMU (pid {:?}) exited during startup (status {status}); check its stderr above for the rejected flag",
+                    child.id(),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                timeouts::MONITOR_SOCKET_POLL_SECS,
+            ))
+            .await;
+        }
+        if !std::path::Path::new(&self.monitor_socket).exists() {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "QEMU (pid {:?}) alive but no monitor socket at {} after {} s; killed it",
+                child.id(),
+                self.monitor_socket,
+                timeouts::MONITOR_SOCKET_WAIT_SECS
+            );
+        }
         self.write_pidfile(&child)?;
         Ok(HeadlessVm {
             builder: self,
@@ -522,11 +679,9 @@ impl HeadlessVmBuilder {
     }
 }
 
-/// True when something accepts on the QMP socket (i.e. our QEMU is alive).
-/// A stale socket file with no listener refuses → not alive.
-pub fn qmp_alive(socket: &str) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
-}
+/// Re-exported transport check (lives in `ipc`; kept here so existing
+/// `qemu::qmp_alive` import paths don't churn).
+pub use crate::ipc::qmp_alive;
 
 pub struct HeadlessVm {
     pub builder: HeadlessVmBuilder,
@@ -581,8 +736,16 @@ impl HeadlessVm {
     /// process to exit, SIGKILL fallback with a warning. Dropping the VM
     /// without this still kills QEMU via `kill_on_drop` — just dirtier.
     pub async fn shutdown_graceful(&mut self, timeout: std::time::Duration) -> Result<()> {
-        if let Ok(mut q) = self.qmp().await {
-            let _ = q.powerdown().await;
+        // Powerdown errors are LOUD, never swallowed: a guest that never
+        // got the message makes the whole timeout expire feeling hung
+        // (observed live). Failure here still falls through to the wait
+        // (the guest may already be exiting) but the log says so.
+        match self.qmp().await {
+            Ok(mut q) => match q.powerdown().await {
+                Ok(_) => eprintln!("ACPI powerdown sent; waiting for guest exit ..."),
+                Err(e) => eprintln!("warning: powerdown send failed ({e:#}); waiting anyway ..."),
+            },
+            Err(e) => eprintln!("warning: no QMP for powerdown ({e:#}); waiting anyway ..."),
         }
         match tokio::time::timeout(timeout, self.child.wait()).await {
             Ok(_) => Ok(()),
@@ -605,6 +768,16 @@ impl HeadlessVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vnc_display_matches_host() {
+        // PROVEN_VNC_DISPLAY is QEMU syntax (can't concat! a const into
+        // it), so this test keeps its bind address glued to PROVEN_SSH_HOST.
+        let spec = PROVEN_VNC_DISPLAY.strip_prefix("vnc=").unwrap();
+        let addr = spec.split(',').next().unwrap();
+        let (host, _) = addr.rsplit_once(':').unwrap();
+        assert_eq!(host, PROVEN_SSH_HOST);
+    }
 
     #[test]
     fn vvfat_never_virtio() {
@@ -673,6 +846,17 @@ mod tests {
         let argv = b.boot_argv("overlay.qcow2");
         assert!(!argv.iter().any(|a| a.starts_with("file=fat:")));
         assert!(!argv.iter().any(|a| a.contains("media=cdrom")));
+        // Installed on NVMe, booted on NVMe: same controller + serial as
+        // the proven install, never a virtio-blk surprise.
+        assert!(
+            argv.iter()
+                .any(|a| a == "nvme,drive=tgt,serial=nvme1,bootindex=0")
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains(".qcow2") && a.contains("if=virtio"))
+        );
     }
 
     #[test]
@@ -696,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn arm64_gets_virt_machine_x86_does_not() {
+    fn machine_type_is_pinned_on_both_arches() {
         // Shared NIC shape (incl. romfile= PXE-ROM suppression) on both.
         for b in [
             HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval),
@@ -717,13 +901,17 @@ mod tests {
             let pos = argv.iter().position(|a| a == "-M").expect("-M present");
             assert_eq!(argv[pos + 1], "virt");
         }
+        // x86 pins q35 — the exact topology install wrote NVRAM on
+        // (default `pc` + q35-written VARS hangs OVMF, machine_for).
         let x86 =
             HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Amd64);
-        assert!(
-            !x86.install_argv("d.qcow2", "w.iso", "v.iso", None)
-                .iter()
-                .any(|a| a == "-M")
-        );
+        for argv in [
+            x86.install_argv("d.qcow2", "w.iso", "v.iso", None),
+            x86.boot_argv("d.qcow2"),
+        ] {
+            let pos = argv.iter().position(|a| a == "-M").expect("-M present");
+            assert_eq!(argv[pos + 1], "q35");
+        }
     }
 
     #[test]
@@ -749,13 +937,18 @@ mod tests {
         assert_eq!(vars, fw_dir.join("edk2-arm-vars.fd"));
         assert!(p.require_firmware().is_ok());
 
-        // VARS seeding: copies template once, keeps the private copy after.
-        let seeded = p.ensure_vars().unwrap();
+        // VARS seeding: steady-state keeps guest NVRAM, install refreshes.
+        let seeded = p.seed_vars_if_absent().unwrap();
         assert_eq!(seeded, tmp.path().join("vm/VARS.fd"));
         assert_eq!(std::fs::read(&seeded).unwrap(), b"fake-vars");
         std::fs::write(&seeded, b"guest-modified").unwrap();
-        assert_eq!(p.ensure_vars().unwrap(), seeded);
+        // Seed-once: a second call leaves the guest's firmware state alone.
+        assert_eq!(p.seed_vars_if_absent().unwrap(), seeded);
         assert_eq!(std::fs::read(&seeded).unwrap(), b"guest-modified");
+        // Install / ISO boot: fresh template every time (stale boot entries
+        // would shadow `-boot d`).
+        assert_eq!(p.refresh_vars().unwrap(), seeded);
+        assert_eq!(std::fs::read(&seeded).unwrap(), b"fake-vars");
 
         // pflash pair in argv, no -bios anywhere.
         let argv = p.install_argv("d.qcow2", "w.iso", "v.iso", None);

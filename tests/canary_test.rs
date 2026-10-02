@@ -1,7 +1,6 @@
 //! Weekly canary: latest Eval ISO, fail fast with a framebuffer screenshot.
 //! Ignored unless `LATEST_WIN11_ISO` is set (i.e. only runs in canary CI).
-use std::time::Duration;
-use windows_headless::{HeadlessVmBuilder, WindowsVersion};
+use windows_headless::{HeadlessVmBuilder, WindowsVersion, timeouts};
 
 #[tokio::test]
 #[ignore]
@@ -16,8 +15,8 @@ async fn test_latest_windows_headless_pipeline() {
         .unwrap();
 
     let ssh = tokio::time::timeout(
-        Duration::from_secs(25 * 60),
-        vm.wait_for_ssh(Duration::from_secs(25 * 60)),
+        timeouts::CANARY_SSH_DEADLINE,
+        vm.wait_for_ssh(timeouts::CANARY_SSH_DEADLINE),
     )
     .await;
     if ssh.is_err() || ssh.unwrap().is_err() {

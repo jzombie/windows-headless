@@ -7,14 +7,291 @@
 //! paths and QEMU finds `share/qemu` (OVMF firmware) relative to the
 //! executable, so the tree works from any CWD with no env vars.
 use anyhow::{Context, Result};
-use cache_manager::CacheRoot;
 use std::env::consts;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-pub const REPO_API_LATEST: &str =
-    "https://api.github.com/repos/jzombie/lab-qemu-portable/releases/latest";
 const UA: &str = "windows-headless/0.1";
+
+/// Env var granting explicit consent to strip `com.apple.quarantine` off the
+/// extracted portable trees on macOS. Absent/false = fail closed.
+pub const ALLOW_QUARANTINE_STRIP_ENV: &str = "WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP";
+
+/// Quarantine attribute stripped off the extracted trees. Single source of
+/// truth for the `xattr` invocation, log lines, and the manual remediation
+/// shown to users — never a second literal copy.
+pub const QUARANTINE_ATTR: &str = "com.apple.quarantine";
+
+/// Binary invoked to clear [`QUARANTINE_ATTR`]. Same single-source rule.
+#[cfg(target_os = "macos")]
+const XATTR_BIN: &str = "xattr";
+
+/// Shell equivalent of the automatic strip, for error messages and logs.
+#[cfg(target_os = "macos")]
+fn quarantine_strip_cmdline(dir: &Path) -> String {
+    format!("{XATTR_BIN} -dr {QUARANTINE_ATTR} \"{}\"", dir.display())
+}
+
+/// Fail-closed Gatekeeper error: `kind` is `"QEMU"` or `"wimlib"`.
+#[cfg(target_os = "macos")]
+fn quarantine_gate_error(dir: &Path, kind: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        r#"macOS Gatekeeper will block the adhoc-signed {kind} binaries.
+
+Execution halted before downloading anything.
+
+To permit automatic stripping of {QUARANTINE_ATTR} from the cache dir, set:
+
+  {ALLOW_QUARANTINE_STRIP_ENV}=1
+
+Or strip it yourself:
+
+  {manual_cmd}"#,
+        manual_cmd = quarantine_strip_cmdline(dir),
+    )
+}
+
+/// Env var granting explicit consent to skip SHA-256 verification when a
+/// release ships no `SHA256SUMS.txt` (or no entry for our asset). Absent/false
+/// = fail closed. Mirrored by the `--allow-unverified` CLI flags.
+pub const ALLOW_UNVERIFIED_ENV: &str = "WINDOWS_HEADLESS_ALLOW_UNVERIFIED";
+
+/// Monotonic suffix making staging dir names unique per attempt (not just per
+/// pid): guard cleanup is async fire-and-forget, so a same-process retry must
+/// never reuse a name whose deletion is still in flight.
+static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sole quarantine authorization boundary: true iff the operator explicitly
+/// consented. Checked by `ensure()`/`ensure_wimlib()` BEFORE any download.
+/// Both call sites are macOS-only; allowed-dead elsewhere so the truth-table
+/// test keeps running on Linux CI.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quarantine_strip_allowed() -> bool {
+    // Bound first: do NOT chain a temporary String into the macro scrutinee.
+    let opt_in = std::env::var(ALLOW_QUARANTINE_STRIP_ENV)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(opt_in.as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Verification escape hatch: explicit CLI flag wins, else the env var.
+fn unverified_allowed(explicit: bool) -> bool {
+    if explicit {
+        return true;
+    }
+    let v = std::env::var(ALLOW_UNVERIFIED_ENV)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Owns a staging dir; removes it on drop unless committed. The removal is
+/// offloaded off the async worker: a QEMU tree is thousands of files and a
+/// synchronous `remove_dir_all` in `Drop` would stall the executor.
+/// `Drop` probes `Handle::try_current()` first — `spawn_blocking` panics
+/// outside a live reactor (notably runtime teardown under SIGINT/SIGTERM),
+/// and a panic in `Drop` aborts the process — falling back to a detached
+/// `std::thread` when no reactor is available. Fire-and-forget either way:
+/// safe because staging names are unique per attempt, so an in-flight
+/// deletion can never collide with a retry.
+struct StagingGuard {
+    path: Option<PathBuf>,
+}
+
+impl StagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_ref().expect("guard used after commit")
+    }
+
+    /// Consume without deleting (call after the atomic rename succeeds).
+    /// If `dest` already existed (lost rename race), call `discard()` instead.
+    fn commit(mut self) {
+        self.path = None;
+    }
+
+    /// Disarm by doing nothing: dropping `self` runs the `Drop` cleanup.
+    /// (No manual deletion here — that would duplicate the `Drop` path and rot.)
+    fn discard(self) {}
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            // `spawn_blocking` panics outside a live reactor (e.g. runtime
+            // teardown under SIGINT/SIGTERM) — and a panic in `Drop` aborts the
+            // process. Probe first; fall back to a detached OS thread.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&p);
+                });
+            } else {
+                std::thread::spawn(move || {
+                    let _ = std::fs::remove_dir_all(&p);
+                });
+            }
+        }
+    }
+}
+
+/// Apply the quarantine strip to an already-authorized tree. No auth check, no
+/// bail: authorization was proven by `quarantine_strip_allowed()` pre-fetch.
+/// Async: `xattr` runs via `tokio::process::Command` so the executor yields
+/// while the subprocess exits (a blocking `std::process::Command` here would
+/// stall the Tokio worker). A swallowed `Result` would reintroduce the silent
+/// path (extract succeeds, OS kills QEMU later with no explanation) — always
+/// propagate with `.await?`.
+async fn strip_quarantine(dir: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        tracing::info!(
+            "quarantine: stripping {QUARANTINE_ATTR} on {} \
+             (explicitly authorized via {ALLOW_QUARANTINE_STRIP_ENV})",
+            dir.display()
+        );
+
+        match tokio::process::Command::new(XATTR_BIN)
+            .arg("-dr")
+            .arg(QUARANTINE_ATTR)
+            .arg(dir)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::warn!(
+                "quarantine: `{}` failed: {}",
+                quarantine_strip_cmdline(dir),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => tracing::warn!("quarantine: could not run `{XATTR_BIN}`: {e:#}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+    }
+
+    Ok(())
+}
+
+/// Fail-closed verification of `archive_path` against the release
+/// `SHA256SUMS.txt`. Missing sums sheet or missing entry bails unless the
+/// operator explicitly opted into unverified downloads. On hash mismatch the
+/// corrupt archive is removed before returning the error. The sums sheet
+/// itself is always removed (it is staging litter, never cache).
+///
+/// `expected_pin`: when `Some` (pinned tag + known platform), the sums-file
+/// hash must additionally equal the code-pinned hash — this is what defeats a
+/// release-infrastructure compromise that forges sums and archive together.
+/// `None` for explicit test tags (bytes legitimately differ from the pin).
+async fn verify_archive_against_sums(
+    assets: &[(String, String)],
+    asset_name: &str,
+    archive_path: &Path,
+    base: &Path,
+    allow_unverified: bool,
+    expected_pin: Option<&str>,
+) -> Result<()> {
+    let sums_url = assets
+        .iter()
+        .find(|(n, _)| n == crate::paths::SHA256SUMS_FILE)
+        .map(|(_, u)| u.clone());
+    let Some(sums_url) = sums_url else {
+        if unverified_allowed(allow_unverified) {
+            tracing::warn!(
+                "{asset_name}: no {} in release; proceeding unverified (explicitly allowed via {ALLOW_UNVERIFIED_ENV} or --allow-unverified)",
+                crate::paths::SHA256SUMS_FILE
+            );
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(archive_path);
+        anyhow::bail!(
+            "{asset_name}: release ships no {sums} — refusing unverified download. \
+             Set {ALLOW_UNVERIFIED_ENV}=1 or pass --allow-unverified to proceed anyway (not recommended)",
+            sums = crate::paths::SHA256SUMS_FILE
+        );
+    };
+    let sums_path = base.join(format!("{}.download", crate::paths::SHA256SUMS_FILE));
+    fetch_to(&sums_url, &sums_path).await?;
+    let body = std::fs::read_to_string(&sums_path)?;
+    let _ = std::fs::remove_file(&sums_path);
+    match parse_sums(&body, asset_name) {
+        Some(expected) => {
+            let actual = crate::downloader::sha256_of(archive_path).await?;
+            if !actual.eq_ignore_ascii_case(&expected) {
+                let _ = std::fs::remove_file(archive_path);
+                anyhow::bail!(
+                    "SHA-256 mismatch for {asset_name}: expected {expected}, got {actual}"
+                );
+            }
+            if let Some(pin) = expected_pin
+                && !expected.eq_ignore_ascii_case(pin)
+            {
+                let _ = std::fs::remove_file(archive_path);
+                anyhow::bail!(
+                    "SHA-256 sums entry for {asset_name} does not match the pinned hash \
+                     (expected pin {pin}, release sums say {expected}): refusing possibly \
+                     compromised release asset"
+                );
+            }
+            Ok(())
+        }
+        None => {
+            if unverified_allowed(allow_unverified) {
+                tracing::warn!(
+                    "{asset_name} not listed in {}; proceeding unverified (explicitly allowed)",
+                    crate::paths::SHA256SUMS_FILE
+                );
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(archive_path);
+            anyhow::bail!(
+                "{asset_name} not listed in {} — refusing unverified download. \
+                 Set {ALLOW_UNVERIFIED_ENV}=1 or pass --allow-unverified to proceed anyway (not recommended)",
+                crate::paths::SHA256SUMS_FILE
+            );
+        }
+    }
+}
+
+/// Publish a staged tree: atomic rename staging → dest. If `dest` already
+/// holds a sentinel-verified tree (a concurrent process won the race), discard
+/// staging and use the winner's tree. A `dest` WITHOUT the sentinel is never
+/// a good tree, so it is removed before rename — never a verified one.
+fn publish_staged(
+    staging: StagingGuard,
+    dest: &Path,
+    sentinel: &Path,
+    inner: &str,
+) -> Result<PathBuf> {
+    if sentinel.is_file() {
+        // Winner already published (or a previous good run); our staging is spare.
+        staging.discard();
+        return Ok(dest.join(inner));
+    }
+    // dest is either absent, empty (created by ensure_dir), or stale without a
+    // sentinel — none of which is a usable tree. Clear it for the rename.
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    match std::fs::rename(staging.path(), dest) {
+        Ok(()) => {
+            staging.commit();
+            Ok(dest.join(inner))
+        }
+        Err(e) => {
+            // Lost the race between our check and rename: re-check the winner.
+            if sentinel.is_file() {
+                staging.discard();
+                return Ok(dest.join(inner));
+            }
+            anyhow::bail!("rename staging to {} failed: {e:#}", dest.display());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AssetKind {
@@ -23,7 +300,8 @@ enum AssetKind {
 }
 
 /// A provisioned portable QEMU tree. `root` is the extracted `qemu-portable`
-/// dir (the one containing `bin/`, `lib/`, `share/`).
+/// dir (the one containing `bin/`, `lib/`, `share/`); `version` is the
+/// full release tag (`qemu-v11.1.1-57`), never a bare version.
 #[derive(Debug, Clone)]
 pub struct PortableQemu {
     pub root: PathBuf,
@@ -32,7 +310,9 @@ pub struct PortableQemu {
 
 impl PortableQemu {
     pub fn qemu_img(&self) -> PathBuf {
-        self.root.join("bin/qemu-img")
+        self.root
+            .join(crate::paths::PORTABLE_BIN_DIR)
+            .join(crate::paths::QEMU_IMG_NAME)
     }
 
     pub fn qemu_system(&self, binary: &str) -> PathBuf {
@@ -62,24 +342,52 @@ impl PortableQemu {
 /// QEMU instead.
 fn asset_for_host() -> Result<(&'static str, AssetKind)> {
     match (consts::OS, consts::ARCH) {
-        ("macos", "aarch64") => Ok(("macos-arm64", AssetKind::TarGz)),
-        ("linux", "x86_64") => Ok(("linux-x86_64", AssetKind::TarXz)),
-        ("linux", "aarch64") => Ok(("linux-aarch64", AssetKind::TarXz)),
+        ("macos", "aarch64") => Ok((crate::paths::MARKER_MACOS_ARM64, AssetKind::TarGz)),
+        ("linux", "x86_64") => Ok((crate::paths::MARKER_LINUX_X86_64, AssetKind::TarXz)),
+        ("linux", "aarch64") => Ok((crate::paths::MARKER_LINUX_AARCH64, AssetKind::TarXz)),
         (os, arch) => anyhow::bail!(
             "no portable QEMU build for {os}/{arch} (only macos-arm64 and linux x86_64/aarch64 are published); install system QEMU instead"
         ),
     }
 }
 
-/// `qemu-v11.1.1` / `v11.1.1` / `11.1.1` → `11.1.1`.
-fn normalize_version(tag: &str) -> String {
-    tag.trim_start_matches("qemu-")
-        .trim_start_matches('v')
-        .to_string()
+/// Pinned SHA-256 for a QEMU portable asset marker at the pinned tag.
+/// `None` for unknown markers (fail-closed downstream treats this as unverified,
+/// which bails without the escape hatch — markers come from `asset_for_host`,
+/// so `None` here means a new platform was added without pinning its hash).
+/// `pub(crate)` for the `verify-pins` command.
+pub(crate) fn pinned_qemu_sha256(marker: &str) -> Option<&'static str> {
+    match marker {
+        crate::paths::MARKER_MACOS_ARM64 => Some(crate::pins::QEMU_PORTABLE_SHA256_MACOS_ARM64),
+        crate::paths::MARKER_LINUX_X86_64 => Some(crate::pins::QEMU_PORTABLE_SHA256_LINUX_X86_64),
+        crate::paths::MARKER_LINUX_AARCH64 => Some(crate::pins::QEMU_PORTABLE_SHA256_LINUX_AARCH64),
+        _ => None,
+    }
 }
 
+/// Pinned SHA-256 for a wimlib portable asset marker at the pinned tag.
+/// Same contract as [`pinned_qemu_sha256`].
+/// `pub(crate)` for the `verify-pins` command.
+pub(crate) fn pinned_wimlib_sha256(marker: &str) -> Option<&'static str> {
+    match marker {
+        crate::paths::MARKER_MACOS_ARM64 => Some(crate::pins::WIMLIB_PORTABLE_SHA256_MACOS_ARM64),
+        crate::paths::MARKER_LINUX_X86_64 => Some(crate::pins::WIMLIB_PORTABLE_SHA256_LINUX_X86_64),
+        crate::paths::MARKER_LINUX_AARCH64 => {
+            Some(crate::pins::WIMLIB_PORTABLE_SHA256_LINUX_AARCH64)
+        }
+        _ => None,
+    }
+}
+
+/// Pinned QEMU release tag: `run`/`install` use exactly this, `fetch-qemu`
+/// downloads exactly this unless `--qemu-tag` overrides. Value lives in
+/// [`crate::pins`]; this alias keeps existing call sites.
+pub const DEFAULT_QEMU_PORTABLE_TAG: &str = crate::pins::QEMU_PORTABLE_TAG;
+
 /// Parse a `SHA256SUMS.txt`-style body (`<hex>  <filename>` per line).
-fn parse_sums(body: &str, asset: &str) -> Option<String> {
+/// `pub(crate)` for the `verify-pins` command, which reuses release parsing
+/// without downloading archives.
+pub(crate) fn parse_sums(body: &str, asset: &str) -> Option<String> {
     body.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         match (parts.next(), parts.next()) {
@@ -91,7 +399,8 @@ fn parse_sums(body: &str, asset: &str) -> Option<String> {
     })
 }
 
-/// Download `url` to `dest` (via `.part` + rename, as in `downloader`).
+/// Download `url` to `dest` (via `.part` + rename, as in `downloader`),
+/// with throttled stderr progress (see `downloader::Progress`).
 async fn fetch_to(url: &str, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(UA)
@@ -109,18 +418,28 @@ async fn fetch_to(url: &str, dest: &Path) -> Result<()> {
     {
         tokio::fs::create_dir_all(parent).await?;
     }
+    // Display the asset name, not our `.download` staging suffix.
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dest.display().to_string());
+    let label = name.strip_suffix(".download").unwrap_or(&name).to_string();
+    let mut progress = crate::downloader::Progress::new(&label, resp.content_length());
     let tmp = dest.with_extension("part");
     let mut file = tokio::fs::File::create(&tmp).await?;
     use tokio::io::AsyncWriteExt;
     while let Some(chunk) = resp.chunk().await? {
+        progress.add(chunk.len());
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
+    progress.finish();
     drop(file);
     tokio::fs::rename(&tmp, dest).await?;
     Ok(())
 }
 
+/// GitHub API client (JSON + User-Agent), shared by the tag endpoints.
 fn github_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(UA)
@@ -128,40 +447,9 @@ fn github_client() -> Result<reqwest::Client> {
         .context("reqwest client")
 }
 
-/// Resolve the latest release tag + asset download URLs from the GitHub API.
-/// Skipped entirely when the requested version is already extracted.
-async fn latest_release() -> Result<(String, Vec<(String, String)>)> {
-    let body: serde_json::Value = github_client()?
-        .get(REPO_API_LATEST)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let tag = body
-        .get("tag_name")
-        .and_then(|t| t.as_str())
-        .context("release has no tag_name")?
-        .to_string();
-    let assets = body
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .context("release has no assets array")?
-        .iter()
-        .filter_map(|a| {
-            Some((
-                a.get("name")?.as_str()?.to_string(),
-                a.get("browser_download_url")?.as_str()?.to_string(),
-            ))
-        })
-        .collect();
-    Ok((tag, assets))
-}
-
 /// Unpack a `.tar.gz` / `.tar.xz` archive into `dest`, rejecting absolute
 /// paths and `..` components (defense in depth over `unpack_in`).
-fn extract(kind: AssetKind, archive: &Path, dest: &Path) -> Result<()> {
+fn extract(kind: AssetKind, archive: &Path, dest: &Path, inner_bin_dir: &str) -> Result<()> {
     // dest must already exist (created via the cache group); `unpack_in`
     // canonicalizes it as a traversal guard and fails otherwise.
     let file =
@@ -179,7 +467,7 @@ fn extract(kind: AssetKind, archive: &Path, dest: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(rd) = std::fs::read_dir(dest.join("qemu-portable/bin")) {
+        if let Ok(rd) = std::fs::read_dir(dest.join(inner_bin_dir)) {
             for entry in rd.flatten() {
                 let p = entry.path();
                 if p.is_file() {
@@ -208,78 +496,67 @@ fn extract_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Strip macOS quarantine so the adhoc-signed binaries actually launch under
-/// HVF. Best-effort: ignored on other OSes and when `xattr` is unavailable.
-fn strip_quarantine(dir: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("xattr")
-            .arg("-dr")
-            .arg("com.apple.quarantine")
-            .arg(dir)
-            .output();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = dir;
-    }
-}
-
 /// Ensure a portable QEMU tree in the project cache (never evicted).
 ///
 /// - `dir`: explicit cache base, else `<project>/.cache/qemu-portable`
 ///   (same discovery as the ISO cache; `$WINDOWS_HEADLESS_QEMU_DIR`
 ///   overrides the base).
-/// - `version`: explicit `11.1.1` (or tag form); else the latest GitHub
-///   release. The API is only hit when the version is not already extracted.
-pub async fn ensure(dir: Option<PathBuf>, version: Option<String>) -> Result<PortableQemu> {
-    // All directories via cache-manager: explicit --dir / env override become
-    // the root, otherwise the discovered project root. Every subdirectory
-    // (group, version) goes through the group API — no raw create_dir_all.
-    let root = match dir {
-        Some(d) => CacheRoot::from_root(d),
-        None => match std::env::var("WINDOWS_HEADLESS_QEMU_DIR") {
-            Ok(d) => CacheRoot::from_root(d),
-            Err(_) => CacheRoot::from_discovery().context("locate project cache root")?,
-        },
-    };
+/// - `version`: exact release tag (for new-build testing); else the
+///   pinned [`DEFAULT_QEMU_PORTABLE_TAG`]. Tags are used verbatim —
+///   no normalization. Already-extracted trees are reused without
+///   touching the network.
+/// - `allow_unverified`: permit proceeding when the release ships no
+///   `SHA256SUMS.txt` (or no entry for our asset). Fails closed by default;
+///   also honored via `$WINDOWS_HEADLESS_ALLOW_UNVERIFIED`.
+pub async fn ensure(
+    dir: Option<PathBuf>,
+    version: Option<String>,
+    allow_unverified: bool,
+) -> Result<PortableQemu> {
+    // All directories via the shared crate::cache helper: explicit --dir /
+    // env override win, else workspace discovery, else the OS user cache.
+    // Every subdirectory (group, version) goes through the group API —
+    // no raw create_dir_all.
+    let root = crate::cache::resolve_cache_root(dir, "WINDOWS_HEADLESS_QEMU_DIR")?;
     // Ensure the base group exists even before we know the version, so the
     // fast path below can scan it.
-    root.ensure_group("qemu-portable")
+    root.ensure_group(crate::paths::QEMU_GROUP)
         .context("create qemu-portable cache group")?;
 
     let (marker, kind) = asset_for_host()?;
 
-    let norm_version: String = match version {
-        Some(v) => normalize_version(&v),
-        None => {
-            // Fast path: reuse the newest extracted tree without touching
-            // the (rate-limited) GitHub API.
-            if let Some(cached) = newest_extracted(&root.group_path("qemu-portable")) {
-                return Ok(cached);
-            }
-            let (tag, _) = latest_release().await?;
-            normalize_version(&tag)
-        }
+    let tag: String = match version {
+        Some(v) => v,
+        None => DEFAULT_QEMU_PORTABLE_TAG.to_string(),
     };
-    let group = root.group(format!("qemu-portable/{norm_version}"));
+    let group = root.group(format!("{}/{tag}", crate::paths::QEMU_GROUP));
     group.ensure_dir().context("create version cache group")?;
-    let tree = group.path().join("qemu-portable");
-    if tree.join("bin/qemu-img").is_file() {
+    let tree = group.path().join(crate::paths::QEMU_INNER);
+    if tree
+        .join(crate::paths::PORTABLE_BIN_DIR)
+        .join(crate::paths::QEMU_IMG_NAME)
+        .is_file()
+    {
         return Ok(PortableQemu {
             root: tree,
-            version: norm_version,
+            version: tag,
         });
+    }
+
+    // Fail fast on macOS BEFORE any network: Gatekeeper would block the
+    // adhoc-signed binaries, so downloading first would only waste gigabytes.
+    #[cfg(target_os = "macos")]
+    if !quarantine_strip_allowed() {
+        return Err(quarantine_gate_error(group.path(), "QEMU"));
     }
 
     // Pin the exact asset URLs from the release metadata so a renamed
     // asset fails loudly instead of 404ing a guessed URL.
-    let (tag, assets) = release_by_version(&norm_version).await?;
-    let _ = tag;
+    let assets = release_by_tag(&tag).await?;
     let asset_name = assets
         .iter()
         .map(|(n, _)| n.as_str())
-        .find(|n| n.contains(marker) && n.starts_with("qemu-portable-"))
+        .find(|n| n.contains(marker) && n.starts_with(crate::paths::QEMU_ASSET_PREFIX))
         .context(format!(
             "release has no portable asset for this host ({marker})"
         ))?
@@ -290,106 +567,129 @@ pub async fn ensure(dir: Option<PathBuf>, version: Option<String>) -> Result<Por
         .map(|(_, u)| u.clone())
         .unwrap();
 
-    let base = root.group_path("qemu-portable");
+    let base = root.group_path(crate::paths::QEMU_GROUP);
     let archive_path = base.join(format!("{asset_name}.download"));
     fetch_to(&url, &archive_path).await?;
 
-    // Verify against the release SHA256SUMS.txt when present.
-    if let Some(sums_url) = assets
-        .iter()
-        .find(|(n, _)| n == "SHA256SUMS.txt")
-        .map(|(_, u)| u.clone())
-    {
-        let sums_path = base.join("SHA256SUMS.txt.download");
-        fetch_to(&sums_url, &sums_path).await?;
-        let body = std::fs::read_to_string(&sums_path)?;
-        match parse_sums(&body, &asset_name) {
-            Some(expected) => {
-                let actual = crate::downloader::sha256_of(&archive_path).await?;
-                anyhow::ensure!(
-                    actual.eq_ignore_ascii_case(&expected),
-                    "SHA-256 mismatch for {asset_name}: expected {expected}, got {actual}"
-                );
-            }
-            None => {
-                tracing::warn!("{asset_name} not listed in SHA256SUMS.txt; skipping verification")
-            }
-        }
-        let _ = std::fs::remove_file(&sums_path);
-    }
+    // Fail-closed verification: missing sums sheet or entry bails unless the
+    // operator explicitly allowed unverified downloads. Mismatches remove the
+    // corrupt archive before returning. The pin additionally binds the sums
+    // entry for the pinned tag, defeating forged sums+archive pairs.
+    let expected_pin = (tag == DEFAULT_QEMU_PORTABLE_TAG).then(|| pinned_qemu_sha256(marker));
+    let expected_pin = expected_pin.flatten();
+    verify_archive_against_sums(
+        &assets,
+        &asset_name,
+        &archive_path,
+        &base,
+        allow_unverified,
+        expected_pin,
+    )
+    .await?;
 
+    // Stage → strip → publish. The full payload (extract + permissions +
+    // quarantine strip) completes inside the staging boundary; the atomic
+    // rename is what makes the tree public. Guard cleanup covers `?`
+    // early-returns and panics.
     let dest = group.path().to_path_buf();
-    extract(kind, &archive_path, &dest)?;
-    strip_quarantine(&dest);
+    let n = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging =
+        StagingGuard::new(base.join(format!(".staging-{tag}-{}-{n}", std::process::id())));
+    std::fs::create_dir_all(staging.path()).context("create staging dir")?;
+    extract(
+        kind,
+        &archive_path,
+        staging.path(),
+        &format!(
+            "{}/{}",
+            crate::paths::QEMU_INNER,
+            crate::paths::PORTABLE_BIN_DIR
+        ),
+    )?;
+    strip_quarantine(staging.path()).await?;
     let _ = std::fs::remove_file(&archive_path);
+    let sentinel = dest
+        .join(crate::paths::QEMU_INNER)
+        .join(crate::paths::PORTABLE_BIN_DIR)
+        .join(crate::paths::QEMU_IMG_NAME);
+    let root = publish_staged(staging, &dest, &sentinel, crate::paths::QEMU_INNER)?;
 
-    Ok(PortableQemu {
-        root: dest.join("qemu-portable"),
-        version: norm_version,
-    })
+    Ok(PortableQemu { root, version: tag })
 }
 
-/// Newest already-extracted tree (by numeric version order), if any.
-fn newest_extracted(base: &Path) -> Option<PortableQemu> {
-    let mut found: Vec<(String, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(base).ok()?.flatten() {
-        let tree = entry.path().join("qemu-portable");
-        if tree.join("bin/qemu-img").is_file() {
-            found.push((entry.file_name().to_string_lossy().into_owned(), tree));
-        }
+/// Pinned portable tree in the project cache, without touching the
+/// network. Used by `run`/`install` so end users never pass `--qemu-dir`
+/// — and never silently run a different QEMU than the pin. Anything else
+/// (e.g. a newer build under test) must be selected explicitly via
+/// `--qemu-dir` or `fetch-qemu --qemu-tag`.
+pub fn pinned_cached() -> Result<PortableQemu> {
+    let root = crate::cache::resolve_cache_root(None, "WINDOWS_HEADLESS_QEMU_DIR")?;
+    let base = root.group_path(crate::paths::QEMU_GROUP);
+    let tag = DEFAULT_QEMU_PORTABLE_TAG.to_string();
+    let tree = base.join(&tag).join(crate::paths::QEMU_INNER);
+    if tree
+        .join(crate::paths::PORTABLE_BIN_DIR)
+        .join(crate::paths::QEMU_IMG_NAME)
+        .is_file()
+    {
+        return Ok(PortableQemu {
+            root: tree,
+            version: tag,
+        });
     }
-    found.sort_by(|a, b| cmp_versions(&a.0, &b.0));
-    found
-        .pop()
-        .map(|(version, root)| PortableQemu { root, version })
+    let found = cached_versions(&base);
+    anyhow::bail!(
+        "pinned portable QEMU {tag} not cached (found: {found}); run `fetch-qemu` (fetches the pin) or pass `--qemu-dir` to use another tree explicitly",
+    )
 }
 
-/// Numeric dotted-version order (`9.2.0 < 10.0.0 < 11.1.1`); non-numeric
-/// components fall back to string order. Plain string sort would rank
-/// `9.x` above `11.x`.
-fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let mut ai = a.split('.');
-    let mut bi = b.split('.');
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, _) => return Ordering::Less,
-            (_, None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(xn), Ok(yn)) => xn.cmp(&yn),
-                    _ => x.cmp(y),
-                };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-        }
+/// Versions with an extracted tree under a `qemu-portable` cache base
+/// (full tags, or `none`), for the `pinned_cached` error message.
+fn cached_versions(base: &Path) -> String {
+    let mut found: Vec<String> = std::fs::read_dir(base)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path()
+                        .join(crate::paths::QEMU_INNER)
+                        .join(crate::paths::PORTABLE_BIN_DIR)
+                        .join(crate::paths::QEMU_IMG_NAME)
+                        .is_file()
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    if found.is_empty() {
+        "none".to_string()
+    } else {
+        found.join(", ")
     }
 }
 
-/// Fetch release metadata for a concrete version (`11.1.1` or tag form).
-async fn release_by_version(norm: &str) -> Result<(String, Vec<(String, String)>)> {
+/// Fetch release metadata for an exact release tag (`qemu-v11.1.1-57`).
+/// No latest-release fallback: under never-overwrite rebuild tags, latest
+/// is never the answer to "give me the pin" — a missing tag is a hard
+/// error naming the tag.
+/// `pub(crate)` for the `verify-pins` command, which checks asset
+/// availability without downloading archives.
+pub(crate) async fn release_by_tag(tag: &str) -> Result<Vec<(String, String)>> {
     let url = format!(
-        "https://api.github.com/repos/jzombie/lab-qemu-portable/releases/tags/qemu-v{norm}"
+        "https://api.github.com/repos/{}/releases/tags/{tag}",
+        crate::pins::RELEASE_REPO,
     );
-    match github_client()?.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await?;
-            parse_release_body(&body)
-        }
-        _ => {
-            // Tag scheme may differ (e.g. `v{norm}`); fall back to latest and
-            // require it to match the requested version.
-            let (tag, assets) = latest_release().await?;
-            anyhow::ensure!(
-                normalize_version(&tag) == norm,
-                "requested portable QEMU {norm}, but latest release is {tag}"
-            );
-            Ok((tag, assets))
-        }
-    }
+    let body: serde_json::Value = github_client()?
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("portable QEMU release {tag} not found"))?
+        .json()
+        .await?;
+    let (_, assets) = parse_release_body(&body)?;
+    Ok(assets)
 }
 
 fn parse_release_body(body: &serde_json::Value) -> Result<(String, Vec<(String, String)>)> {
@@ -413,16 +713,193 @@ fn parse_release_body(body: &serde_json::Value) -> Result<(String, Vec<(String, 
     Ok((tag, assets))
 }
 
+/// A provisioned portable wimlib tree (`wimlib-portable` release asset).
+/// `root` is the extracted inner dir holding `bin/wimlib-imagex`.
+#[derive(Debug, Clone)]
+pub struct PortableWimlib {
+    pub root: PathBuf,
+    pub version: String,
+}
+
+impl PortableWimlib {
+    pub fn wimlib_bin(&self) -> PathBuf {
+        self.root
+            .join(crate::paths::PORTABLE_BIN_DIR)
+            .join(crate::paths::WIMLIB_IMGX_NAME)
+    }
+}
+
+/// Pinned wimlib release tag: `build-media` uses exactly this,
+/// `fetch-wimlib` downloads exactly this unless `--wimlib-tag` overrides.
+/// Value lives in [`crate::pins`]; this alias keeps existing call sites.
+pub const DEFAULT_WIMLIB_PORTABLE_TAG: &str = crate::pins::WIMLIB_PORTABLE_TAG;
+
+/// Release metadata for an exact tag in `repo` (`owner/name`).
+async fn release_for_tag(repo: &str, tag: &str) -> Result<(String, Vec<(String, String)>)> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    let body: serde_json::Value = github_client()?
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("GET {url}"))?
+        .json()
+        .await?;
+    parse_release_body(&body)
+}
+
+/// Download URL of `asset` in release `tag` of `repo` (fails loudly on rename).
+pub async fn release_asset_url(repo: &str, tag: &str, asset: &str) -> Result<String> {
+    let (_, assets) = release_for_tag(repo, tag).await?;
+    assets
+        .iter()
+        .find(|(n, _)| n == asset)
+        .map(|(_, u)| u.clone())
+        .with_context(|| format!("release {tag} has no asset {asset}"))
+}
+
+/// Ensure a portable wimlib tree in the project cache (never evicted).
+/// Same shape as [`ensure`]: `$WINDOWS_HEADLESS_WIMLIB_DIR` overrides,
+/// else `<project>/.cache/wimlib-portable`; exact release tag or the
+/// pinned [`DEFAULT_WIMLIB_PORTABLE_TAG`]. Tags are used verbatim.
+/// Already-extracted trees are reused without touching the network.
+/// `allow_unverified` mirrors [`ensure`]: fail closed unless set (or
+/// `$WINDOWS_HEADLESS_ALLOW_UNVERIFIED`).
+pub async fn ensure_wimlib(
+    dir: Option<PathBuf>,
+    version: Option<String>,
+    allow_unverified: bool,
+) -> Result<PortableWimlib> {
+    let root = crate::cache::resolve_cache_root(dir, "WINDOWS_HEADLESS_WIMLIB_DIR")?;
+    root.ensure_group(crate::paths::WIMLIB_GROUP)
+        .context("create wimlib-portable cache group")?;
+    let (marker, kind) = asset_for_host()?;
+    let tag: String = match version {
+        Some(v) => v,
+        None => DEFAULT_WIMLIB_PORTABLE_TAG.to_string(),
+    };
+    let group = root.group(format!("{}/{tag}", crate::paths::WIMLIB_GROUP));
+    group.ensure_dir().context("create version cache group")?;
+    let tree = group.path().join(crate::paths::WIMLIB_INNER);
+    if tree
+        .join(crate::paths::PORTABLE_BIN_DIR)
+        .join(crate::paths::WIMLIB_IMGX_NAME)
+        .is_file()
+    {
+        return Ok(PortableWimlib {
+            root: tree,
+            version: tag,
+        });
+    }
+    // Fail fast on macOS BEFORE any network (same Gatekeeper boundary as QEMU).
+    #[cfg(target_os = "macos")]
+    if !quarantine_strip_allowed() {
+        return Err(quarantine_gate_error(group.path(), "wimlib"));
+    }
+    let (_, assets) = release_for_tag(crate::pins::RELEASE_REPO, &tag).await?;
+    let asset_name = assets
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .find(|n| n.contains(marker) && n.starts_with(crate::paths::WIMLIB_ASSET_PREFIX))
+        .with_context(|| format!("release {tag} has no portable asset for this host ({marker})"))?
+        .to_string();
+    let url = assets
+        .iter()
+        .find(|(n, _)| n == &asset_name)
+        .map(|(_, u)| u.clone())
+        .unwrap();
+    let base = root.group_path(crate::paths::WIMLIB_GROUP);
+    let archive_path = base.join(format!("{asset_name}.download"));
+    fetch_to(&url, &archive_path).await?;
+    let expected_pin = (tag == DEFAULT_WIMLIB_PORTABLE_TAG).then(|| pinned_wimlib_sha256(marker));
+    let expected_pin = expected_pin.flatten();
+    verify_archive_against_sums(
+        &assets,
+        &asset_name,
+        &archive_path,
+        &base,
+        allow_unverified,
+        expected_pin,
+    )
+    .await?;
+    let dest = group.path().to_path_buf();
+    let n = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging =
+        StagingGuard::new(base.join(format!(".staging-{tag}-{}-{n}", std::process::id())));
+    std::fs::create_dir_all(staging.path()).context("create staging dir")?;
+    extract(
+        kind,
+        &archive_path,
+        staging.path(),
+        &format!(
+            "{}/{}",
+            crate::paths::WIMLIB_INNER,
+            crate::paths::PORTABLE_BIN_DIR
+        ),
+    )?;
+    strip_quarantine(staging.path()).await?;
+    let _ = std::fs::remove_file(&archive_path);
+    let sentinel = dest
+        .join(crate::paths::WIMLIB_INNER)
+        .join(crate::paths::PORTABLE_BIN_DIR)
+        .join(crate::paths::WIMLIB_IMGX_NAME);
+    let root = publish_staged(staging, &dest, &sentinel, crate::paths::WIMLIB_INNER)?;
+    Ok(PortableWimlib { root, version: tag })
+}
+
+/// Pinned portable wimlib tree, without touching the network. Used by
+/// `build-media` so end users never pass `--wimlib-bin` — and never
+/// silently split with a different wimlib than the pin.
+pub fn pinned_cached_wimlib() -> Result<PortableWimlib> {
+    let root = crate::cache::resolve_cache_root(None, "WINDOWS_HEADLESS_WIMLIB_DIR")?;
+    let base = root.group_path(crate::paths::WIMLIB_GROUP);
+    let tag = DEFAULT_WIMLIB_PORTABLE_TAG.to_string();
+    let tree = base.join(&tag).join(crate::paths::WIMLIB_INNER);
+    if tree
+        .join(crate::paths::PORTABLE_BIN_DIR)
+        .join(crate::paths::WIMLIB_IMGX_NAME)
+        .is_file()
+    {
+        return Ok(PortableWimlib {
+            root: tree,
+            version: tag,
+        });
+    }
+    let found = cached_wimlib_versions(&base);
+    anyhow::bail!(
+        "pinned portable wimlib {tag} not cached (found: {found}); run `fetch-wimlib` (fetches the pin)"
+    )
+}
+
+/// Versions with an extracted tree under a `wimlib-portable` cache base,
+/// for the `pinned_cached_wimlib` error message.
+fn cached_wimlib_versions(base: &Path) -> String {
+    let mut found: Vec<String> = std::fs::read_dir(base)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path()
+                        .join(crate::paths::WIMLIB_INNER)
+                        .join(crate::paths::PORTABLE_BIN_DIR)
+                        .join(crate::paths::WIMLIB_IMGX_NAME)
+                        .is_file()
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    if found.is_empty() {
+        "none".to_string()
+    } else {
+        found.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn version_normalization() {
-        assert_eq!(normalize_version("qemu-v11.1.1"), "11.1.1");
-        assert_eq!(normalize_version("v11.1.1"), "11.1.1");
-        assert_eq!(normalize_version("11.1.1"), "11.1.1");
-    }
 
     #[test]
     fn sums_parsing() {
@@ -435,22 +912,86 @@ mod tests {
     }
 
     #[test]
-    fn version_order_is_numeric_not_lexicographic() {
-        assert_eq!(cmp_versions("9.2.0", "11.1.1"), std::cmp::Ordering::Less);
-        assert_eq!(cmp_versions("11.1.1", "11.1.1"), std::cmp::Ordering::Equal);
+    fn default_qemu_tag_is_the_pin() {
+        assert_eq!(DEFAULT_QEMU_PORTABLE_TAG, crate::pins::QEMU_PORTABLE_TAG);
     }
 
     #[test]
-    fn newest_extracted_picks_highest_version() {
+    fn pinned_cached_finds_pin_and_rejects_others() {
         let tmp = tempfile::tempdir().unwrap();
-        for v in ["9.2.0", "11.1.1", "10.0.0"] {
-            let bin = tmp.path().join(v).join("qemu-portable/bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join("qemu-img"), b"x").unwrap();
-        }
-        let got = newest_extracted(tmp.path()).unwrap();
-        assert_eq!(got.version, "11.1.1");
-        assert!(got.root.ends_with("11.1.1/qemu-portable"));
+        // Cache dirs are tags, verbatim.
+        let pin_bin = tmp
+            .path()
+            .join("qemu-portable")
+            .join(DEFAULT_QEMU_PORTABLE_TAG)
+            .join("qemu-portable/bin");
+        std::fs::create_dir_all(&pin_bin).unwrap();
+        std::fs::write(pin_bin.join("qemu-img"), b"x").unwrap();
+        // A newer tree must NOT shadow the pin.
+        let other_bin = tmp
+            .path()
+            .join("qemu-portable/qemu-v99.99.99/qemu-portable/bin");
+        std::fs::create_dir_all(&other_bin).unwrap();
+        std::fs::write(other_bin.join("qemu-img"), b"x").unwrap();
+        // SAFETY: process-local env, restored below; no other test reads
+        // this variable (only pinned_cached, called solely here).
+        unsafe { std::env::set_var("WINDOWS_HEADLESS_QEMU_DIR", tmp.path()) };
+        let got = pinned_cached().unwrap();
+        assert_eq!(got.version, DEFAULT_QEMU_PORTABLE_TAG);
+        assert!(
+            got.root
+                .ends_with(format!("{}/qemu-portable", DEFAULT_QEMU_PORTABLE_TAG))
+        );
+        std::fs::remove_dir_all(
+            tmp.path()
+                .join("qemu-portable")
+                .join(DEFAULT_QEMU_PORTABLE_TAG),
+        )
+        .unwrap();
+        assert!(pinned_cached().is_err());
+        unsafe { std::env::remove_var("WINDOWS_HEADLESS_QEMU_DIR") };
+    }
+
+    #[test]
+    fn default_wimlib_tag_is_the_pin() {
+        assert_eq!(
+            DEFAULT_WIMLIB_PORTABLE_TAG,
+            crate::pins::WIMLIB_PORTABLE_TAG
+        );
+    }
+
+    #[test]
+    fn pinned_cached_wimlib_finds_pin_and_rejects_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pin_bin = tmp
+            .path()
+            .join("wimlib-portable")
+            .join(DEFAULT_WIMLIB_PORTABLE_TAG)
+            .join("wimlib-portable/bin");
+        std::fs::create_dir_all(&pin_bin).unwrap();
+        std::fs::write(pin_bin.join("wimlib-imagex"), b"x").unwrap();
+        let other_bin = tmp
+            .path()
+            .join("wimlib-portable/wimlib-v9.9.9/wimlib-portable/bin");
+        std::fs::create_dir_all(&other_bin).unwrap();
+        std::fs::write(other_bin.join("wimlib-imagex"), b"x").unwrap();
+        // SAFETY: process-local env, restored below; no other test reads
+        // this variable (only pinned_cached_wimlib, called solely here).
+        unsafe { std::env::set_var("WINDOWS_HEADLESS_WIMLIB_DIR", tmp.path()) };
+        let got = pinned_cached_wimlib().unwrap();
+        assert_eq!(got.version, DEFAULT_WIMLIB_PORTABLE_TAG);
+        assert!(
+            got.root
+                .ends_with(format!("{}/wimlib-portable", DEFAULT_WIMLIB_PORTABLE_TAG))
+        );
+        std::fs::remove_dir_all(
+            tmp.path()
+                .join("wimlib-portable")
+                .join(DEFAULT_WIMLIB_PORTABLE_TAG),
+        )
+        .unwrap();
+        assert!(pinned_cached_wimlib().is_err());
+        unsafe { std::env::remove_var("WINDOWS_HEADLESS_WIMLIB_DIR") };
     }
 
     #[test]
@@ -458,5 +999,75 @@ mod tests {
         // Must not error on the dev/CI hosts we support (macos-arm64,
         // linux x86_64/aarch64); other hosts get the actionable error.
         let _ = asset_for_host();
+    }
+
+    #[test]
+    fn quarantine_gate_truth_table() {
+        // SAFETY: this test owns ALLOW_QUARANTINE_STRIP_ENV; no other test
+        // reads it (only quarantine_strip_allowed, called solely here).
+        let prior = std::env::var(ALLOW_QUARANTINE_STRIP_ENV).ok();
+        unsafe { std::env::remove_var(ALLOW_QUARANTINE_STRIP_ENV) };
+        assert!(!quarantine_strip_allowed());
+        for v in ["1", "true", "yes", "on", "TRUE", "Yes", "ON"] {
+            unsafe { std::env::set_var(ALLOW_QUARANTINE_STRIP_ENV, v) };
+            assert!(quarantine_strip_allowed(), "want allowed for {v:?}");
+        }
+        for v in ["0", "false", "no", "", "maybe"] {
+            unsafe { std::env::set_var(ALLOW_QUARANTINE_STRIP_ENV, v) };
+            assert!(!quarantine_strip_allowed(), "want denied for {v:?}");
+        }
+        match prior {
+            Some(v) => unsafe { std::env::set_var(ALLOW_QUARANTINE_STRIP_ENV, v) },
+            None => unsafe { std::env::remove_var(ALLOW_QUARANTINE_STRIP_ENV) },
+        }
+    }
+
+    #[test]
+    fn unverified_gate_truth_table() {
+        // SAFETY: same single-owner discipline as the quarantine gate test.
+        let prior = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
+        unsafe { std::env::remove_var(ALLOW_UNVERIFIED_ENV) };
+        assert!(!unverified_allowed(false));
+        assert!(unverified_allowed(true));
+        unsafe { std::env::set_var(ALLOW_UNVERIFIED_ENV, "1") };
+        assert!(unverified_allowed(false));
+        unsafe { std::env::set_var(ALLOW_UNVERIFIED_ENV, "0") };
+        assert!(!unverified_allowed(false));
+        assert!(unverified_allowed(true));
+        match prior {
+            Some(v) => unsafe { std::env::set_var(ALLOW_UNVERIFIED_ENV, v) },
+            None => unsafe { std::env::remove_var(ALLOW_UNVERIFIED_ENV) },
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_guard_drop_removes_and_commit_keeps() {
+        // NOTE: #[tokio::test] is REQUIRED: Drop offloads via spawn_blocking,
+        // which panics outside a runtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging_path = tmp.path().join(".staging-test-1");
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::fs::write(staging_path.join("f"), b"x").unwrap();
+        {
+            let _guard = StagingGuard::new(staging_path.clone());
+            // Drop without commit → removed (deletion is async: poll).
+        }
+        let mut gone = false;
+        for _ in 0..100 {
+            if !staging_path.exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone, "staging dir was not cleaned up");
+
+        let keep_path = tmp.path().join(".staging-test-2");
+        std::fs::create_dir_all(&keep_path).unwrap();
+        {
+            let guard = StagingGuard::new(keep_path.clone());
+            guard.commit();
+        }
+        assert!(keep_path.is_dir());
     }
 }

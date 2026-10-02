@@ -54,7 +54,7 @@ impl DiskManager {
     /// Freeze rule: never touch this dir again once QEMU has launched.
     pub fn ensure_unattend_dir(dir: &Path, xml: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
-        let file = dir.join("autounattend.xml");
+        let file = dir.join(crate::paths::UNATTEND_XML);
         std::fs::write(&file, xml).with_context(|| format!("write {}", file.display()))?;
         Ok(file)
     }

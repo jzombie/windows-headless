@@ -1,0 +1,11 @@
+# Fatal boot-failure signatures for the serial-log watchdog.
+# One substring per line; `#` comments and blank lines ignored.
+# Keep this conservative: only signatures that NEVER appear in a healthy
+# boot. A hit fails the run/install fast with the serial tail as evidence.
+# Add new signatures here as new dead screens are observed live.
+
+0xc000000f
+0xc000000e
+BdsDxe: failed to start
+Boot Failed
+No bootable device

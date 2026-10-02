@@ -1,0 +1,21 @@
+rem WinPE diskpart script: wipe the install target and lay out GPT.
+rem Invoked as: diskpart /s <USB-letter>:\setup\part.txt
+rem (the answer file tries C: then D:).
+rem
+rem NVMe TOPOLOGY: the target is Disk 0 (PCI enumerates before USB).
+rem A Disk 1 variant here would wipe the installer USB -- see
+rem docs/usb-install-media.md (NVMe warning). For virtio-blk targets
+rem (USB=Disk 0, target=Disk 1) change both selects to Disk 1.
+rem Resulting layout: EFI=partition 1, MSR=2, Windows=3, matching
+rem InstallTo <DiskID>0</DiskID><PartitionID>3</PartitionID>.
+select disk 0
+clean
+convert gpt
+create partition efi size=100
+format quick fs=fat32 label="System"
+assign letter="S"
+create partition msr size=16
+create partition primary
+format quick fs=ntfs label="Windows"
+assign letter="W"
+exit

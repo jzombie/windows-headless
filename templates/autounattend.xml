@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?><unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>{locale}</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>{locale}</InputLocale>
+      <SystemLocale>{locale}</SystemLocale>
+      <UILanguage>{locale}</UILanguage>
+      <UserLocale>{locale}</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
+      <!-- NVMe topology: the target is Disk 0 (PCI enumerates before USB),
+                       inbox stornvme covers it (no third-party storage driver exists
+                       in this file at all). part.txt selects Disk 0 (the Disk 1
+                       variant here would wipe the installer USB). -->
+      <RunSynchronous>
+        <!-- Log which volume holds install.wim (Order 1). Fresh targets boot
+                         with C:=USB-FAT32, D:=USB-exFAT (probed live); the log
+                         on P1 makes any letter drift diagnosable offline. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c (for %L in (C D E F G H) do @if exist %L:\sources\install.wim echo FOUND-AT-%L: &gt;&gt; C:\wimsearch.log 2&gt;&amp;1 &amp; echo scan-done &gt;&gt; C:\wimsearch.log 2&gt;&amp;1 &amp; echo scan-done &gt;&gt; D:\wimsearch.log 2&gt;&amp;1)</Path>
+          <Description>Log install.wim location</Description>
+        </RunSynchronousCommand>
+        <!-- diskpart first (Order 1): the NVMe target is visible inbox, no
+                         driver load needed. Retries converge once the disk appears;
+                         missing part.txt degrades to the interactive prompt. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c (for /L %i in (1,1,12) do @(diskpart /s C:\setup\part.txt &amp; diskpart /s D:\setup\part.txt &amp; timeout /t 10) &amp; exit 0)</Path>
+          <Description>Partition target disk with part.txt (retry)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass TPM 2.0 Check</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass Secure Boot Check</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass RAM Size Check</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass CPU Architecture Check</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass Minimum Disk Size Check</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>Windows 11 Pro</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <ProductKey>
+          <Key></Key>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass OOBE Network Requirement</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE" /v DisablePrivacyExperience /t REG_DWORD /d 1 /f</Path>
+          <Description>Disable OOBE Privacy Experience Page</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c (for %L in (C D E F) do @if exist %L:\drivers\NetKVM pnputil /add-driver %L:\drivers\NetKVM\w11\{arch}\netkvm.inf /install)</Path>
+          <Description>Install NetKVM network driver (specialize)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c (for %L in (C D E F) do @if exist %L:\tools\{sshzip} powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%L:\tools\{sshzip}' -DestinationPath 'C:\Program Files\OpenSSH' -Force")</Path>
+          <Description>Expand OpenSSH Server zip offline from USB</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>cmd /c (pushd "C:\Program Files\OpenSSH\{sshdir}" &amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File install-sshd.ps1 > C:\ssh-install.log 2>&amp;1 &amp; exit 0)</Path>
+          <Description>Install OpenSSH Server service offline (cwd-safe, logged)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service -Name sshd"</Path>
+          <Description>Configure SSHD Automatic Startup</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</Path>
+          <Description>Open Firewall Port 22</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
+      <InputLocale>{locale}</InputLocale>
+      <SystemLocale>{locale}</SystemLocale>
+      <UILanguage>{locale}</UILanguage>
+      <UserLocale>{locale}</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>{user}</Name>
+            <Group>Administrators</Group>
+            <DisplayName>Headless Admin</DisplayName>
+            <Password>
+              <Value>{pass}</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>{auto_logon_xml}
+      <TimeZone>{tz}</TimeZone>
+    </component>
+  </settings>
+</unattend>
