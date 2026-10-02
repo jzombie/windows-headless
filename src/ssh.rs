@@ -60,20 +60,68 @@ pub async fn wait_for_ssh(host: &str, port: u16, timeout_: Duration) -> Result<(
     }
 }
 
-// Readable PowerShell lives in templates/ (like autounattend.xml).
-const PROBE_TPL: &str = include_str!("../templates/probe-ready.ps1");
+/// Guest readiness probe as one `cmd` line: four `reg.exe` reads with
+/// marker-delimited sections. `&& echo YES || echo NO` keeps
+/// key-existence checks locale-independent; value parsing keys on the
+/// (never localized) `REG_DWORD` token.
+fn reg_probe_command() -> String {
+    [
+        "echo [SETUP]",
+        "reg query \"HKLM\\SYSTEM\\Setup\" /v SetupType",
+        "echo [OOBE]",
+        "reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress",
+        "echo [CBS]",
+        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\" && echo YES || echo NO",
+        "echo [WU]",
+        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\" && echo YES || echo NO",
+        "echo [END]",
+    ]
+    .join(" & ")
+}
 
-/// Flatten the multiline probe asset into one exec-channel line:
-/// strip comments/blank lines, join statements with `; `, backslash-escape
-/// inner double quotes (Win32-OpenSSH routes exec through cmd, which strips
-/// bare inner quotes — regressed live as "'BUSY' is not recognized").
-fn flatten_probe(tpl: &str) -> String {
-    tpl.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("; ")
-        .replace('"', "\\\"")
+/// Split reg-probe output into its marker-delimited sections. Only the
+/// exact markers this probe emits are boundaries — anything else brackety
+/// in `reg` output is data, never structure.
+const KNOWN_MARKERS: &[&str] = &["SETUP", "OOBE", "CBS", "WU", "END"];
+
+fn probe_sections(text: &str) -> Option<std::collections::HashMap<&str, Vec<&str>>> {
+    let mut sections = std::collections::HashMap::new();
+    let mut current: Option<&str> = None;
+    let mut seen_marker = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            let name = &t[1..t.len() - 1];
+            if let Some(marker) = KNOWN_MARKERS.iter().find(|m| **m == name) {
+                current = Some(*marker);
+                if *marker != "END" {
+                    seen_marker = true;
+                }
+                sections.entry(*marker).or_insert_with(Vec::new);
+                continue;
+            }
+        }
+        if let Some(c) = current {
+            sections.entry(c).or_insert_with(Vec::new).push(t);
+        }
+    }
+    if seen_marker { Some(sections) } else { None }
+}
+
+/// DWORD value from a `reg query /v` section: `None` when the value (or
+/// key) is absent — absent OOBE counts as done, absent SetupType as busy.
+fn probe_dword(section: &[&str]) -> Option<u32> {
+    section
+        .iter()
+        .find(|l| l.contains("REG_DWORD"))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|hex| {
+            let clean = hex
+                .strip_prefix("0x")
+                .or_else(|| hex.strip_prefix("0X"))
+                .unwrap_or(hex);
+            u32::from_str_radix(clean, 16).ok()
+        })
 }
 
 /// Password-authenticated session (host key accepted blind — see
@@ -358,41 +406,41 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
 
 /// Guest readiness probe over a real SSH login (password auth). Asks the
 /// guest itself whether Setup is finished instead of inferring it from
-/// banner timing:
+/// banner timing: four registry reads through `cmd`+`reg.exe` (millisecond
+/// startup, no PowerShell cold start per probe).
 ///
-/// - `HKLM\SYSTEM\Setup`: `SetupType == 0`, no `OOBEInProgress`.
-/// - No CBS `RebootPending`, no WindowsUpdate `RebootRequired`.
-///
-/// Returns `Ok(true)` = finished, `Ok(false)` = still working (with the
-/// reason echoed to stderr by the caller), `Err` = SSH/login/exec failure
-/// (caller treats as "not yet" — sshd may be mid-restart during reboots).
+/// Returns `Ok(true)` = finished, `Ok(false)` = still working,
+/// `Err` = SSH/login/exec failure (caller treats as "not yet" — sshd may
+/// be mid-restart during reboots). No marker lines at all means the probe
+/// command itself broke (quoting, channel) — loud error, never a silent
+/// `Ok(false)` limp.
 pub async fn probe_setup_done(host: &str, port: u16, user: &str, pass: &str) -> Result<bool> {
-    // The asset stays human-readable multiline; the exec channel wants a
-    // single line — see flatten_probe() for the why behind each step.
-    let one_line = flatten_probe(PROBE_TPL);
-    let text = ssh_exec(
-        host,
-        port,
-        user,
-        pass,
-        &format!("powershell -NoProfile -Command \"{one_line}\""),
-    )
-    .await?;
-    let line = text
-        .lines()
-        .find(|l| l.contains("READY") || l.contains("BUSY"))
-        .unwrap_or("");
-    if line.contains("READY") {
+    let text = ssh_exec(host, port, user, pass, &reg_probe_command()).await?;
+    let sections = probe_sections(&text)
+        .ok_or_else(|| anyhow::anyhow!("unparseable probe output: {text:?}"))?;
+    let get = |name: &str| sections.get(name).map(Vec::as_slice).unwrap_or(&[]);
+    // Absent key/value: OOBE counts as done (not started), everything
+    // else as busy — matching the old PowerShell probe's verdicts.
+    let setup = probe_dword(get("SETUP"));
+    let oobe = probe_dword(get("OOBE")).unwrap_or(0);
+    let cbs = get("CBS").contains(&"YES");
+    let wu = get("WU").contains(&"YES");
+    // CBS/WU sections must resolve to an explicit verdict; a section with
+    // neither YES nor NO means the chain broke mid-command.
+    for (name, lines) in [("CBS", get("CBS")), ("WU", get("WU"))] {
+        if !lines.iter().any(|l| *l == "YES" || *l == "NO") {
+            anyhow::bail!("probe section {name} has no verdict: {lines:?}");
+        }
+    }
+    if setup == Some(0) && oobe == 0 && !cbs && !wu {
         return Ok(true);
     }
-    if line.contains("BUSY") {
-        eprintln!("guest busy: {}", line.trim());
-        return Ok(false);
-    }
-    // No verdict line at all: the probe itself is broken (quoting, asset
-    // drift), not the guest. Loud error — a silent Ok(false) here once
-    // let a broken probe limp on until a fluke READY declared victory.
-    anyhow::bail!("unparseable probe output: {text:?}");
+    let line = format!(
+        "BUSY setuptype={} oobe={oobe} cbs={cbs} wu={wu}",
+        setup.map_or("unknown".to_string(), |v| v.to_string())
+    );
+    eprintln!("guest busy: {line}");
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -466,25 +514,30 @@ mod tests {
     }
 
     #[test]
-    fn probe_flattens_without_bare_quotes() {
-        // Regression: the templated probe once shipped unescaped inner
-        // quotes; cmd stripped them and PowerShell died with
-        // "'BUSY' is not recognized as the name of a cmdlet".
-        let flat = flatten_probe(PROBE_TPL);
-        assert!(!flat.contains('\n'), "newlines break exec parsing");
-        // Every double quote must be backslash-escaped (cmd strips bare
-        // inner quotes). Registry backslashes (HKLM:\...) are fine.
-        let mut prev = '\0';
-        for c in flat.chars() {
-            if c == '"' {
-                assert_eq!(prev, '\\', "bare double quote in flattened probe");
-            }
-            prev = c;
+    fn reg_probe_parses_sample_output() {
+        // Shaped like real `reg.exe` output: value sections carry
+        // REG_DWORD lines, key-existence sections resolve via YES/NO.
+        let text = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\nERROR: The system was unable to find the specified registry key or value.\n[CBS]\nERROR: The system was unable to find the specified registry key or value.\nNO\n[WU]\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\nYES\n[END]\n";
+        let sections = probe_sections(text).unwrap();
+        let get = |name: &str| sections.get(name).map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(probe_dword(get("SETUP")), Some(0));
+        assert_eq!(probe_dword(get("OOBE")), None);
+        assert!(get("CBS").contains(&"NO"));
+        assert!(get("WU").contains(&"YES"));
+        // Busy SetupType parses as decimal from hex.
+        let busy = "[SETUP]\n    SetupType    REG_DWORD    0x2\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x1\n[END]\n";
+        let s2 = probe_sections(busy).unwrap();
+        assert_eq!(
+            probe_dword(s2.get("SETUP").map(Vec::as_slice).unwrap_or(&[])),
+            Some(2)
+        );
+        // No markers at all: broken channel, not a verdict.
+        assert!(probe_sections("garbage\nmore garbage\n").is_none());
+        // The command itself is one &-chained line with all four queries.
+        let cmd = reg_probe_command();
+        assert!(!cmd.contains('\n'));
+        for marker in ["[SETUP]", "[OOBE]", "[CBS]", "[WU]", "[END]"] {
+            assert!(cmd.contains(marker), "missing {marker}");
         }
-        // Statements separated (space-join once merged them into one
-        // command: "positional parameter ... '='" parse error).
-        assert!(flat.contains("; "), "statements must join with '; '");
-        assert!(flat.contains("READY"), "flattening must keep the verdicts");
-        assert!(flat.contains("BUSY"), "flattening must keep the verdicts");
     }
 }

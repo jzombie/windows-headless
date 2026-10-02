@@ -2222,8 +2222,14 @@ async fn wait_install_ready(
     // probes means a reboot (reported); probe errors mean sshd is
     // mid-restart (retried, not fatal). Each probe gets a hard budget: a
     // stalled handshake mid-reboot must surface, never hang the loop.
+    // Separate counter for the overloaded state: banner stable but every
+    // exec timing out means the guest is too saturated to cold-start
+    // PowerShell (Setup still applying), not rebooting. Hammering it with
+    // a probe every 10 s only stacks more powershell.exe on the pile, so
+    // the cadence backs off while stalled.
     let mut reboots = 0u32;
     let mut was_up = true;
+    let mut exec_stalls = 0u32;
     loop {
         if start.elapsed() > deadline {
             anyhow::bail!(
@@ -2282,9 +2288,32 @@ async fn wait_install_ready(
                 );
                 return Ok(banner);
             }
-            Ok(Ok(false)) => {}
-            Ok(Err(e)) => eprintln!("probe failed (sshd mid-reboot?): {e:#}"),
-            Err(_) => eprintln!("probe timed out (sshd busy?) — retrying ..."),
+            Ok(Ok(false)) => {
+                exec_stalls = 0;
+            }
+            Ok(Err(e)) => {
+                exec_stalls += 1;
+                // Five straight exec timeouts with the banner up is not a
+                // reboot (banner would drop) — it is saturation. Say so
+                // once, then stay quiet while backing off below.
+                if exec_stalls == 5 {
+                    eprintln!(
+                        "exec stalled 5x with SSH stable — guest is overloaded (Setup still applying), not rebooting; backing off probes ..."
+                    );
+                } else if exec_stalls < 5 {
+                    eprintln!("probe failed (sshd mid-reboot?): {e:#}");
+                }
+            }
+            Err(_) => {
+                exec_stalls += 1;
+                if exec_stalls == 5 {
+                    eprintln!(
+                        "probe timed out 5x with SSH stable — guest is overloaded, backing off probes ..."
+                    );
+                } else if exec_stalls < 5 {
+                    eprintln!("probe timed out (sshd busy?) — retrying ...");
+                }
+            }
         }
         let up = banner_once(port).await.is_some();
         match (was_up, up) {
@@ -2296,12 +2325,16 @@ async fn wait_install_ready(
             }
             (false, true) => {
                 reboots += 1;
+                exec_stalls = 0;
                 eprintln!("SSH back (reboot #{reboots} finished) — resuming probes ...");
             }
             _ => {}
         }
         was_up = up;
-        tokio::time::sleep(timeouts::READINESS_PROBE_INTERVAL).await;
+        // Back off while stalled (10 s → up to 60 s): each probe spawns a
+        // PowerShell cold start, and hammering a saturated guest buries it.
+        let backoff = 1 + (exec_stalls / 5).min(5);
+        tokio::time::sleep(timeouts::READINESS_PROBE_INTERVAL * backoff).await;
     }
 }
 
