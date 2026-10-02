@@ -109,8 +109,17 @@ jobs:
             README.md
 
       - name: Upload time-lapse screenshots
-        if: failure()
+        # Always: frames are tiny (~6 KB PNGs) and a visual history of
+        # Setup across builds is worth more than the storage it costs.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-setup-screenshots
           path: .cache/vms/win11/screenshots
+          # Frames are evidence for the linked run, not an archive: two
+          # weeks keeps last week around for comparison when this week
+          # goes red, without stacking forever.
+          retention-days: 14
+          # A media-build failure means no guest ever booted, so no frames
+          # exist; warn instead of erroring on the absent dir.
+          if-no-files-found: warn
