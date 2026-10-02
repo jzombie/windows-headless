@@ -56,6 +56,21 @@ user cache dir. Layout:
 Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
 `$WINDOWS_HEADLESS_MEDIA_DIR`, `$WINDOWS_HEADLESS_VM_DIR`.
 
+## Drivers
+
+One third-party driver, installed from the pinned virtio-win ISO:
+
+- **Network: Red Hat VirtIO NetKVM** (`NetKVM/w11/<arch>`). The guest NIC
+  is `virtio-net-pci`, so without it there is no network (and no SSH).
+
+Everything else is inbox Windows:
+
+- **Storage: none.** The disk is NVMe, driven by Windows' built-in
+  `stornvme`. No `viostor` needed or installed.
+- **GPU: none.** Display is `ramfb` (a plain framebuffer for VNC and
+  installer screenshots). No virtio-gpu, QXL, or vendor GPU driver: expect
+  software rendering only.
+
 Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
 
 > Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
