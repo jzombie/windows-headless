@@ -34,7 +34,9 @@ jobs:
           # this (pinned QEMU/wimlib/virtio/OpenSSH, media build, install)
           # runs through `cargo` below — no manual downloads, no apt QEMU.
           wget -O /tmp/Fido.ps1 https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1
-          pwsh -NoProfile -File /tmp/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -Quiet -Dir /tmp
+          # -PlatformArch skips Fido's WMI host-arch autodetect
+          # (Get-CimInstance is Windows-only and absent from Linux pwsh).
+          pwsh -NoProfile -File /tmp/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -PlatformArch x64 -Quiet -Dir /tmp
           mv /tmp/*Windows_11*.iso /tmp/win11-latest.iso
           test -f /tmp/win11-latest.iso
 
