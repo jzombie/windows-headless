@@ -98,7 +98,9 @@ jobs:
         if: success()
         uses: peter-evans/create-pull-request@v7
         with:
-          branch: canary/proof-${{ github.run_id }}
+          # Flat name: `canary/proof-*` is uncreatable while a `canary`
+          # branch exists (git forbids refs/heads/X alongside refs/heads/X/*).
+          branch: canary-proof-${{ github.run_id }}
           commit-message: "canary: prove latest Windows ISO installs unattended"
           title: "Canary proof: latest Windows ISO installs unattended"
           body: |
