@@ -6,7 +6,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
+  # ISO acquisition runs here and travels to the Linux job as an artifact.
+  # This is the one step that cannot go through the Rust pipeline:
+  # EvalCenter links require the interactive form, so Fido drives the
+  # real download API instead.
+  fetch-iso:
+    runs-on: windows-latest
+    steps:
+      - name: Download latest Windows ISO (Fido)
+        run: |
+          Invoke-WebRequest -Uri https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1 -OutFile $env:RUNNER_TEMP/Fido.ps1
+          & $env:RUNNER_TEMP/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -Quiet -Dir $env:RUNNER_TEMP
+          Move-Item $env:RUNNER_TEMP/*Windows_11*.iso $env:RUNNER_TEMP/win11-latest.iso
+          if (!(Test-Path $env:RUNNER_TEMP/win11-latest.iso)) { exit 1 }
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: win11-latest-iso
+          path: ${{ runner.temp }}/win11-latest.iso
+          retention-days: 2
+
   canary:
+    needs: fetch-iso
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,23 +49,18 @@ jobs:
           sudo docker system prune -af 2>/dev/null || true
           df -h
 
-      - name: Download latest Windows ISO (Fido)
-        run: |
-          # The one acquisition step that cannot go through the Rust
-          # pipeline: EvalCenter links require the interactive form, so
-          # Fido drives the real download API instead. Everything after
-          # this (pinned QEMU/wimlib/virtio/OpenSSH, media build, install)
-          # runs through `cargo` below — no manual downloads, no apt QEMU.
-          wget -O /tmp/Fido.ps1 https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1
-          # -PlatformArch skips Fido's WMI host-arch autodetect
-          # (Get-CimInstance is Windows-only and absent from Linux pwsh).
-          pwsh -NoProfile -File /tmp/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -PlatformArch x64 -Quiet -Dir /tmp
-          mv /tmp/*Windows_11*.iso /tmp/win11-latest.iso
-          test -f /tmp/win11-latest.iso
+      - name: Download ISO artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: win11-latest-iso
+          path: /tmp/canary-iso
 
+      # Everything from here runs through `cargo` — pinned QEMU/wimlib/
+      # virtio/OpenSSH via the fetch chain, media build, then install.
+      # No manual downloads, no apt QEMU.
       - name: Run canary test
         env:
-          LATEST_WIN11_ISO: /tmp/win11-latest.iso
+          LATEST_WIN11_ISO: /tmp/canary-iso/win11-latest.iso
         run: cargo test --test canary_test -- --ignored --nocapture
 
       - name: Upload time-lapse screenshots
