@@ -11,6 +11,12 @@ jobs:
   # the ISO bytes are never stored on GitHub infra (no redistribution:
   # the Linux job downloads straight from Microsoft, and the links expire).
   # Eval media is evaluation-licensed, which covers installer testing.
+  #
+  # Single arch by design: everything arch-specific lives in early boot
+  # (firmware, storage/NIC drivers, answer-file arch), already proven per
+  # arch by logged local runs. Past driver injection the unattend passes
+  # are platform-independent, so one leg re-proving the tail against each
+  # new Microsoft build is the whole job.
   fetch-iso-url:
     runs-on: windows-latest
     outputs:
