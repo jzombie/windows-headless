@@ -95,6 +95,11 @@ enum Cmd {
         /// (reached only when `--win-iso` triggers an install).
         #[arg(long, default_value_t = windows_headless::timeouts::INSTALL_SSH_DEADLINE_SECS)]
         install_timeout_secs: u64,
+        /// Screendump cadence during the boot wait in seconds (0 =
+        /// disabled). Frames land in `<vm-dir>/screenshots/` — a boot
+        /// time-lapse, so a slow or stuck boot is readable without VNC.
+        #[arg(long, default_value_t = windows_headless::timeouts::SCREENSHOTS_EVERY_SECS)]
+        screenshots_every_secs: u64,
     },
     /// Proven install: USB-HDD media + NVMe target, unattended answer
     /// file, ends at SSH with the guest reporting Setup complete.
@@ -490,6 +495,7 @@ async fn async_main() -> Result<()> {
             shell,
             win_iso,
             install_timeout_secs,
+            screenshots_every_secs,
         } => {
             cmd_run(RunArgs {
                 disk,
@@ -505,6 +511,7 @@ async fn async_main() -> Result<()> {
                 shell: want_shell(shell),
                 win_iso,
                 install_timeout_secs,
+                screenshots_every_secs,
             })
             .await
         }
@@ -665,6 +672,29 @@ mod tests {
         assert!(Cli::try_parse_from(["wh", "run", "--memory", "512m"]).is_err());
         assert!(Cli::try_parse_from(["wh", "run", "--disk-size", "8g"]).is_err());
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn run_boot_screenshot_cadence_defaults_on() {
+        // Boot time-lapse on by default (readable boot, no VNC); 0 opts out.
+        let cli = Cli::try_parse_from(["wh", "run"]).unwrap();
+        let Cmd::Run {
+            screenshots_every_secs,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(screenshots_every_secs, 60);
+        let cli = Cli::try_parse_from(["wh", "run", "--screenshots-every-secs", "0"]).unwrap();
+        let Cmd::Run {
+            screenshots_every_secs,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(screenshots_every_secs, 0);
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::ipc::{MON_SOCK_NAME, QMP_SOCK_NAME, SERIAL_LOG_NAME, vm_endpoint};
 use crate::qemu::{
-    Display, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
-    PROVEN_VNC_PASSWORD, WindowsVersion, qmp_alive, vnc_url,
+    Display, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_PASSWORD,
+    WindowsVersion, qmp_alive, vnc_url,
 };
 use crate::storage::DiskManager;
 use crate::timeouts;
@@ -465,6 +465,9 @@ pub struct RunArgs {
     /// Budget for that install's SSH wait, in seconds (`run` passes it
     /// straight through; only reached when `--win-iso` installs).
     pub install_timeout_secs: u64,
+    /// Screendump cadence during the boot wait in seconds (0 = disabled);
+    /// frames land in `<vm-dir>/screenshots/`.
+    pub screenshots_every_secs: u64,
 }
 
 pub async fn cmd_run(a: RunArgs) -> Result<()> {
@@ -587,6 +590,22 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     eprintln!("QEMU launched; guest is booting ...");
     let pidfile = vm.builder.pidfile();
     let start = std::time::Instant::now();
+    // One shots dir for the whole wait: periodic boot frames land here and
+    // every failure path captures its final frame into it too.
+    let shots_dir = screenshots_dir(&vm.builder.workdir);
+    if a.screenshots_every_secs > 0 {
+        eprintln!(
+            "Saving a boot screenshot every {}s → {}",
+            a.screenshots_every_secs,
+            shots_dir.display()
+        );
+    }
+    // VNC coordinates for failure reports (None for gtk/cocoa/none — the
+    // frame + serial line still say what happened).
+    let vnc = a
+        .display
+        .is_vnc()
+        .then(|| vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg()));
     let mut ticker = tokio::time::interval(timeouts::BOOT_STATUS_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so the first status line comes
@@ -594,32 +613,50 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     ticker.tick().await;
     // Stall sensor: serial-silent deaths would otherwise poll SSH blindly.
     let mut idle = BlockIdle::new();
+    // Boot time-lapse bookkeeping: cadence is honored inside the ticker
+    // loop (first frame after a full interval, matching `install`), so it
+    // stops the moment the wait ends — no background task leaking into the
+    // interactive session.
+    let mut last_shot = Some(start);
+    let mut shot_n = 0u64;
     tokio::select! {
         r = vm.wait_for_ssh(timeouts::BOOT_SSH_DEADLINE) => {
-            // One last frame before failing: `run` has no periodic
-            // screenshots and the serial is silent, so the screen is the
-            // only evidence of *where* boot died (observed live: black
-            // "guest has not initialized the display" vs a Windows
-            // prompt — neither is guessable from the timeout alone).
-            if r.is_err() {
-                let _ = take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
+            // Time's up: the serial is silent through a Windows boot, so
+            // the screen + serial tail are the only evidence of *where*
+            // boot died (black handoff vs a parked Windows prompt —
+            // neither is guessable from the timeout alone). Attach both
+            // instead of dropping the frame on the floor.
+            if let Err(e) = r {
+                let report =
+                    boot_failure_report(&mon, &vm.builder.serial_log, &shots_dir, &vnc).await;
+                anyhow::bail!("{e:#}\n{report}");
             }
-            r?;
         }
-        _ = async {
+        cause = async {
             loop {
                 ticker.tick().await;
                 // Dead-screen watchdog: a fatal serial signature means the
-                // boot already failed — report it instead of polling on.
-                if let Err(e) = check_boot_failure(&vm.builder.serial_log, &screenshots_dir(&vm.builder.workdir)) {
-                    eprintln!("{e:#}");
-                    return;
-                }
+                // boot already failed — return it as the cause instead of
+                // polling on.
+                check_boot_failure(&vm.builder.serial_log)?;
                 // Stall watchdog: frozen disk I/O + no banner = parked.
                 // Bail propagates out of the select arm below.
-                if let Err(e) = idle.poll(&mon).await {
-                    eprintln!("{e:#}");
-                    return;
+                idle.poll(&mon).await?;
+                // Boot time-lapse: periodic frames so a slow boot narrates
+                // itself visually (the serial has nothing to say while
+                // Windows boots) — same cadence idea as install's.
+                if a.screenshots_every_secs > 0
+                    && last_shot.is_none_or(|t| {
+                        t.elapsed() >= Duration::from_secs(a.screenshots_every_secs)
+                    })
+                    && let Some((p, s)) = take_screenshot(&mon, &shots_dir).await
+                {
+                    shot_n += 1;
+                    last_shot = Some(std::time::Instant::now());
+                    eprintln!(
+                        "boot frame {shot_n}: {} ({s})",
+                        p.file_name().unwrap_or_default().to_string_lossy()
+                    );
                 }
                 // Narrate the boot: last serial line says what the guest
                 // is doing (recovery, Boot Manager, Setup pass...).
@@ -636,14 +673,21 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     );
                 }
             }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
         } => {
-            // Wedged/fatal-signature guest: same evidence gap as the
-            // timeout arm — capture the screen before it is torn down.
-            let _ = take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
+            // The loop only ever ends by erroring (its Ok arm is
+            // unreachable): carry the cause, then the evidence block —
+            // final frame with path + screen classification, last serial
+            // line, VNC coordinates — so the failure reads without VNC.
+            let cause =
+                cause.map_or_else(|e| format!("{e:#}"), |_| "guest failed to boot".to_string());
+            let report =
+                boot_failure_report(&mon, &vm.builder.serial_log, &shots_dir, &vnc).await;
             eprintln!("stopping dead guest...");
             vm.kill().await?;
             let _ = std::fs::remove_file(pidfile);
-            anyhow::bail!("guest failed to boot (see serial evidence above)");
+            anyhow::bail!("{cause}\n{report}");
         }
         _ = shutdown_signal() => {
             eprintln!("interrupted during boot; stopping guest...");
@@ -729,7 +773,12 @@ async fn finish_install_capture(session: &mut InstallSession) {
         h.abort();
     }
     // Final frame after victory: the desktop as proven, not mid-install.
-    let _ = take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await;
+    if let Some((p, s)) = take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await {
+        eprintln!(
+            "final frame: {} ({s})",
+            p.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
 }
 
 /// Inputs for the install-time QEMU argv (pure constructor below): every
@@ -1121,6 +1170,7 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
         mon: std::sync::Arc::clone(&mon),
         shots_dir,
         serial_log: serial_log.clone(),
+        vnc: p.display.is_vnc().then(|| url.clone()),
     };
     tokio::select! {
         r = wait_install_ready(
@@ -1137,7 +1187,22 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
             p.auto_updates,
             &scope,
         ) => {
-            let banner = r?;
+            let banner = match r {
+                Ok(b) => b,
+                Err(e) => {
+                    // Same evidence block as `run`'s failure arms: final
+                    // frame + serial tail + VNC, attached to the cause
+                    // (banner timeout, fatal signature, stall watchdog).
+                    let report = boot_failure_report(
+                        &scope.mon,
+                        &scope.serial_log,
+                        &scope.shots_dir,
+                        &scope.vnc,
+                    )
+                    .await;
+                    anyhow::bail!("{e:#}\n{report}");
+                }
+            };
             // Committed proof: one tested-isos.jsonl line from the image's
             // sidecar, plus a README table refresh when the markers exist.
             // Best-effort throughout — images built before sidecars existed
@@ -1891,7 +1956,10 @@ fn fatal_boot_patterns() -> Vec<String> {
         .collect()
 }
 
-fn check_boot_failure(serial_log: &str, shots_dir: &Path) -> Result<()> {
+/// Fatal serial signature check (see [`fatal_boot_patterns`]): returns the
+/// cause only — `cmd_run`'s failure arms append the evidence block (frame
+/// path + serial tail + VNC) via [`boot_failure_report`].
+fn check_boot_failure(serial_log: &str) -> Result<()> {
     let fatal = fatal_boot_patterns();
     let text = std::fs::read_to_string(serial_log).unwrap_or_default();
     // Only the tail matters (log persists across runs); keep the last 8 KB.
@@ -1902,11 +1970,7 @@ fn check_boot_failure(serial_log: &str, shots_dir: &Path) -> Result<()> {
     };
     for pat in &fatal {
         if tail.contains(pat) {
-            anyhow::bail!(
-                "guest failed to boot (serial shows {pat:?}); VNC {url} or latest screenshot in {shots} for the screen",
-                url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string()),
-                shots = shots_dir.display(),
-            );
+            anyhow::bail!("guest failed to boot (serial shows {pat:?})");
         }
     }
     Ok(())
@@ -1966,9 +2030,11 @@ impl BlockIdle {
         }
         let idle = self.last_change.elapsed().as_secs();
         if idle >= timeouts::IDLE_BAIL_SECS {
+            // Cause only; `cmd_run`'s failure arm appends frame + serial +
+            // VNC via [`boot_failure_report`] (install keeps its announced
+            // time-lapse frames as the evidence).
             anyhow::bail!(
-                "guest appears stuck: no disk I/O for {idle}s and no SSH — likely parked at an input screen (recovery, EULA). VNC {url} or latest screenshot for the screen",
-                url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string()),
+                "guest appears stuck: no disk I/O for {idle}s and no SSH — likely parked at an input screen (recovery, EULA)"
             );
         }
         if idle >= timeouts::IDLE_WARN_SECS && !self.warned {
@@ -1990,14 +2056,132 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
     vm_dir.join(SCREENSHOTS_DIR)
 }
 
+/// Coarse verdict on what the guest screen shows — the one-line answer
+/// boot failures print so they are readable without VNC. Deliberately
+/// heuristic (no OCR): three buckets that separate the cases that matter —
+/// nothing on screen, a flat saturated frame (BSOD/WinRE-class screens are
+/// one solid background), and anything else (desktop, lock screen, OVMF
+/// text, gradients).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenState {
+    /// Essentially all pixels near-black: firmware no-display or blank.
+    Dark,
+    /// One flat saturated color owns the frame: BSOD/recovery-class screen.
+    SolidError,
+    /// Anything else.
+    Content,
+}
+
+impl std::fmt::Display for ScreenState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ScreenState::Dark => "screen is black (no visible output)",
+            ScreenState::SolidError => {
+                "screen shows a solid-color error screen (BSOD/recovery-like)"
+            }
+            ScreenState::Content => "screen shows content",
+        })
+    }
+}
+
+/// Classify raw RGB (as parsed by [`parse_ppm_p6`]). Sampling every 4th
+/// pixel keeps 1280x800 frames well under a millisecond while the
+/// statistics (dark share, dominant quantized bucket) stay exact enough.
+fn classify_screen(rgb: &[u8]) -> ScreenState {
+    if rgb.is_empty() {
+        return ScreenState::Dark;
+    }
+    let mut n = 0u32;
+    let mut dark = 0u32;
+    let mut buckets = std::collections::HashMap::<u16, u32>::new();
+    for px in rgb.as_chunks::<3>().0.iter().step_by(4) {
+        let (r, g, b) = (px[0], px[1], px[2]);
+        n += 1;
+        if r < 24 && g < 24 && b < 24 {
+            dark += 1;
+        }
+        // Quantize to 16 levels/channel: flat frames collapse into one
+        // bucket, gradients and photos spread across many.
+        let key = (((r >> 4) as u16) << 8) | (((g >> 4) as u16) << 4) | ((b >> 4) as u16);
+        *buckets.entry(key).or_insert(0) += 1;
+    }
+    if dark * 100 >= n * 95 {
+        return ScreenState::Dark;
+    }
+    // Dominant bucket ≥ 80% and saturated (max-min channel ≥ 32 in the
+    // bucket's center color) = flat error screen; flat gray/white or any
+    // spread-out frame stays Content.
+    let (top_key, top) = buckets
+        .into_iter()
+        .max_by_key(|&(_, c)| c)
+        .unwrap_or((0, 0));
+    if top * 100 >= n * 80 {
+        // Decode the bucket back to a representative color: each nibble is
+        // the 4 quantization bits, center = n*16+8.
+        let center = |nib: u16| (nib & 0xF) as u8 * 16 + 8;
+        let (r, g, b) = (
+            center(top_key >> 8),
+            center((top_key >> 4) & 0xF),
+            center(top_key & 0xF),
+        );
+        let sat = r.max(g).max(b) - r.min(g).min(b);
+        if sat >= 32 {
+            return ScreenState::SolidError;
+        }
+    }
+    ScreenState::Content
+}
+
+/// Evidence block for a failed boot wait: final frame (path + screen
+/// classification), last serial line, VNC coordinates. Pure formatter so
+/// the layout is unit-testable; [`boot_failure_report`] gathers the parts.
+fn format_failure_report(
+    frame: Option<(PathBuf, ScreenState)>,
+    serial: &str,
+    vnc: &Option<String>,
+) -> String {
+    let mut out = match frame {
+        Some((p, s)) => format!("boot diagnosis: {s} — {}", p.display()),
+        None => "boot diagnosis: no screenshot could be captured".to_string(),
+    };
+    if !serial.is_empty() {
+        out.push_str(&format!("\n  last serial: {serial}"));
+    }
+    if let Some(u) = vnc {
+        out.push_str(&format!("\n  vnc: {u} (password {PROVEN_VNC_PASSWORD})"));
+    }
+    out
+}
+
+/// Gather the evidence for [`format_failure_report`]: one final frame off
+/// the live monitor (the serial is silent through a Windows boot, so the
+/// screen is the primary witness), the last meaningful serial line, and
+/// the caller's VNC coordinates. Every part is best-effort — a missing
+/// piece is stated, never invented.
+async fn boot_failure_report(
+    mon: &crate::ipc::Monitor,
+    serial_log: &str,
+    shots_dir: &Path,
+    vnc: &Option<String>,
+) -> String {
+    let frame = take_screenshot(mon, shots_dir).await;
+    let serial = last_serial_line(serial_log);
+    format_failure_report(frame, &serial, vnc)
+}
+
 /// One screendump frame: `screendump` to PPM, converted in-crate to PNG
 /// (README-displayable; tens to low hundreds of KB depending on screen
 /// content vs 1.4 MB raw), PPM deleted. Frames land as
-/// `<screenshots_dir>/screenshot-<epoch>.png`.
+/// `<screenshots_dir>/screenshot-<epoch>.png`, each paired with the
+/// [`ScreenState`] verdict from [`classify_screen`] so callers can
+/// announce *what* the screen shows, not just where the file is.
 /// Best-effort (logs, never fails): the monitor may be busy mid-command
 /// and a missed frame is not worth failing an install over.
-/// Returns the PNG path on success so callers can announce it.
-async fn take_screenshot(mon: &crate::ipc::Monitor, screenshots_dir: &Path) -> Option<PathBuf> {
+/// Returns the PNG path + state on success so callers can announce it.
+async fn take_screenshot(
+    mon: &crate::ipc::Monitor,
+    screenshots_dir: &Path,
+) -> Option<(PathBuf, ScreenState)> {
     if std::fs::create_dir_all(screenshots_dir).is_err() {
         return None;
     }
@@ -2021,13 +2205,15 @@ async fn take_screenshot(mon: &crate::ipc::Monitor, screenshots_dir: &Path) -> O
         .map_err(anyhow::Error::from)
         .and_then(|d| {
             let (w, h, rgb) = parse_ppm_p6(&d)?;
-            write_png(&png_path, w, h, &rgb)
+            let state = classify_screen(&rgb);
+            write_png(&png_path, w, h, &rgb)?;
+            Ok((png_path, state))
         });
     // Always clean up the raw PPM: success deletes it anyway, and a failed
     // conversion must not leak multi-MB dumps on every cadence tick.
     let _ = std::fs::remove_file(&ppm);
     match result {
-        Ok(_) => Some(png_path),
+        Ok(ok) => Some(ok),
         Err(e) => {
             eprintln!("warning: ppm->png failed ({e:#})");
             None
@@ -2148,24 +2334,24 @@ fn spawn_screenshots(
         // then on cadence. Numbered, basename-only (the dir was announced
         // once above), so the log reads as progress toward the SSH answer.
         let mut n = 0u64;
-        let announce = |n: u64, p: PathBuf| {
+        let announce = |n: u64, p: PathBuf, s: ScreenState| {
             eprintln!(
-                "installer screenshot {n}: {}",
+                "installer screenshot {n}: {} ({s})",
                 p.file_name().unwrap_or_default().to_string_lossy()
             );
         };
-        if let Some(p) = take_screenshot(&mon, &screenshots_dir).await {
+        if let Some((p, s)) = take_screenshot(&mon, &screenshots_dir).await {
             n += 1;
-            announce(n, p);
+            announce(n, p, s);
         }
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate tick
         loop {
             ticker.tick().await;
-            if let Some(p) = take_screenshot(&mon, &screenshots_dir).await {
+            if let Some((p, s)) = take_screenshot(&mon, &screenshots_dir).await {
                 n += 1;
-                announce(n, p);
+                announce(n, p, s);
             }
         }
     })
@@ -2209,12 +2395,14 @@ async fn banner_once(port: u16) -> Option<String> {
 /// password never touches the answer file.
 /// Shared observability for the install/boot waits: the one monitor
 /// session plus the paths it watches. Bundled so the wait fns don't
-/// sprawl argument lists (clippy limit is 7).
+/// sprawl argument lists (clippy limit is 7). `vnc` is the report
+/// coordinate (None for gtk/cocoa/none displays).
 #[derive(Clone)]
 struct GuestScope {
     mon: std::sync::Arc<crate::ipc::Monitor>,
     shots_dir: PathBuf,
     serial_log: String,
+    vnc: Option<String>,
 }
 
 async fn wait_install_ready(
@@ -2245,7 +2433,7 @@ async fn wait_install_ready(
             break b;
         }
         // Dead-screen watchdog (same as run): fail fast with evidence.
-        check_boot_failure(&scope.serial_log, &scope.shots_dir)?;
+        check_boot_failure(&scope.serial_log)?;
         // Stall watchdog: frozen disk I/O + no banner = parked.
         idle.poll(&scope.mon).await?;
         tokio::time::sleep(timeouts::SSH_POLL_INTERVAL).await;
@@ -2643,5 +2831,86 @@ mod tests {
         // No virtio hash in the fixture → falls back to the ISO name.
         assert!(table.contains("virtio-win.iso"), "{table}");
         assert_eq!(epoch_to_date(1_758_600_000), "2025-09-23");
+    }
+
+    // --- boot failure screen classification -------------------------------
+
+    fn flat(w: usize, h: usize, rgb: [u8; 3]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 3);
+        for _ in 0..w * h {
+            v.extend_from_slice(&rgb);
+        }
+        v
+    }
+
+    #[test]
+    fn screen_state_black_frame_is_dark() {
+        assert_eq!(classify_screen(&flat(64, 64, [0, 0, 0])), ScreenState::Dark);
+        // Sparse text on black (OVMF prompt, spinning dots) stays dark.
+        let mut rgb = flat(64, 64, [0, 0, 0]);
+        rgb[..600].fill(220);
+        assert_eq!(classify_screen(&rgb), ScreenState::Dark);
+        // Degenerate empty frame: nothing captured = nothing to see.
+        assert_eq!(classify_screen(&[]), ScreenState::Dark);
+    }
+
+    #[test]
+    fn screen_state_flat_saturated_is_error() {
+        // BSOD blue #0078D7 with a white text band (the real screen).
+        let mut rgb = flat(100, 100, [0, 120, 215]);
+        for px in rgb.as_chunks_mut::<3>().0.iter_mut().skip(900).take(100) {
+            px.copy_from_slice(&[255, 255, 255]);
+        }
+        assert_eq!(classify_screen(&rgb), ScreenState::SolidError);
+    }
+
+    #[test]
+    fn screen_state_gradient_and_flat_gray_are_content() {
+        // Gradient (lock-screen style): spread across buckets → content.
+        let mut rgb = Vec::with_capacity(100 * 100 * 3);
+        for y in 0..100u8 {
+            for x in 0..100u8 {
+                rgb.extend_from_slice(&[x * 2, y * 2, 128]);
+            }
+        }
+        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        // Flat gray: dominant but unsaturated (not the error signature).
+        assert_eq!(
+            classify_screen(&flat(64, 64, [128, 128, 128])),
+            ScreenState::Content
+        );
+    }
+
+    #[test]
+    fn failure_report_carries_frame_serial_vnc() {
+        let report = format_failure_report(
+            Some((
+                PathBuf::from("/vm/screenshots/screenshot-1.png"),
+                ScreenState::SolidError,
+            )),
+            "BdsDxe: starting Boot0003",
+            &Some("vnc://127.0.0.1:5910".to_string()),
+        );
+        assert!(report.contains("solid-color error screen"), "{report}");
+        assert!(
+            report.contains("/vm/screenshots/screenshot-1.png"),
+            "{report}"
+        );
+        assert!(
+            report.contains("last serial: BdsDxe: starting Boot0003"),
+            "{report}"
+        );
+        assert!(report.contains("vnc: vnc://127.0.0.1:5910"), "{report}");
+    }
+
+    #[test]
+    fn failure_report_states_missing_parts() {
+        let report = format_failure_report(None, "", &None);
+        assert!(
+            report.contains("no screenshot could be captured"),
+            "{report}"
+        );
+        assert!(!report.contains("last serial"), "{report}");
+        assert!(!report.contains("vnc:"), "{report}");
     }
 }

@@ -32,8 +32,9 @@ pub const BOOT_SSH_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// and a parked guest is caught separately by [`IDLE_BAIL_SECS`].
 pub const INSTALL_SSH_DEADLINE_SECS: u64 = 6 * 60 * 60;
 
-/// Default for `--screenshots-every-secs`; also the cadence `run
-/// --win-iso` uses for its install-chain time-lapse (it has no flag).
+/// Default for `--screenshots-every-secs`: the install time-lapse and
+/// `run`'s boot time-lapse cadence (also what `run --win-iso` uses for
+/// its install-chain time-lapse, which has no flag of its own).
 pub const SCREENSHOTS_EVERY_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
