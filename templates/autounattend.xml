@@ -115,8 +115,18 @@
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
           <Order>7</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</Path>
-          <Description>Open Firewall Port 22</Description>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
+          <Description>Configure Firewall for SSH</Description>
+        </RunSynchronousCommand>
+        <!-- NLA leaves a headless NIC Unidentified for ~300 s while it
+             probes for a domain/network location before assigning a
+             firewall profile. Force Private so background services stop
+             stalling on the probe (the firewall rule above already
+             accepts port 22 on Any profile regardless). -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>8</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"</Path>
+          <Description>Set Network Category to Private</Description>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>

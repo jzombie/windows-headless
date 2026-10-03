@@ -441,8 +441,25 @@ impl HeadlessVmBuilder {
                 self.vars_file().display()
             ));
         }
+        // Target disk on the SAME NVMe controller + serial boot_argv uses
+        // (inbox stornvme; part.txt/InstallTo pick Disk 0 — see the
+        // template header): identical bus topology across install and
+        // first boot means no controller change, no NIC slot shift, no
+        // minutes-long PnP re-enumeration. Never `if=virtio` here — the
+        // answer file loads no storage driver.
+        //
+        // Deliberately NO bootindex on the install NVMe (unlike
+        // boot_argv): any bootindex makes OVMF build its boot list
+        // exclusively from the fw_cfg bootorder file, and unindexed
+        // devices (the installer CD) get no boot option at all —
+        // observed live: setup drops to the UEFI shell instead of
+        // booting the ISO. Without one, OVMF enumerates every device
+        // and falls through to the installer (today's proven path, with
+        // -boot order=d below unchanged).
         a.push("-drive".into());
-        a.push(format!("file={disk},format=qcow2,if=virtio"));
+        a.push(format!("file={disk},format=qcow2,if=none,id=tgt"));
+        a.push("-device".into());
+        a.push("nvme,drive=tgt,serial=nvme1".into());
         a.push("-drive".into());
         a.push(format!("file={win_iso},media=cdrom,readonly=on"));
         a.push("-drive".into());
@@ -898,9 +915,34 @@ mod tests {
                     .iter()
                     .any(|a| a.contains("if=virtio") && a.starts_with("file=fat:"))
             );
+            // Install target: NVMe (same controller as boot_argv, never
+            // virtio-blk) but WITHOUT bootindex — any bootindex starves
+            // the unindexed installer CD of a boot option in OVMF
+            // (observed: setup drops to the UEFI shell instead).
             let os = argv.iter().find(|a| a.contains(".qcow2")).unwrap();
-            assert!(os.contains("if=virtio"));
+            assert!(os.contains("if=none,id=tgt"), "got {os}");
+            assert!(argv.iter().any(|a| a == "nvme,drive=tgt,serial=nvme1"));
+            assert!(!argv.iter().any(|a| a.contains("bootindex")));
         }
+    }
+
+    #[test]
+    fn install_and_boot_share_the_nvme_controller() {
+        // One controller identity across install and first boot: same
+        // device string (bus topology + serial), differing only by
+        // boot_argv's bootindex (firmware boot priority only — invisible
+        // to Windows PnP, so it never perturbs device enumeration).
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
+        let install = b.install_argv("d.qcow2", "w.iso", "v.iso", None);
+        let boot = b.boot_argv("d.qcow2");
+        let dev = |argv: &[String]| {
+            argv.iter()
+                .find(|a| a.starts_with("nvme,drive=tgt"))
+                .expect("NVMe target device present")
+                .clone()
+        };
+        assert_eq!(dev(&install), "nvme,drive=tgt,serial=nvme1");
+        assert_eq!(dev(&boot), "nvme,drive=tgt,serial=nvme1,bootindex=0");
     }
 
     #[test]

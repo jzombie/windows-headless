@@ -272,6 +272,11 @@ mod tests {
             "OpenSSH-Win64",
             "OpenSSH-Win64.zip",
             "New-NetFirewallRule",
+            // SSH must be reachable regardless of NLA's profile verdict
+            // (headless boots sit Unidentified ~300 s), and the profile
+            // itself is forced Private so background probes stop stalling.
+            "-Profile Any",
+            "Set-NetConnectionProfile",
             "NetworkLocation",
             "TimeZone",
         ] {
@@ -297,36 +302,40 @@ mod tests {
         // A gap (orders starting at 2) fails Setup with 0x800700D
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
+        // Both command passes are checked: specialize carries the SSH
+        // firewall/NLA commands too (orders 1..=8).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,
                 ..VmConfig::default()
             }
             .generate_unattend_xml();
-            let pe = xml
-                .split("<settings pass=\"windowsPE\">")
-                .nth(1)
-                .unwrap()
-                .split("</settings>")
-                .next()
-                .unwrap();
-            let rs = pe
-                .split("<RunSynchronous>")
-                .nth(1)
-                .unwrap()
-                .split("</RunSynchronous>")
-                .next()
-                .unwrap();
-            let orders: Vec<u32> = rs
-                .split("<Order>")
-                .skip(1)
-                .map(|s| s.split("</Order>").next().unwrap().parse().unwrap())
-                .collect();
-            assert_eq!(
-                orders,
-                (1..=orders.len() as u32).collect::<Vec<_>>(),
-                "gap in {arch:?}: {orders:?}"
-            );
+            for pass in ["windowsPE", "specialize"] {
+                let section = format!("<settings pass=\"{pass}\">");
+                let rs = xml
+                    .split(&section)
+                    .nth(1)
+                    .unwrap()
+                    .split("</settings>")
+                    .next()
+                    .unwrap()
+                    .split("<RunSynchronous>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</RunSynchronous>")
+                    .next()
+                    .unwrap();
+                let orders: Vec<u32> = rs
+                    .split("<Order>")
+                    .skip(1)
+                    .map(|s| s.split("</Order>").next().unwrap().parse().unwrap())
+                    .collect();
+                assert_eq!(
+                    orders,
+                    (1..=orders.len() as u32).collect::<Vec<_>>(),
+                    "gap in {arch:?} pass {pass}: {orders:?}"
+                );
+            }
         }
     }
 
