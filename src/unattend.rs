@@ -286,6 +286,13 @@ mod tests {
             // post-install SSH step only applies once Setup hits Ready.
             "bootstatuspolicy IgnoreAllFailures",
             "recoveryenabled No",
+            // Headless diet: firewall off (slirp NAT gates inbound; the
+            // firewall sat on port 22 ~27s after sshd bound — measured),
+            // SSH-only service trim. Defender RT is tamper-locked (no
+            // no-op order shipped).
+            "netsh advfirewall set allprofiles state off",
+            "'Spooler','WSearch'",
+            "'RemoteRegistry','lfsvc'",
             "NetworkLocation",
             "TimeZone",
         ] {
@@ -312,8 +319,8 @@ mod tests {
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
         // Both command passes are checked: specialize carries the gpsvc
-        // repair, the SSH firewall/NLA commands, and the recovery
-        // policy (orders 1..=14).
+        // repair, the SSH firewall/NLA commands, the recovery policy, and
+        // the headless network/service diet (orders 1..=18).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,

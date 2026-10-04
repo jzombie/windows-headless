@@ -542,6 +542,16 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             ),
         }
     }
+    // Stale serial from a previous session: drop it before the spawn.
+    // QEMU's chardev truncates on open, but the baseline below must be 0
+    // *without racing OVMF's first line* (reading after spawn often found
+    // the first `BdsDxe: starting` already written and swallowed the
+    // "guest booted" narration); an old file would also skew a pre-spawn
+    // read.
+    let _ = std::fs::remove_file(crate::ipc::vm_endpoint(
+        &vm_dir,
+        crate::ipc::SERIAL_LOG_NAME,
+    ));
     let mut b = HeadlessVmBuilder::new(WindowsVersion::Win11)
         .ssh_port(a.ssh_port)
         .display(a.display.clone())
@@ -570,6 +580,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         a.ssh_port,
         timeouts::BOOT_SSH_DEADLINE.as_secs() / 60
     );
+    // Stale serial from a previous session was dropped pre-spawn so the
+    // baseline below is 0 (never a post-spawn read racing OVMF's line).
     let mut vm = b.boot_existing(&disk).await?;
     // One monitor session for the whole boot: VNC handshake plus the stall
     // watchdog below share it (single-client transports forbid overlap).
@@ -615,8 +627,10 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     let mut idle = BlockIdle::new();
     // Reboot awareness below the screenshot layer: OVMF's per-boot handoff
     // line in the serial file, so "the guest bounced" is announced even
-    // while the screen looks like nothing happened.
-    let mut boots_seen = boot_count(&vm.builder.serial_log);
+    // while the screen looks like nothing happened. Baseline 0 (the stale
+    // file was removed pre-spawn) — never a post-spawn read, which races
+    // OVMF's first line.
+    let mut boots_seen = 0u64;
     // Boot time-lapse bookkeeping: cadence is honored inside the ticker
     // loop (first frame after a full interval, matching `install`), so it
     // stops the moment the wait ends — no background task leaking into the
