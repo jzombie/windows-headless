@@ -37,11 +37,15 @@ Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
 60 seconds until SSH answers — installs as a time-lapse, `run` boots as a
 boot time-lapse (`--screenshots-every-secs`, `0` disables). Boot failures
 end with a diagnosis block: latest frame path + screen state (black /
-solid-color error / modal error dialog / content) + last serial line, so
+solid color field / modal error dialog / content) + last serial line, so
 dead boots are readable without VNC. `black` means literally no visible
-pixel — text or a spinner on black is content. Black and solid-color
-verdicts only stand while the frame is static — real error screens don't
-animate, the installer's flat progress screens do (spinner/percent).
+pixel — text or a spinner on black is content. The classifier never
+claims "error" from color shape alone: the main Windows Setup progress
+screen is itself a flat saturated blue, so a flat frame only counts when
+nothing at all is rendered on it (≥99.5% one color, <0.1% white, no UI),
+and it says `solid color field`, not "error". Black and flat-field
+verdicts only stand while the frame is static — animated screens demote
+to content (spinner/percent).
 Firmware reboots are counted from the serial log (OVMF `BdsDxe: starting`
 handoffs): `guest rebooted (firmware boot #N seen on serial)` lines print
 while waiting for SSH, and failure reports carry `guest boots seen`.

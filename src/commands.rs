@@ -2096,19 +2096,28 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 
 /// Coarse verdict on what the guest screen shows — the one-line answer
 /// boot failures print so they are readable without VNC. Deliberately
-/// heuristic (no OCR): four buckets that separate the cases that matter —
-/// nothing on screen, a flat saturated frame, a modal failure dialog
-/// (caught by its red error icon), and anything else (desktop, OVMF text,
-/// gradients). The flat/black verdicts only stand while the frame is
-/// static: installer progress screens are flat too but animate, so
-/// [`effective_state`] withdraws them once the previous frame moved.
+/// heuristic (no OCR): four buckets — nothing on screen, a bare color
+/// field with no UI, a modal failure dialog (red error icon), and
+/// anything else (desktop, OVMF text, gradients, installer progress).
+/// The classifier never claims "error" on color shape alone: the main
+/// Windows Setup screen is itself a flat saturated blue, and a false
+/// "error screen" announcement is worse than a bland "content" (users
+/// assume the tool is broke). The flat/black verdicts only stand while
+/// the frame is static; [`effective_state`] withdraws them once the
+/// previous frame moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
     /// No pixel visibly lit anywhere: literally nothing on screen. A
     /// spinner dot or a line of text on black is *content*, not this.
     Dark,
-    /// One flat saturated color owns the frame: BSOD/recovery-class screen.
-    SolidError,
+    /// A bare color field fills the frame with no visible text or UI
+    /// (firmware/GPU output, test patterns). Deliberately NOT an error
+    /// claim: the Windows Setup progress screen is a flat saturated blue
+    /// too — color uniformity alone cannot tell the two apart (live
+    /// 2026-10-04: the main installer screen was 99% #005A9E and the old
+    /// 80% rule announced it as a "BSOD/recovery-like error"). Any
+    /// text-bearing screen — setup, BSOD, recovery — is [`ScreenState::Content`].
+    FlatField,
     /// A modal error dialog is up (its red error icon is visible): setup or
     /// OOBE failure dialog that sits there until someone clicks OK — the
     /// failure mode where screenshots keep flowing but nothing progresses.
@@ -2121,9 +2130,7 @@ impl std::fmt::Display for ScreenState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             ScreenState::Dark => "screen is black (no visible output)",
-            ScreenState::SolidError => {
-                "screen shows a solid-color error screen (BSOD/recovery-like)"
-            }
+            ScreenState::FlatField => "screen shows a solid color field (no UI visible)",
             ScreenState::ErrorDialog => "screen shows a MODAL ERROR DIALOG (failure dialog up)",
             ScreenState::Content => "screen shows content",
         })
@@ -2159,32 +2166,49 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
         let key = (((r >> 4) as u16) << 8) | (((g >> 4) as u16) << 4) | ((b >> 4) as u16);
         *buckets.entry(key).or_insert(0) += 1;
     }
-    // Dominant bucket ≥ 80% and saturated (max-min channel ≥ 32 in the
-    // bucket's center color) = flat error screen; flat gray/white or any
-    // spread-out frame stays Content.
     let (top_key, top) = buckets
         .into_iter()
         .max_by_key(|&(_, c)| c)
         .unwrap_or((0, 0));
-    if top * 100 >= n * 80 {
-        // Decode the bucket back to a representative color: each nibble is
-        // the 4 quantization bits, center = n*16+8.
-        let center = |nib: u16| (nib & 0xF) as u8 * 16 + 8;
-        let (r, g, b) = (
-            center(top_key >> 8),
-            center((top_key >> 4) & 0xF),
-            center(top_key & 0xF),
-        );
-        let sat = r.max(g).max(b) - r.min(g).min(b);
-        if sat >= 32 {
-            return ScreenState::SolidError;
+    // Bare color field: near-total flatness AND near-zero ink AND a
+    // saturated color, all required. The old ≥80%-flat rule matched the
+    // Windows Setup progress screen (99.07% #005A9E, sat 144) and
+    // announced the main installer screen as a "BSOD/recovery-like error"
+    // — color uniformity can't separate those screens, so this verdict
+    // only survives when there is nothing rendered at all: ≥99.5% one
+    // bucket (Setup sits at 99.07% — its text/spinner keep it out) and
+    // <0.1% white-ish pixels (Setup: 0.18% — title, percent, Cancel).
+    // Each gate alone excludes Setup; a text-bearing screen never reaches
+    // the saturation check (flat gray/white stays Content).
+    if top * 1000 >= n * 995 {
+        let whiteish = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .step_by(4)
+            .filter(|px| px[0] >= 200 && px[1] >= 200 && px[2] >= 200)
+            .count() as u32;
+        if whiteish * 1000 < n {
+            // Decode the bucket back to a representative color: each nibble
+            // is the 4 quantization bits, center = n*16+8.
+            let center = |nib: u16| (nib & 0xF) as u8 * 16 + 8;
+            let (r, g, b) = (
+                center(top_key >> 8),
+                center((top_key >> 4) & 0xF),
+                center(top_key & 0xF),
+            );
+            let sat = r.max(g).max(b) - r.min(g).min(b);
+            if sat >= 32 {
+                return ScreenState::FlatField;
+            }
         }
     }
     // Modal failure dialogs (the setup "restarted unexpectedly" loop, OOBE
-    // errors): a saturated red error icon on the frame. Checked last so
-    // solid-color screens keep their own verdict, and quantitatively loose
-    // (>= 50 sampled red pixels ≈ a ~200 px icon) because this only ever
-    // feeds an announcement — never an automatic failure verdict.
+    // errors): a saturated red error icon on the frame. Checked after the
+    // flat-field gate (a bare color field keeps its own verdict), and
+    // quantitatively loose (>= 50 sampled red pixels ≈ a ~200 px icon)
+    // because this only ever feeds an announcement — never an automatic
+    // failure verdict.
     let red = rgb
         .as_chunks::<3>()
         .0
@@ -2205,8 +2229,8 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
 static LAST_FRAME: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
 /// Has the screen changed enough since `prev` to count as animation? The
-/// installer's spinner/dots/percent ticks are a few hundred pixels; real
-/// error screens (BSOD, recovery) never change between samples. Sampling
+/// installer's spinner/dots/percent ticks are a few hundred pixels; a
+/// genuinely dead screen never changes between samples. Sampling
 /// every 4th pixel with a small per-channel tolerance keeps a minute-apart
 /// comparison cheap and immune to sub-threshold jitter, while a resized
 /// frame is conservatively "moved".
@@ -2229,17 +2253,17 @@ fn frame_moved(prev: &[u8], cur: &[u8]) -> bool {
     changed > 50
 }
 
-/// Motion-aware adjustment of [`classify_screen`]: a flat-color or black
-/// verdict only survives when the frame stood still since the previous
-/// one — the live installer's blue/black progress screens are flat and
-/// dark but animate (spinner, percent), so they demote to plain content.
-/// Real error screens don't move and keep their verdict; [`ScreenState::ErrorDialog`]
+/// Motion-aware adjustment of [`classify_screen`]: a bare-color-field or
+/// black verdict only survives when the frame stood still since the
+/// previous one — progress/firmware screens can look flat but animate
+/// (spinner, percent), so they demote to plain content. A genuinely dead
+/// frame doesn't move and keeps its verdict; [`ScreenState::ErrorDialog`]
 /// is never demoted (a spinning loader under a modal dialog still means
 /// the dialog is up). First frame has no predecessor and is reported as
 /// classified.
 fn effective_state(raw: ScreenState, moved: bool) -> ScreenState {
     match raw {
-        ScreenState::Dark | ScreenState::SolidError if moved => ScreenState::Content,
+        ScreenState::Dark | ScreenState::FlatField if moved => ScreenState::Content,
         other => other,
     }
 }
@@ -3028,13 +3052,41 @@ mod tests {
     }
 
     #[test]
-    fn screen_state_flat_saturated_is_error() {
-        // BSOD blue #0078D7 with a white text band (the real screen).
-        let mut rgb = flat(100, 100, [0, 120, 215]);
-        for px in rgb.as_chunks_mut::<3>().0.iter_mut().skip(900).take(100) {
-            px.copy_from_slice(&[255, 255, 255]);
+    fn screen_state_windows_setup_progress_is_content() {
+        // Live frames 2026-10-04 ("Installing Windows 11", 5–7%): the
+        // background is 99.07% of the frame at #005A9E (saturated blue,
+        // bucket share 99.07% < 99.5) and the ink — title, percent,
+        // Cancel — is 0.18% white-ish. The old ≥80%-flat rule announced
+        // this MAIN installer screen as a "BSOD/recovery-like error";
+        // both new gates must exclude it independently.
+        let (w, h) = (100u32, 100u32);
+        // Ink-gate case: white text plus antialias pixels that stay in the
+        // background's own bucket (flat share 99.82% — passes flatness,
+        // fails the 0.1% white gate).
+        let mut rgb = flat(w as usize, h as usize, [0, 90, 158]);
+        let put = |rgb: &mut [u8], i: usize, c: [u8; 3]| {
+            rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
+        };
+        for k in 0..18 {
+            put(&mut rgb, k * 431 + 17, [255, 255, 255]);
         }
-        assert_eq!(classify_screen(&rgb), ScreenState::SolidError);
+        for k in 0..75 {
+            put(&mut rgb, k * 131 + 200, [0, 90, 150]);
+        }
+        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        // Flatness-gate case: 1% dark ink and NOT one white pixel (flat
+        // share 99.0% < 99.5 — fails flatness, passes the white gate).
+        let mut rgb = flat(w as usize, h as usize, [0, 90, 158]);
+        for k in 0..100 {
+            put(&mut rgb, k * 97 + 5, [10, 10, 10]);
+        }
+        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        // A true bare color field (no ink at all) still gets the verdict —
+        // neutral wording, no "error" claim.
+        assert_eq!(
+            classify_screen(&flat(64, 64, [0, 120, 215])),
+            ScreenState::FlatField
+        );
     }
 
     #[test]
@@ -3076,11 +3128,11 @@ mod tests {
             }
         }
         assert_eq!(classify_screen(&rgb), ScreenState::ErrorDialog);
-        // Ordering guard: a full-frame saturated screen keeps the BSOD-class
-        // verdict even though every pixel also matches the icon test.
+        // Ordering guard: a full-frame color field keeps its own verdict
+        // even though every pixel also matches the icon test.
         assert_eq!(
             classify_screen(&flat(64, 64, [220, 60, 50])),
-            ScreenState::SolidError
+            ScreenState::FlatField
         );
     }
 
@@ -3088,15 +3140,15 @@ mod tests {
     fn motion_withdraws_flat_verdicts_only_when_the_frame_changed() {
         let a = flat(64, 64, [0, 120, 215]);
         let a_again = a.clone();
-        // Static frames keep the verdict: a real BSOD never animates.
+        // Static frames keep the verdict: a dead screen never animates.
         assert!(!frame_moved(&a, &a_again));
         assert_eq!(
-            effective_state(ScreenState::SolidError, false),
-            ScreenState::SolidError
+            effective_state(ScreenState::FlatField, false),
+            ScreenState::FlatField
         );
         assert_eq!(effective_state(ScreenState::Dark, false), ScreenState::Dark);
         // A spinner-sized change (400 px here) demotes the flat/black
-        // verdicts: the installer's progress screens look flat but move.
+        // verdicts: progress screens can look flat but move.
         let mut b = a.clone();
         for y in 30..50u32 {
             for x in 30..50u32 {
@@ -3106,7 +3158,7 @@ mod tests {
         }
         assert!(frame_moved(&a, &b));
         assert_eq!(
-            effective_state(ScreenState::SolidError, true),
+            effective_state(ScreenState::FlatField, true),
             ScreenState::Content
         );
         assert_eq!(
@@ -3134,13 +3186,13 @@ mod tests {
         let report = format_failure_report(
             Some((
                 PathBuf::from("/vm/screenshots/screenshot-1.png"),
-                ScreenState::SolidError,
+                ScreenState::FlatField,
             )),
             "BdsDxe: starting Boot0003",
             3,
             &Some("vnc://127.0.0.1:5910".to_string()),
         );
-        assert!(report.contains("solid-color error screen"), "{report}");
+        assert!(report.contains("solid color field"), "{report}");
         assert!(report.contains("guest boots seen: 3"), "{report}");
         assert!(
             report.contains("/vm/screenshots/screenshot-1.png"),
