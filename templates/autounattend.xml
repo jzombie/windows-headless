@@ -83,48 +83,62 @@
   <settings pass="specialize">
     <component name="Microsoft-Windows-Deployment" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
+        <!-- FIRST: gpsvc repair. EventLog's ServiceMain calls gpsvc's
+             IUserProfile2 RPC interface during startup. If the GPSvcGroup
+             svchost entry is missing (corrupt on some installs), gpsvc can
+             never start, the RPC endpoint resolution blocks for its full
+             300 s timeout, and boot-to-SSH sits at ~5 min while firewall /
+             NLA / inbound SSH wait on EventLog. Idempotent: rebuild the
+             standard structure, then start gpsvc so the pending resolution
+             completes in seconds on this boot and every later boot. -->
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$k='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost'; if(-not (Get-ItemProperty -Path $k -Name GPSvcGroup -EA SilentlyContinue)){ New-ItemProperty -Path $k -Name GPSvcGroup -PropertyType MultiString -Value @('gpsvc') -Force | Out-Null }; $g=Join-Path $k 'GPSvcGroup'; if(-not (Test-Path $g)){ New-Item -Path $g -Force | Out-Null }; if(-not (Get-ItemProperty -Path $g -Name AuthenticationCapabilities -EA SilentlyContinue)){ New-ItemProperty -Path $g -Name AuthenticationCapabilities -PropertyType DWord -Value 12320 -Force | Out-Null }; if(-not (Get-ItemProperty -Path $g -Name CoInitializeSecurityParam -EA SilentlyContinue)){ New-ItemProperty -Path $g -Name CoInitializeSecurityParam -PropertyType DWord -Value 1 -Force | Out-Null }; Start-Service -Name gpsvc -EA SilentlyContinue"</Path>
+          <Description>Repair gpsvc svchost group so EventLog starts fast</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
           <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
           <Description>Bypass OOBE Network Requirement</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>2</Order>
+          <Order>3</Order>
           <Path>cmd /c reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE" /v DisablePrivacyExperience /t REG_DWORD /d 1 /f</Path>
           <Description>Disable OOBE Privacy Experience Page</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>3</Order>
+          <Order>4</Order>
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\drivers\NetKVM pnputil /add-driver %L:\drivers\NetKVM\w11\{arch}\netkvm.inf /install)</Path>
           <Description>Install NetKVM network driver (specialize)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>4</Order>
+          <Order>5</Order>
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\tools\{sshzip} powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%L:\tools\{sshzip}' -DestinationPath 'C:\Program Files\OpenSSH' -Force")</Path>
           <Description>Expand OpenSSH Server zip offline from USB</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>5</Order>
+          <Order>6</Order>
           <Path>cmd /c (pushd "C:\Program Files\OpenSSH\{sshdir}" &amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File install-sshd.ps1 > C:\ssh-install.log 2>&amp;1 &amp; exit 0)</Path>
           <Description>Install OpenSSH Server service offline (cwd-safe, logged)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>6</Order>
+          <Order>7</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service -Name sshd"</Path>
           <Description>Configure SSHD Automatic Startup</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>7</Order>
+          <Order>8</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
           <Description>Configure Firewall for SSH</Description>
         </RunSynchronousCommand>
-        <!-- NLA leaves a headless NIC Unidentified for ~300 s while it
-             probes for a domain/network location before assigning a
-             firewall profile. Force Private so background services stop
-             stalling on the probe (the firewall rule above already
+        <!-- NLA only assigns a firewall profile once EventLog is up (its
+             identify events are logged there). With gpsvc broken, EventLog
+             sat Start Pending ~300 s and inbound SSH waited on that profile
+             (Order 1 repairs it). Force Private anyway so background probes
+             can't re-stall identification (the firewall rule above already
              accepts port 22 on Any profile regardless). -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>8</Order>
+          <Order>9</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"</Path>
           <Description>Set Network Category to Private</Description>
         </RunSynchronousCommand>

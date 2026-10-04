@@ -273,10 +273,13 @@ mod tests {
             "OpenSSH-Win64.zip",
             "New-NetFirewallRule",
             // SSH must be reachable regardless of NLA's profile verdict
-            // (headless boots sit Unidentified ~300 s), and the profile
+            // (the profile wait is EventLog's gpsvc stall), and the profile
             // itself is forced Private so background probes stop stalling.
             "-Profile Any",
             "Set-NetConnectionProfile",
+            // gpsvc repair must ship: missing GPSvcGroup blocks EventLog
+            // 300 s on the IUserProfile2 endpoint resolution (5 min boots).
+            "GPSvcGroup",
             "NetworkLocation",
             "TimeZone",
         ] {
@@ -302,8 +305,8 @@ mod tests {
         // A gap (orders starting at 2) fails Setup with 0x800700D
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
-        // Both command passes are checked: specialize carries the SSH
-        // firewall/NLA commands too (orders 1..=8).
+        // Both command passes are checked: specialize carries the gpsvc
+        // repair plus the SSH firewall/NLA commands too (orders 1..=9).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,
