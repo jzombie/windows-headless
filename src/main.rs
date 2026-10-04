@@ -136,7 +136,9 @@ enum Cmd {
         /// Keep Windows Automatic Repair ("Diagnosing your PC") enabled.
         /// Default off: faster boots. With recovery off, a truly damaged
         /// virtual disk fails fast instead of repairing. Snapshots are
-        /// the safety net, not WinRE.
+        /// the safety net, not WinRE. The off default is set at specialize
+        /// (first OS boot, so even an early Ctrl-C is covered); this flag
+        /// re-arms recovery when Setup reports Ready.
         #[arg(long, default_value_t = false)]
         recovery: bool,
         /// Leave Windows Update automatic (download + install + reboot on

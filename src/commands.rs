@@ -2629,7 +2629,10 @@ async fn wait_install_ready(
                 }
                 // Recovery policy (default off, docker-like): a damaged disk
                 // fails fast instead of parking at "Diagnosing your PC".
-                // Runs as the end-state credential (post-rotation).
+                // Specialize already set the off state on the first OS boot
+                // (an early Ctrl-C is covered there); this step applies the
+                // flag's end state as the credential (post-rotation) —
+                // `--recovery` re-arms both switches.
                 if let Err(e) = crate::ssh::set_recovery_enabled(
                     PROVEN_SSH_HOST,
                     port,

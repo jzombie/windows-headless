@@ -221,10 +221,22 @@ fn loud_stderr_message(out: &[u8], err: &[u8]) -> Option<String> {
     Some(format!("guest command produced no stdout — stderr: {text}"))
 }
 
+/// One `bcdedit /enum` line check: `key ... want` (whitespace varies).
+fn bcdedit_value_verified(out: &str, key: &str, want: &str) -> bool {
+    out.lines().any(|l| {
+        let l = l.trim().to_ascii_lowercase();
+        l.starts_with(key) && l.ends_with(&want.to_ascii_lowercase())
+    })
+}
+
 /// Enable or disable Windows Automatic Repair ("Diagnosing your PC") on
 /// the guest. Disabled = boots fail fast instead of parking at recovery;
-/// snapshots are the safety net, not WinRE. Verified by reading the entry
-/// back (`bcdedit /enum`) — same trust-nothing rule as `set_auto_updates`.
+/// snapshots are the safety net, not WinRE. Toggles BOTH BCD switches:
+/// `recoveryenabled` gates WinRE invocation, while the "Diagnosing your
+/// PC" screen itself is the boot-status policy (`bootstatuspolicy`) —
+/// IgnoreAllFailures makes winload skip it after an unclean stop.
+/// Verified by reading the entry back (`bcdedit /enum`) — same
+/// trust-nothing rule as `set_auto_updates`.
 pub async fn set_recovery_enabled(
     host: &str,
     port: u16,
@@ -233,6 +245,11 @@ pub async fn set_recovery_enabled(
     enabled: bool,
 ) -> Result<()> {
     let val = if enabled { "Yes" } else { "No" };
+    let policy = if enabled {
+        "DisplayAllFailures"
+    } else {
+        "IgnoreAllFailures"
+    };
     ssh_exec(
         host,
         port,
@@ -241,17 +258,23 @@ pub async fn set_recovery_enabled(
         &format!("bcdedit /set {{current}} recoveryenabled {val}"),
     )
     .await?;
+    ssh_exec(
+        host,
+        port,
+        user,
+        pass,
+        &format!("bcdedit /set {{current}} bootstatuspolicy {policy}"),
+    )
+    .await?;
     let en = ssh_exec(host, port, user, pass, "bcdedit /enum {current}").await?;
-    // `recoveryenabled    Yes|No` (whitespace varies).
-    let ok = en.lines().any(|l| {
-        let l = l.trim().to_ascii_lowercase();
-        l.starts_with("recoveryenabled") && l.ends_with(&val.to_ascii_lowercase())
-    });
-    if !ok {
+    if !bcdedit_value_verified(&en, "recoveryenabled", val) {
         anyhow::bail!("recoveryenabled {val} unverified (bcdedit /enum): {en:?}");
     }
+    if !bcdedit_value_verified(&en, "bootstatuspolicy", policy) {
+        anyhow::bail!("bootstatuspolicy {policy} unverified (bcdedit /enum): {en:?}");
+    }
     eprintln!(
-        "recovery {val} (Automatic Repair {}, verified)",
+        "recovery {val} (Automatic Repair {}, boot status policy {policy}, verified)",
         if enabled { "kept" } else { "disabled" }
     );
     Ok(())
@@ -683,11 +706,42 @@ mod tests {
     #[test]
     fn stderr_is_loud_only_when_it_changes_the_reading() {
         let err = b"ERROR: the key does not exist\r\n";
-        // No stdout: without the loud report a broken command would masquerade
+        // No stdout: without the loud report a broken command would masquer
         // as an empty-but-successful answer (observed live).
         assert!(loud_stderr_message(b"", err).is_some());
         // Routine stderr beside real stdout: that is progress, not an error.
         assert!(loud_stderr_message(b"HKEY_LOCAL_MACHINE\\...\r\n", err).is_none());
         assert!(loud_stderr_message(b"ok", b"").is_none());
+    }
+
+    #[test]
+    fn bcdedit_enum_lines_verify_both_switches() {
+        // Shaped like real `bcdedit /enum {current}` output: variable
+        // whitespace, mixed value widths.
+        let enum_out = "Windows Boot Manager\n---------------------\nidentifier              {bootmgr}\n\nWindows Boot Loader\n-------------------\nidentifier              {current}\npath                    \\Windows\\System32\\winload.efi\ndescription             Windows 11\nrecoveryenabled         No\nbootstatuspolicy        IgnoreAllFailures\n";
+        assert!(bcdedit_value_verified(enum_out, "recoveryenabled", "No"));
+        assert!(bcdedit_value_verified(
+            enum_out,
+            "bootstatuspolicy",
+            "IgnoreAllFailures"
+        ));
+        // Wrong policy (default DisplayAllFailures) must NOT verify.
+        assert!(!bcdedit_value_verified(
+            enum_out,
+            "bootstatuspolicy",
+            "DisplayAllFailures"
+        ));
+        // Keys must anchor at line start: "nrecoveryenabled" fails.
+        assert!(!bcdedit_value_verified(
+            "nrecoveryenabled  No\n",
+            "recoveryenabled",
+            "No"
+        ));
+        // Missing key entirely: verify-never-guess.
+        assert!(!bcdedit_value_verified(
+            "garbage\n",
+            "recoveryenabled",
+            "No"
+        ));
     }
 }

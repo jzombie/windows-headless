@@ -281,6 +281,11 @@ mod tests {
             // 300 s on the IUserProfile2 endpoint resolution (5 min boots).
             "GPSvcGroup",
             "AuthenticationCapabilities",
+            // Recovery off from the first specialize boot: a hard stop
+            // (Ctrl-C) must never surface "Diagnosing your PC" — the
+            // post-install SSH step only applies once Setup hits Ready.
+            "bootstatuspolicy IgnoreAllFailures",
+            "recoveryenabled No",
             "NetworkLocation",
             "TimeZone",
         ] {
@@ -307,7 +312,8 @@ mod tests {
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
         // Both command passes are checked: specialize carries the gpsvc
-        // repair plus the SSH firewall/NLA commands too (orders 1..=12).
+        // repair, the SSH firewall/NLA commands, and the recovery
+        // policy (orders 1..=14).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,

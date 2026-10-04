@@ -163,6 +163,23 @@
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"</Path>
           <Description>Set Network Category to Private</Description>
         </RunSynchronousCommand>
+        <!-- Headless hard stops (Ctrl-C, SIGKILL, QEMU crash) dirty the
+             guest; the next boot must NOT park at "Diagnosing your PC" /
+             Startup Repair. IgnoreAllFailures makes winload skip the
+             boot-status diagnosis, recoveryenabled No keeps WinRE out.
+             Runs at specialize (first OS boot) — the post-install SSH
+             step applies the same policy but only when Setup reaches
+             Ready, which an early stop never does. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>13</Order>
+          <Path>cmd /c bcdedit /set {current} bootstatuspolicy IgnoreAllFailures</Path>
+          <Description>Skip "Diagnosing your PC" after unclean stops</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>14</Order>
+          <Path>cmd /c bcdedit /set {current} recoveryenabled No</Path>
+          <Description>WinRE off by default (fail fast, not repair)</Description>
+        </RunSynchronousCommand>
       </RunSynchronous>
     </component>
   </settings>
