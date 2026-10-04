@@ -90,44 +90,65 @@
              300 s timeout, and boot-to-SSH sits at ~5 min while firewall /
              NLA / inbound SSH wait on EventLog. Idempotent: rebuild the
              standard structure, then start gpsvc so the pending resolution
-             completes in seconds on this boot and every later boot. -->
+             completes in seconds on this boot and every later boot.
+             Deliberately FOUR short reg.exe commands, not one PowerShell
+             one-liner: Setup rejects a Path over ~256 chars with
+             WCM_E_INVALIDVALUE 0x80220005 "Value is invalid", which fails
+             the WHOLE answer file (windeploy 0x1f -> "the computer
+             restarted unexpectedly" loop; live 2026-10-04 with an
+             854-char Path). Every Path stays under 243 chars. -->
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$k='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost'; if(-not (Get-ItemProperty -Path $k -Name GPSvcGroup -EA SilentlyContinue)){ New-ItemProperty -Path $k -Name GPSvcGroup -PropertyType MultiString -Value @('gpsvc') -Force | Out-Null }; $g=Join-Path $k 'GPSvcGroup'; if(-not (Test-Path $g)){ New-Item -Path $g -Force | Out-Null }; if(-not (Get-ItemProperty -Path $g -Name AuthenticationCapabilities -EA SilentlyContinue)){ New-ItemProperty -Path $g -Name AuthenticationCapabilities -PropertyType DWord -Value 12320 -Force | Out-Null }; if(-not (Get-ItemProperty -Path $g -Name CoInitializeSecurityParam -EA SilentlyContinue)){ New-ItemProperty -Path $g -Name CoInitializeSecurityParam -PropertyType DWord -Value 1 -Force | Out-Null }; Start-Service -Name gpsvc -EA SilentlyContinue"</Path>
-          <Description>Repair gpsvc svchost group so EventLog starts fast</Description>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost" /v GPSvcGroup /t REG_MULTI_SZ /d gpsvc /f</Path>
+          <Description>Register gpsvc in the Svchost GPSvcGroup (EventLog fix)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
           <Order>2</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost\GPSvcGroup" /v AuthenticationCapabilities /t REG_DWORD /d 12320 /f</Path>
+          <Description>GPSvcGroup COM AuthenticationCapabilities</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost\GPSvcGroup" /v CoInitializeSecurityParam /t REG_DWORD /d 1 /f</Path>
+          <Description>GPSvcGroup COM CoInitializeSecurityParam</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c (sc start gpsvc &amp; exit 0)</Path>
+          <Description>Start gpsvc now to release a pending EventLog RPC wait</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
           <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
           <Description>Bypass OOBE Network Requirement</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>3</Order>
+          <Order>6</Order>
           <Path>cmd /c reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE" /v DisablePrivacyExperience /t REG_DWORD /d 1 /f</Path>
           <Description>Disable OOBE Privacy Experience Page</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>4</Order>
+          <Order>7</Order>
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\drivers\NetKVM pnputil /add-driver %L:\drivers\NetKVM\w11\{arch}\netkvm.inf /install)</Path>
           <Description>Install NetKVM network driver (specialize)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>5</Order>
+          <Order>8</Order>
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\tools\{sshzip} powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%L:\tools\{sshzip}' -DestinationPath 'C:\Program Files\OpenSSH' -Force")</Path>
           <Description>Expand OpenSSH Server zip offline from USB</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>6</Order>
+          <Order>9</Order>
           <Path>cmd /c (pushd "C:\Program Files\OpenSSH\{sshdir}" &amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File install-sshd.ps1 > C:\ssh-install.log 2>&amp;1 &amp; exit 0)</Path>
           <Description>Install OpenSSH Server service offline (cwd-safe, logged)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>7</Order>
+          <Order>10</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service -Name sshd"</Path>
           <Description>Configure SSHD Automatic Startup</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>8</Order>
+          <Order>11</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
           <Description>Configure Firewall for SSH</Description>
         </RunSynchronousCommand>
@@ -138,7 +159,7 @@
              can't re-stall identification (the firewall rule above already
              accepts port 22 on Any profile regardless). -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>9</Order>
+          <Order>12</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"</Path>
           <Description>Set Network Category to Private</Description>
         </RunSynchronousCommand>

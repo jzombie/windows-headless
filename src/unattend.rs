@@ -280,6 +280,7 @@ mod tests {
             // gpsvc repair must ship: missing GPSvcGroup blocks EventLog
             // 300 s on the IUserProfile2 endpoint resolution (5 min boots).
             "GPSvcGroup",
+            "AuthenticationCapabilities",
             "NetworkLocation",
             "TimeZone",
         ] {
@@ -306,7 +307,7 @@ mod tests {
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
         // Both command passes are checked: specialize carries the gpsvc
-        // repair plus the SSH firewall/NLA commands too (orders 1..=9).
+        // repair plus the SSH firewall/NLA commands too (orders 1..=12).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,
@@ -338,6 +339,50 @@ mod tests {
                     (1..=orders.len() as u32).collect::<Vec<_>>(),
                     "gap in {arch:?} pass {pass}: {orders:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn run_synchronous_paths_stay_short() {
+        // Setup validates every <Path> with WCM: a long value comes back
+        // as WCM_E_INVALIDVALUE 0x80220005 "Value is invalid", which fails
+        // the WHOLE answer file (windeploy 0x1f -> the "computer restarted
+        // unexpectedly" loop). Live 2026-10-04: an 854-char PowerShell Path
+        // was rejected while every command up to 243 chars passed, so keep
+        // the proven bound with margin: nothing over 256.
+        for arch in [Architecture::Amd64, Architecture::Arm64] {
+            let xml = VmConfig {
+                arch,
+                ..VmConfig::default()
+            }
+            .generate_unattend_xml();
+            for pass in ["windowsPE", "specialize"] {
+                let section = format!("<settings pass=\"{pass}\">");
+                let rs = xml
+                    .split(&section)
+                    .nth(1)
+                    .unwrap()
+                    .split("</settings>")
+                    .next()
+                    .unwrap()
+                    .split("<RunSynchronous>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</RunSynchronous>")
+                    .next()
+                    .unwrap();
+                let mut paths = rs
+                    .split("<Path>")
+                    .skip(1)
+                    .map(|s| s.split("</Path>").next().unwrap());
+                for path in &mut paths {
+                    assert!(
+                        path.len() <= 256,
+                        "{arch:?} pass {pass}: Path is {} chars (limit 256): {path}",
+                        path.len()
+                    );
+                }
             }
         }
     }

@@ -2068,6 +2068,10 @@ enum ScreenState {
     Dark,
     /// One flat saturated color owns the frame: BSOD/recovery-class screen.
     SolidError,
+    /// A modal error dialog is up (its red error icon is visible): setup or
+    /// OOBE failure dialog that sits there until someone clicks OK — the
+    /// failure mode where screenshots keep flowing but nothing progresses.
+    ErrorDialog,
     /// Anything else.
     Content,
 }
@@ -2079,6 +2083,7 @@ impl std::fmt::Display for ScreenState {
             ScreenState::SolidError => {
                 "screen shows a solid-color error screen (BSOD/recovery-like)"
             }
+            ScreenState::ErrorDialog => "screen shows a MODAL ERROR DIALOG (failure dialog up)",
             ScreenState::Content => "screen shows content",
         })
     }
@@ -2128,6 +2133,21 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
         if sat >= 32 {
             return ScreenState::SolidError;
         }
+    }
+    // Modal failure dialogs (the setup "restarted unexpectedly" loop, OOBE
+    // errors): a saturated red error icon on the frame. Checked last so
+    // solid-color screens keep their own verdict, and quantitatively loose
+    // (>= 50 sampled red pixels ≈ a ~200 px icon) because this only ever
+    // feeds an announcement — never an automatic failure verdict.
+    let red = rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .step_by(4)
+        .filter(|px| px[0] >= 170 && px[1] <= 90 && px[2] <= 90)
+        .count();
+    if red >= 50 {
+        return ScreenState::ErrorDialog;
     }
     ScreenState::Content
 }
@@ -2335,8 +2355,16 @@ fn spawn_screenshots(
         // once above), so the log reads as progress toward the SSH answer.
         let mut n = 0u64;
         let announce = |n: u64, p: PathBuf, s: ScreenState| {
+            // A modal failure dialog must not read as routine "content":
+            // flag it loudly so a 3-hour no-progress stall is obvious in
+            // the output the moment the dialog first appears.
+            let warn = if matches!(s, ScreenState::ErrorDialog) {
+                "WARNING: "
+            } else {
+                ""
+            };
             eprintln!(
-                "installer screenshot {n}: {} ({s})",
+                "{warn}installer screenshot {n}: {} ({s})",
                 p.file_name().unwrap_or_default().to_string_lossy()
             );
         };
@@ -2878,6 +2906,36 @@ mod tests {
         assert_eq!(
             classify_screen(&flat(64, 64, [128, 128, 128])),
             ScreenState::Content
+        );
+    }
+
+    #[test]
+    fn screen_state_red_error_icon_is_dialog() {
+        // The live setup-failure frame: black background, white modal box,
+        // red error icon — dark/flat thresholds pass through, the icon is
+        // what identifies it (and the WARNING prefix in the installer log).
+        let (w, h) = (160u32, 100u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        let mut put = |x: u32, y: u32, c: [u8; 3]| {
+            let i = ((y * w + x) * 3) as usize;
+            rgb[i..i + 3].copy_from_slice(&c);
+        };
+        for y in 25..75 {
+            for x in 50..130 {
+                put(x, y, [240, 240, 240]);
+            }
+        }
+        for y in 30..55 {
+            for x in 55..85 {
+                put(x, y, [220, 60, 50]);
+            }
+        }
+        assert_eq!(classify_screen(&rgb), ScreenState::ErrorDialog);
+        // Ordering guard: a full-frame saturated screen keeps the BSOD-class
+        // verdict even though every pixel also matches the icon test.
+        assert_eq!(
+            classify_screen(&flat(64, 64, [220, 60, 50])),
+            ScreenState::SolidError
         );
     }
 
