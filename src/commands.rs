@@ -613,6 +613,10 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     ticker.tick().await;
     // Stall sensor: serial-silent deaths would otherwise poll SSH blindly.
     let mut idle = BlockIdle::new();
+    // Reboot awareness below the screenshot layer: OVMF's per-boot handoff
+    // line in the serial file, so "the guest bounced" is announced even
+    // while the screen looks like nothing happened.
+    let mut boots_seen = boot_count(&vm.builder.serial_log);
     // Boot time-lapse bookkeeping: cadence is honored inside the ticker
     // loop (first frame after a full interval, matching `install`), so it
     // stops the moment the wait ends — no background task leaking into the
@@ -639,6 +643,13 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                 // boot already failed — return it as the cause instead of
                 // polling on.
                 check_boot_failure(&vm.builder.serial_log)?;
+                // Reboot narration (first boot or a bounce): serial truth,
+                // independent of what the screenshots look like.
+                let boots = boot_count(&vm.builder.serial_log);
+                if let Some(note) = boot_note(boots_seen, boots) {
+                    eprintln!("{note}");
+                }
+                boots_seen = boots;
                 // Stall watchdog: frozen disk I/O + no banner = parked.
                 // Bail propagates out of the select arm below.
                 idle.poll(&mon).await?;
@@ -1956,6 +1967,33 @@ fn fatal_boot_patterns() -> Vec<String> {
         .collect()
 }
 
+/// Firmware boot handoffs in the serial log: OVMF prints one
+/// `BdsDxe: starting <entry>` line per boot attempt it launches (failed
+/// candidates log `failed to load` instead), so the count rises on every
+/// guest reboot — the below-screenshot "did it bounce?" signal. QEMU's
+/// file chardev truncates at VM start, so it counts this session only.
+/// Caveat: a boot entry whose `Start()` returns without loading can add a
+/// line without a full reboot — the trend (flat vs rising) is the signal.
+fn boot_count(serial_log: &str) -> u64 {
+    std::fs::read_to_string(serial_log)
+        .unwrap_or_default()
+        .matches("BdsDxe: starting")
+        .count() as u64
+}
+
+/// One-shot narration for a rising [`boot_count`]: `None` while flat, a
+/// line for the first boot, a reboot line after it. Count regressions
+/// (a truncated log) stay silent — never claim a reboot that didn't show.
+fn boot_note(old: u64, new: u64) -> Option<String> {
+    (new > old).then(|| {
+        if new == 1 {
+            "guest booted (first firmware boot)".to_string()
+        } else {
+            format!("guest rebooted (firmware boot #{new} seen on serial)")
+        }
+    })
+}
+
 /// Fatal serial signature check (see [`fatal_boot_patterns`]): returns the
 /// cause only — `cmd_run`'s failure arms append the evidence block (frame
 /// path + serial tail + VNC) via [`boot_failure_report`].
@@ -2066,7 +2104,8 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 /// [`effective_state`] withdraws them once the previous frame moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
-    /// Essentially all pixels near-black: firmware no-display or blank.
+    /// No pixel visibly lit anywhere: literally nothing on screen. A
+    /// spinner dot or a line of text on black is *content*, not this.
     Dark,
     /// One flat saturated color owns the frame: BSOD/recovery-class screen.
     SolidError,
@@ -2098,22 +2137,27 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
     if rgb.is_empty() {
         return ScreenState::Dark;
     }
+    // "Black" means black: EVERY pixel near-black, full-frame (the old
+    // 95%-dark rule called a black UI frame with visible text or a
+    // spinner "no visible output", which was a lie). Full scan, not the
+    // 4th-pixel sample below — one lit pixel must never be missed.
+    if rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .all(|px| px[0] < 24 && px[1] < 24 && px[2] < 24)
+    {
+        return ScreenState::Dark;
+    }
     let mut n = 0u32;
-    let mut dark = 0u32;
     let mut buckets = std::collections::HashMap::<u16, u32>::new();
     for px in rgb.as_chunks::<3>().0.iter().step_by(4) {
         let (r, g, b) = (px[0], px[1], px[2]);
         n += 1;
-        if r < 24 && g < 24 && b < 24 {
-            dark += 1;
-        }
         // Quantize to 16 levels/channel: flat frames collapse into one
         // bucket, gradients and photos spread across many.
         let key = (((r >> 4) as u16) << 8) | (((g >> 4) as u16) << 4) | ((b >> 4) as u16);
         *buckets.entry(key).or_insert(0) += 1;
-    }
-    if dark * 100 >= n * 95 {
-        return ScreenState::Dark;
     }
     // Dominant bucket ≥ 80% and saturated (max-min channel ≥ 32 in the
     // bucket's center color) = flat error screen; flat gray/white or any
@@ -2206,6 +2250,7 @@ fn effective_state(raw: ScreenState, moved: bool) -> ScreenState {
 fn format_failure_report(
     frame: Option<(PathBuf, ScreenState)>,
     serial: &str,
+    boots: u64,
     vnc: &Option<String>,
 ) -> String {
     let mut out = match frame {
@@ -2215,6 +2260,7 @@ fn format_failure_report(
     if !serial.is_empty() {
         out.push_str(&format!("\n  last serial: {serial}"));
     }
+    out.push_str(&format!("\n  guest boots seen: {boots}"));
     if let Some(u) = vnc {
         out.push_str(&format!("\n  vnc: {u} (password {PROVEN_VNC_PASSWORD})"));
     }
@@ -2234,7 +2280,7 @@ async fn boot_failure_report(
 ) -> String {
     let frame = take_screenshot(mon, shots_dir).await;
     let serial = last_serial_line(serial_log);
-    format_failure_report(frame, &serial, vnc)
+    format_failure_report(frame, &serial, boot_count(serial_log), vnc)
 }
 
 /// One screendump frame: `screendump` to PPM, converted in-crate to PNG
@@ -2504,6 +2550,9 @@ async fn wait_install_ready(
     let start = std::time::Instant::now();
     // Phase 1: first banner.
     let mut idle = BlockIdle::new();
+    // Reboot awareness while Setup applies (no SSH yet — serial is the
+    // only below-screenshot voice): count OVMF firmware handoffs.
+    let mut boots_seen = boot_count(&scope.serial_log);
     let banner = loop {
         if start.elapsed() > deadline {
             anyhow::bail!(
@@ -2519,6 +2568,13 @@ async fn wait_install_ready(
         }
         // Dead-screen watchdog (same as run): fail fast with evidence.
         check_boot_failure(&scope.serial_log)?;
+        // Reboot narration: Setup reboots between passes; announce each
+        // firmware bounce instead of leaving the long wait mute.
+        let boots = boot_count(&scope.serial_log);
+        if let Some(note) = boot_note(boots_seen, boots) {
+            eprintln!("{note}");
+        }
+        boots_seen = boots;
         // Stall watchdog: frozen disk I/O + no banner = parked.
         idle.poll(&scope.mon).await?;
         tokio::time::sleep(timeouts::SSH_POLL_INTERVAL).await;
@@ -2929,14 +2985,43 @@ mod tests {
     }
 
     #[test]
-    fn screen_state_black_frame_is_dark() {
+    fn screen_state_black_means_nothing_visible() {
         assert_eq!(classify_screen(&flat(64, 64, [0, 0, 0])), ScreenState::Dark);
-        // Sparse text on black (OVMF prompt, spinning dots) stays dark.
+        // Sparse text/dots on black ARE visible content — the old
+        // 95%-dark rule reported "no visible output" over live pixels.
         let mut rgb = flat(64, 64, [0, 0, 0]);
         rgb[..600].fill(220);
-        assert_eq!(classify_screen(&rgb), ScreenState::Dark);
+        assert_eq!(classify_screen(&rgb), ScreenState::Content);
         // Degenerate empty frame: nothing captured = nothing to see.
         assert_eq!(classify_screen(&[]), ScreenState::Dark);
+    }
+
+    #[test]
+    fn boot_count_and_note_from_serial() {
+        let path = std::env::temp_dir().join(format!("wh-boot-count-{}.log", std::process::id()));
+        std::fs::write(
+            &path,
+            "BdsDxe: loading Boot0001 \"USB\"\n\
+             BdsDxe: starting Boot0001 \"USB\"\n\
+             BdsDxe: failed to load Boot0002 \"NVMe\": Not Found\n\
+             BdsDxe: starting Boot0003 \"Windows Boot Manager\"\n",
+        )
+        .unwrap();
+        assert_eq!(boot_count(path.to_str().unwrap()), 2);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(boot_count("/nonexistent/wh-no-serial.log"), 0);
+        // Narration: first boot, reboots, flat, and regressions.
+        assert_eq!(boot_note(0, 0), None);
+        assert_eq!(
+            boot_note(0, 1).as_deref(),
+            Some("guest booted (first firmware boot)")
+        );
+        assert_eq!(
+            boot_note(1, 3).as_deref(),
+            Some("guest rebooted (firmware boot #3 seen on serial)")
+        );
+        assert_eq!(boot_note(3, 3), None);
+        assert_eq!(boot_note(3, 2), None);
     }
 
     #[test]
@@ -3049,9 +3134,11 @@ mod tests {
                 ScreenState::SolidError,
             )),
             "BdsDxe: starting Boot0003",
+            3,
             &Some("vnc://127.0.0.1:5910".to_string()),
         );
         assert!(report.contains("solid-color error screen"), "{report}");
+        assert!(report.contains("guest boots seen: 3"), "{report}");
         assert!(
             report.contains("/vm/screenshots/screenshot-1.png"),
             "{report}"
@@ -3065,7 +3152,7 @@ mod tests {
 
     #[test]
     fn failure_report_states_missing_parts() {
-        let report = format_failure_report(None, "", &None);
+        let report = format_failure_report(None, "", 0, &None);
         assert!(
             report.contains("no screenshot could be captured"),
             "{report}"

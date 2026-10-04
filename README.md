@@ -38,11 +38,15 @@ Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
 boot time-lapse (`--screenshots-every-secs`, `0` disables). Boot failures
 end with a diagnosis block: latest frame path + screen state (black /
 solid-color error / modal error dialog / content) + last serial line, so
-dead boots are readable without VNC. Black and solid-color verdicts only
-stand while the frame is static — real error screens don't animate, the
-installer's flat progress screens do (spinner/percent). Installer
-screenshots that catch a modal failure dialog print a `WARNING:` line as
-soon as it appears.
+dead boots are readable without VNC. `black` means literally no visible
+pixel — text or a spinner on black is content. Black and solid-color
+verdicts only stand while the frame is static — real error screens don't
+animate, the installer's flat progress screens do (spinner/percent).
+Firmware reboots are counted from the serial log (OVMF `BdsDxe: starting`
+handoffs): `guest rebooted (firmware boot #N seen on serial)` lines print
+while waiting for SSH, and failure reports carry `guest boots seen`.
+Installer screenshots that catch a modal failure dialog print a
+`WARNING:` line as soon as it appears.
 
 ## Where things live
 
@@ -90,6 +94,7 @@ Proven installs, logged automatically by `install` to [tested-isos.jsonl](./test
 <!-- TESTED-BEGIN -->
 | Date | ISO | Arch | Accel | Host | QEMU | wimlib | virtio | Commit | Result |
 |---|---|---|---|---|---|---|---|---|---|
+| 2026-10-04 | Windows11_Client_x64_en-us_26300_9457.iso | amd64 | kvm | linux Ubuntu 26.04.1 LTS | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [c369131](https://github.com/jzombie/windows-headless/commit/c36913109b1d) | ssh-banner |
 | 2026-10-02 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | hvf | macos 26.6.2 | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [51606bf](https://github.com/jzombie/windows-headless/commit/51606bf345ba) | ssh-banner |
 | 2026-10-02 | Windows11_Client_x64_en-us_26300_9457.iso | amd64 | kvm | linux Ubuntu 26.04.1 LTS | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [c077bbc](https://github.com/jzombie/windows-headless/commit/c077bbcff71d) | ssh-banner |
 | 2026-10-02 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | tcg | linux Ubuntu 26.04 LTS | [qemu-v11.1.1-48](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925) | [088e297](https://github.com/jzombie/windows-headless/commit/088e297df38f) | ssh-banner |
