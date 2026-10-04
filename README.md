@@ -38,8 +38,11 @@ Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
 boot time-lapse (`--screenshots-every-secs`, `0` disables). Boot failures
 end with a diagnosis block: latest frame path + screen state (black /
 solid-color error / modal error dialog / content) + last serial line, so
-dead boots are readable without VNC. Installer screenshots that catch a
-modal failure dialog print a `WARNING:` line as soon as it appears.
+dead boots are readable without VNC. Black and solid-color verdicts only
+stand while the frame is static — real error screens don't animate, the
+installer's flat progress screens do (spinner/percent). Installer
+screenshots that catch a modal failure dialog print a `WARNING:` line as
+soon as it appears.
 
 ## Where things live
 

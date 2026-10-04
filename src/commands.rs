@@ -2058,10 +2058,12 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 
 /// Coarse verdict on what the guest screen shows — the one-line answer
 /// boot failures print so they are readable without VNC. Deliberately
-/// heuristic (no OCR): three buckets that separate the cases that matter —
-/// nothing on screen, a flat saturated frame (BSOD/WinRE-class screens are
-/// one solid background), and anything else (desktop, lock screen, OVMF
-/// text, gradients).
+/// heuristic (no OCR): four buckets that separate the cases that matter —
+/// nothing on screen, a flat saturated frame, a modal failure dialog
+/// (caught by its red error icon), and anything else (desktop, OVMF text,
+/// gradients). The flat/black verdicts only stand while the frame is
+/// static: installer progress screens are flat too but animate, so
+/// [`effective_state`] withdraws them once the previous frame moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
     /// Essentially all pixels near-black: firmware no-display or blank.
@@ -2152,6 +2154,52 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
     ScreenState::Content
 }
 
+/// Previous frame kept by [`take_screenshot`] for motion detection — a
+/// full RGB copy of the last successful screendump (one 1280x800 frame,
+/// replaced every cadence tick; poisoning can't lose a verdict we care
+/// about, so callers take the data back out of the poison error).
+static LAST_FRAME: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Has the screen changed enough since `prev` to count as animation? The
+/// installer's spinner/dots/percent ticks are a few hundred pixels; real
+/// error screens (BSOD, recovery) never change between samples. Sampling
+/// every 4th pixel with a small per-channel tolerance keeps a minute-apart
+/// comparison cheap and immune to sub-threshold jitter, while a resized
+/// frame is conservatively "moved".
+fn frame_moved(prev: &[u8], cur: &[u8]) -> bool {
+    if prev.len() != cur.len() {
+        return true;
+    }
+    let (prev, _) = prev.as_chunks::<3>();
+    let (cur, _) = cur.as_chunks::<3>();
+    let mut changed = 0u32;
+    for (a, b) in prev.iter().step_by(4).zip(cur.iter().step_by(4)) {
+        if a.iter().zip(b).any(|(x, y)| x.abs_diff(*y) > 8) {
+            changed += 1;
+        }
+    }
+    // > 50 sampled pixels ≈ 200 real pixels: a spinner arc moves more
+    // than that, jitter much less. Percent-only ticks are smaller, but
+    // every progress screen that ticks also spins — the spinner is the
+    // signal we key on.
+    changed > 50
+}
+
+/// Motion-aware adjustment of [`classify_screen`]: a flat-color or black
+/// verdict only survives when the frame stood still since the previous
+/// one — the live installer's blue/black progress screens are flat and
+/// dark but animate (spinner, percent), so they demote to plain content.
+/// Real error screens don't move and keep their verdict; [`ScreenState::ErrorDialog`]
+/// is never demoted (a spinning loader under a modal dialog still means
+/// the dialog is up). First frame has no predecessor and is reported as
+/// classified.
+fn effective_state(raw: ScreenState, moved: bool) -> ScreenState {
+    match raw {
+        ScreenState::Dark | ScreenState::SolidError if moved => ScreenState::Content,
+        other => other,
+    }
+}
+
 /// Evidence block for a failed boot wait: final frame (path + screen
 /// classification), last serial line, VNC coordinates. Pure formatter so
 /// the layout is unit-testable; [`boot_failure_report`] gathers the parts.
@@ -2225,7 +2273,16 @@ async fn take_screenshot(
         .map_err(anyhow::Error::from)
         .and_then(|d| {
             let (w, h, rgb) = parse_ppm_p6(&d)?;
-            let state = classify_screen(&rgb);
+            let raw = classify_screen(&rgb);
+            let state = {
+                let mut last = LAST_FRAME
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let moved = last.as_deref().is_some_and(|p| frame_moved(p, &rgb));
+                let state = effective_state(raw, moved);
+                *last = Some(rgb.clone());
+                state
+            };
             write_png(&png_path, w, h, &rgb)?;
             Ok((png_path, state))
         });
@@ -2937,6 +2994,51 @@ mod tests {
             classify_screen(&flat(64, 64, [220, 60, 50])),
             ScreenState::SolidError
         );
+    }
+
+    #[test]
+    fn motion_withdraws_flat_verdicts_only_when_the_frame_changed() {
+        let a = flat(64, 64, [0, 120, 215]);
+        let a_again = a.clone();
+        // Static frames keep the verdict: a real BSOD never animates.
+        assert!(!frame_moved(&a, &a_again));
+        assert_eq!(
+            effective_state(ScreenState::SolidError, false),
+            ScreenState::SolidError
+        );
+        assert_eq!(effective_state(ScreenState::Dark, false), ScreenState::Dark);
+        // A spinner-sized change (400 px here) demotes the flat/black
+        // verdicts: the installer's progress screens look flat but move.
+        let mut b = a.clone();
+        for y in 30..50u32 {
+            for x in 30..50u32 {
+                let i = ((y * 64 + x) * 3) as usize;
+                b[i..i + 3].copy_from_slice(&[255, 255, 255]);
+            }
+        }
+        assert!(frame_moved(&a, &b));
+        assert_eq!(
+            effective_state(ScreenState::SolidError, true),
+            ScreenState::Content
+        );
+        assert_eq!(
+            effective_state(ScreenState::Dark, true),
+            ScreenState::Content
+        );
+        // Content and the modal-dialog verdict are never rewritten.
+        assert_eq!(
+            effective_state(ScreenState::Content, true),
+            ScreenState::Content
+        );
+        assert_eq!(
+            effective_state(ScreenState::ErrorDialog, true),
+            ScreenState::ErrorDialog
+        );
+        // Sub-50-sample jitter and a resolution change behave as documented.
+        let mut c = a.clone();
+        c[0..3].copy_from_slice(&[10, 130, 225]);
+        assert!(!frame_moved(&a, &c));
+        assert!(frame_moved(&a, &flat(32, 32, [0, 120, 215])));
     }
 
     #[test]
