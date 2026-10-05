@@ -87,6 +87,9 @@ Everything else is inbox Windows:
   installer screenshots). No virtio-gpu, QXL, or vendor GPU driver: expect
   software rendering only.
 
+> There is no automated driver upgrade path. To pick up newer drivers, rebuild
+the installer and reinstall from scratch with the latest media.
+
 Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
 
 > Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
