@@ -93,9 +93,10 @@ Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`
 
 ## Snapshots
 
-Golden rewind is the default. `build`/`install` prove the shell, then save
-that disk state as the golden snapshot. Every `run` rewinds to it first, so
-a dirty stop (Ctrl-C) can't leave the next boot in Recovery.
+Golden rewind is the default. The first golden snapshot is automatic: `build`
+(and likewise `run --win-iso`, which installs when the disk is missing) proves
+the shell, then saves that disk state. Every `run` afterward rewinds to it
+first, so a dirty stop (Ctrl-C) can't leave the next boot in Recovery.
 
 ```sh
 # Terminal 1: `run` blocks, so boot and leave it running.
@@ -127,6 +128,19 @@ cargo run -- snapshot --live
 # rather than booting a half-state.
 cargo run -- run --live
 ```
+
+Golden and live coexist (separate sidecars) and `run` selects by flag, so you
+can alternate between them. Plain `run` rewinds to golden and drops any
+orphaned live overlay out loud; `run --live` skips the rewind and requires
+every live piece or refuses. A new install voids both. Re-taking either
+overwrites that type only; run one `snapshot` at a time (QMP is single-client).
+
+Where the deltas live: golden is an internal snapshot inside `disk.qcow2`
+(single `golden` tag; re-taking deletes and recreates it, so no chains
+accumulate (the `.golden` sidecar just proves it's there). Live deltas go to
+`disk-live-overlay.qcow2` beside the disk, plus `golden-live.state` (used RAM,
+2–3 GB at the default 4 GB guest; scales with `--memory`) and a VARS backup. No merge step: plain `run` drops an orphaned overlay,
+live resume consumes it, and re-taking live deletes all three first.
 
 Rewind is CPU-bound (full firmware + Windows boot); live is I/O-bound (2–3 GB
 stream + settle). On Apple Silicon with the cache on external USB, rewind wins:

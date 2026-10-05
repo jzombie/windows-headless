@@ -14,7 +14,7 @@ Silicon) and Linux (amd64 + arm64); Intel Macs are not supported.
 ### Added
 
 - `build` / `run` flow: build the installer image from your ISO, boot it,
-  and wait for SSH — or `run --win-iso` to do it all in one command.
+  and wait for SSH, or `run --win-iso` to do it all in one command.
 - Docker-style sizing: `--memory 8g --cpus 8 --disk-size 128g`
   (`--smp` still works as an alias of `--cpus`).
 - Automatic dependency provisioning: portable QEMU, wimlib, virtio
