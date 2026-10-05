@@ -22,13 +22,17 @@ Silicon) and Linux (amd64 + arm64); Intel Macs are not supported.
 - Download integrity: every auto-downloaded byte is verified against
   hardcoded SHA-256 pins; `verify-pins` checks them all without installing.
 - Install observability: phase banners, VNC URL + password, and a
-  numbered screenshot every 60 seconds until SSH answers.
+  configurable screenshot time-lapse (`--screenshots-every-secs`, `0`
+  disables) until SSH answers; dead boots end with a diagnosis block
+  (screen state + last serial line), firmware reboot counting, and an
+  immediate `WARNING:` on modal failure dialogs.
 - Proven-install log: each green install records itself in
   `tested-isos.jsonl` and refreshes the README's Tested table.
-- Snapshots: `build`/`install` snapshot the landed shell state and every
-  boot rewinds to it (dirty stops can't park the next boot at Recovery);
-  `snapshot` re-takes it on demand, with an experimental `--live`
-  migration-based variant (see README tradeoffs).
+- Snapshots: `build`/`install` snapshot the proven shell state and `run`
+  rewinds to it (dirty stops can't park the next boot at Recovery);
+  `snapshot` re-takes it on demand (proves shell, halts cleanly,
+  snapshots, stops), with an experimental `--live` migration-based
+  variant (`snapshot --live` / `run --live`, see README tradeoffs).
 - Rust library surface: `VmConfig`, `HeadlessVmBuilder`, `DiskManager`,
   and friends are exported for programmatic use.
 
