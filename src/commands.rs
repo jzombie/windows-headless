@@ -1172,6 +1172,8 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     } else {
         eprintln!("Windows installer is running on the {url} display.");
     }
+
+    // TODO: Don't render (much longer under TCG emulation) when not using TCG emulation
     eprintln!(
         "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
     );
