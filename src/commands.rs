@@ -542,6 +542,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                 prove_landed_shell(PROVEN_SSH_PORT, &a.username, &a.password).await?;
                 let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
                 let target_s = target.to_string_lossy().into_owned();
+                shutdown_guest_clean(PROVEN_SSH_HOST, PROVEN_SSH_PORT, &a.username, &a.password)
+                    .await?;
                 session.child.kill().await?;
                 snapshot_golden(&session.img_bin, &target_s).await?;
             }
@@ -834,6 +836,51 @@ async fn watch_golden_void(port: u16, disk: String) {
     }
 }
 
+/// Clean guest shutdown ahead of a golden snapshot: `Stop-Computer` over
+/// SSH, then wait for the banner to die (halted). Golden must capture a
+/// clean bit — a QMP-quit power cut here would bake the dirty flag into
+/// every future rewind. Loud failure instead of a dirty snapshot: the
+/// caller reports, nothing is captured.
+async fn shutdown_guest_clean(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    eprintln!(
+        "shutting guest down cleanly for snapshot (up to {} s) ...",
+        timeouts::GUEST_SHUTDOWN_SECS
+    );
+    // Best-effort issue: if the guest is already dying, the banner wait
+    // below still does the real gating.
+    let _ = crate::ssh::ssh_exec(
+        host,
+        port,
+        user,
+        pass,
+        "powershell -NoProfile -Command \"Stop-Computer -Force\"",
+    )
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeouts::GUEST_SHUTDOWN_SECS);
+    // Two consecutive misses: a single loopback blip must not pass for a
+    // halt with the guest still running (snapshotting that disk would
+    // bless torn writes).
+    let mut misses = 0u32;
+    loop {
+        if banner_once(port).await.is_none() {
+            misses += 1;
+            if misses >= 2 {
+                eprintln!("guest halted.");
+                return Ok(());
+            }
+        } else {
+            misses = 0;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "guest did not halt within {} s — refusing a dirty snapshot (stop it and retry)",
+                timeouts::GUEST_SHUTDOWN_SECS
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 /// Disk-only golden snapshot of the landed state + sidecar. QEMU must
 /// already be stopped (this runs post-kill): offline `qemu-img snapshot`
 /// sidesteps live device state entirely — boots rewind with `snapshot -a`
@@ -892,6 +939,9 @@ async fn shell_then_wait(
 ) -> Result<()> {
     if shell {
         crate::ssh::interactive_shell(host, port, username, password).await?;
+        // The guest prompt never terminates its line — without this, the
+        // wait prompt below lands mid-prompt (`C:\...>press Ctrl-C ...`).
+        eprintln!();
     }
     eprintln!("{prompt}");
     shutdown_signal().await;
@@ -1387,6 +1437,64 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     })
 }
 
+/// Snapshot the running guest's disk as the new golden state (`docker
+/// commit`): proves the shell, stops QEMU, snapshots offline, and writes
+/// the sidecar. The guest must be up (boot it with `run` first); QEMU is
+/// left stopped afterward, so boot again to resume the new golden.
+pub async fn cmd_snapshot(
+    vm_dir: Option<PathBuf>,
+    qemu_dir: Option<PathBuf>,
+    username: String,
+    password: String,
+    ssh_port: u16,
+) -> Result<()> {
+    let vm_dir = match vm_dir {
+        Some(d) => d,
+        None => default_vm_dir()?,
+    };
+    let disk = vm_dir
+        .join(crate::paths::DISK_IMAGE)
+        .to_string_lossy()
+        .into_owned();
+    if !std::path::Path::new(&disk).is_file() {
+        anyhow::bail!("no disk at {disk} (install first)");
+    }
+    // The guest must be running: a snapshot of a stopped disk proves
+    // nothing about the shell.
+    if banner_once(ssh_port).await.is_none() {
+        anyhow::bail!(
+            "no SSH banner on {PROVEN_SSH_HOST}:{ssh_port} (boot the guest with `run` first)"
+        );
+    }
+    prove_landed_shell(ssh_port, &username, &password).await?;
+    let img_bin = match qemu_dir {
+        Some(d) => d
+            .join(crate::paths::PORTABLE_BIN_DIR)
+            .join(crate::paths::QEMU_IMG_NAME),
+        None => {
+            #[cfg(feature = "downloader")]
+            {
+                let q = crate::qemu_portable::pinned_cached()?;
+                q.root
+                    .join(crate::paths::PORTABLE_BIN_DIR)
+                    .join(crate::paths::QEMU_IMG_NAME)
+            }
+            #[cfg(not(feature = "downloader"))]
+            {
+                PathBuf::from(crate::paths::QEMU_IMG_NAME)
+            }
+        }
+    };
+    // Clean halt first (guest-initiated, so the bit is clean), then QMP
+    // quit reaps a halted QEMU, then the offline snapshot. A power-cut
+    // snapshot would bake the dirty flag into every future rewind.
+    shutdown_guest_clean(PROVEN_SSH_HOST, ssh_port, &username, &password).await?;
+    cmd_stop(Some(vm_dir), None).await?;
+    snapshot_golden(&img_bin, &disk).await?;
+    eprintln!("golden refreshed — `run` resumes this state from now on.");
+    Ok(())
+}
+
 /// Standalone `install`: full install, then supervise the VM for a human
 /// via the shared tail (final frame + optional shell + Ctrl-C wait + kill).
 /// `shell` only affects this tail, never the install itself.
@@ -1429,6 +1537,10 @@ pub async fn cmd_install(p: InstallParams, shell: bool) -> Result<()> {
     } else {
         eprintln!("install complete (non-interactive — shutting down guest)...");
     }
+    // Clean halt before the snapshot (same reason as `snapshot`): golden
+    // must capture a clean bit. Ctrl-C still kills instantly everywhere
+    // else — only snapshot paths pay for clean.
+    shutdown_guest_clean(PROVEN_SSH_HOST, PROVEN_SSH_PORT, &username, &password).await?;
     session.child.kill().await?;
     snapshot_golden(&session.img_bin, &target_s).await?;
     Ok(())

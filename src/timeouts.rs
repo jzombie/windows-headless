@@ -40,6 +40,11 @@ pub const SCREENSHOTS_EVERY_SECS: u64 = 60;
 /// Internal snapshot tag for the landed state (`qemu-img snapshot -c`).
 pub const GOLDEN_TAG: &str = "golden";
 
+/// Bound for a clean guest shutdown ahead of a golden snapshot: the guest
+/// gets this long to halt after `Stop-Computer` before the snapshot path
+/// gives up and reports instead of capturing a dirty disk.
+pub const GUEST_SHUTDOWN_SECS: u64 = 120;
+
 // ---------------------------------------------------------------------------
 // Per-poll SSH mechanics (the inner loops under those deadlines)
 // ---------------------------------------------------------------------------

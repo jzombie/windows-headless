@@ -14,7 +14,7 @@ use windows_headless::{
     commands::{
         BuildMediaArgs, GenArgs, GuestArgs, GuestOp, InstallParams, ReportArgs, RunArgs,
         cmd_build_media, cmd_gen, cmd_guest, cmd_install, cmd_overlay, cmd_report, cmd_run,
-        cmd_stop,
+        cmd_snapshot, cmd_stop,
     },
 };
 
@@ -219,6 +219,25 @@ enum Cmd {
         /// Portable tree root (extracted `qemu-portable` dir); else PATH.
         #[arg(long)]
         qemu_dir: Option<PathBuf>,
+    },
+    /// Snapshot the running guest as the new golden state (`docker
+    /// commit`): proves the shell, stops QEMU, snapshots the disk. Boot
+    /// the guest with `run` first; boot again afterward to resume it.
+    Snapshot {
+        /// VM dir holding the disk (default: project cache `vms/win11`).
+        #[arg(long)]
+        vm_dir: Option<PathBuf>,
+        /// Portable tree override (default: newest cached tree from `fetch-qemu`).
+        #[arg(long)]
+        qemu_dir: Option<PathBuf>,
+        /// Guest username (for the shell proof).
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
+        username: String,
+        /// Guest password (for the shell proof).
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
+        password: String,
+        #[arg(long, default_value_t = PROVEN_SSH_PORT)]
+        ssh_port: u16,
     },
     /// Graceful shutdown via QMP + pidfile cleanup (no orphans).
     #[command(hide = true)]
@@ -582,6 +601,13 @@ async fn async_main() -> Result<()> {
             qemu_dir,
         } => cmd_overlay(base, overlay, qemu_dir).await,
         Cmd::Stop { vm_dir, qmp_sock } => cmd_stop(vm_dir, qmp_sock).await,
+        Cmd::Snapshot {
+            vm_dir,
+            qemu_dir,
+            username,
+            password,
+            ssh_port,
+        } => cmd_snapshot(vm_dir, qemu_dir, username, password, ssh_port).await,
         Cmd::Guest {
             op,
             ssh_port,
