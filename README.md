@@ -141,12 +141,10 @@ orphaned live overlay out loud; `run --live` skips the rewind and requires
 every live piece or refuses. A new install voids both. Re-taking either
 overwrites that type only; run one `snapshot` at a time (QMP is single-client).
 
-Where the deltas live: golden is an internal snapshot inside `disk.qcow2`
-(single `golden` tag; re-taking deletes and recreates it, so no chains
-accumulate (the `.golden` sidecar just proves it's there). Live deltas go to
-`disk-live-overlay.qcow2` beside the disk, plus `golden-live.state` (used RAM,
-2–3 GB at the default 4 GB guest; scales with `--memory`) and a VARS backup. No merge step: plain `run` drops an orphaned overlay,
-live resume consumes it, and re-taking live deletes all three first.
+Storage: golden is a single named snapshot inside `disk.qcow2` (re-taking it
+replaces it, so nothing accumulates). Live state is separate files beside the
+disk that are consumed or dropped on resume, never merged. See
+[Where things live](#where-things-live) for the exact filenames.
 
 Rewind is CPU-bound (full firmware + Windows boot); live is I/O-bound (2–3 GB
 stream + settle). On Apple Silicon with the cache on external USB, rewind wins:
