@@ -188,9 +188,9 @@ The provisioning pipeline downloads third-party binaries. Hash verification is e
 
 | Artifact | Source | Hash Enforced? | Security Guarantee |
 |---|---|---|---|
-| **`qemu-portable`** & **`wimlib-portable`** | Auto-download ([qemu](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) · [wimlib](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
-| **`virtio-win.iso`** | Auto-download ([drivers](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
-| **OpenSSH Archive** | Auto-download ([releases](https://github.com/PowerShell/Win32-OpenSSH/releases/tag/10.0.0.0p2-Preview)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **`qemu-portable`** & **`wimlib-portable`** | Auto-download ([releases](https://github.com/jzombie/lab-qemu-portable/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **`virtio-win.iso`** | Auto-download ([releases](https://github.com/jzombie/lab-qemu-portable/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **OpenSSH Archive** | Auto-download ([releases](https://github.com/PowerShell/Win32-OpenSSH/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
 | **Windows 11 ISO** | User-supplied | **NO (Opt-in)** | Microsoft URLs rotate. Validated via TLS and ISO9660 magic bytes only, unless pinned explicitly via `--win-iso-sha256`. |
 
 *Security Note:* For all auto-downloaded components, the trust root is the source code (`src/pins.rs`). The tool will immediately abort if a downloaded payload does not match its hardcoded hash. If you choose to override default downloads using custom URLs (such as `--virtio-iso-url`), those payloads rely solely on TLS unless you explicitly provide their matching hash flags.
