@@ -210,25 +210,29 @@ pub struct BuildArgs {
 }
 
 #[cfg(feature = "downloader")]
-pub async fn cmd_build(a: BuildArgs) -> Result<()> {
+pub async fn cmd_build(a: BuildArgs) -> Result<PathBuf> {
     // The ISO is the one input `setup` cannot fetch, so check it BEFORE the
     // downloads: a bad path must fail in milliseconds, not after gigabytes.
     require_win_iso(&expand_tilde(a.win_iso.clone()))?;
     cmd_setup(None, a.arch).await?;
+    // Resolve the media path here (same rule as build-media) so callers
+    // chaining into `install` know which image came out.
+    let out = a.out.map(expand_tilde).unwrap_or(default_media_image()?);
     cmd_build_media(BuildMediaArgs {
         win_iso: a.win_iso,
         arch: a.arch,
         virtio_iso: None,
         drivers_dir: None,
         openssh_zip: None,
-        out: a.out,
+        out: Some(out.clone()),
         wimlib_bin: None,
         username: a.username,
         password: a.password,
         locale: a.locale,
         force: a.force,
     })
-    .await
+    .await?;
+    Ok(out)
 }
 
 pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
@@ -535,7 +539,11 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                 })
                 .await?;
                 finish_install_capture(&mut session).await;
+                prove_landed_shell(PROVEN_SSH_PORT, &a.username, &a.password).await?;
+                let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
+                let target_s = target.to_string_lossy().into_owned();
                 session.child.kill().await?;
+                snapshot_golden(&session.img_bin, &target_s).await?;
             }
             None => anyhow::bail!(
                 "disk {disk} does not exist (run `install` first, pass --disk <image>, or pass --win-iso to install it now)"
@@ -567,6 +575,31 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                 eprintln!("using pinned portable QEMU {}", q.version);
                 b = b.qemu_dir(q.root);
             }
+        }
+    }
+    // Golden rewind: a verified landed state rolls the disk past any
+    // dirty stop — Recovery can never appear on a rewound base. Applied
+    // (`snapshot -a`) rather than `-loadvm`: loadvm restores device state
+    // too, and QEMU refuses it with a writable pflash drive attached.
+    // Runs after qemu_dir resolution so the same portable qemu-img that
+    // wrote the snapshot applies it.
+    if golden_sidecar(&disk).is_file() {
+        let img_bin = match &b.qemu_dir {
+            Some(d) => d
+                .join(crate::paths::PORTABLE_BIN_DIR)
+                .join(crate::paths::QEMU_IMG_NAME),
+            None => PathBuf::from(crate::paths::QEMU_IMG_NAME),
+        };
+        eprintln!("rewinding to golden snapshot (landed state) ...");
+        let st = tokio::process::Command::new(&img_bin)
+            .args(["snapshot", "-a", crate::timeouts::GOLDEN_TAG, &disk])
+            .status()
+            .await?;
+        if !st.success() {
+            anyhow::bail!(
+                "golden sidecar present but snapshot apply failed — disk left untouched, refusing to boot a half-state (delete {} to boot normally)",
+                golden_sidecar(&disk).display()
+            );
         }
     }
     eprintln!(
@@ -758,6 +791,78 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
 // install
 // ---------------------------------------------------------------------------
 
+/// Sidecar next to the disk proving a golden snapshot lives inside it.
+/// Written only after a verified landing; removed when an install starts,
+/// so a stale sidecar can never bless a half-written disk.
+pub fn golden_sidecar(disk: &str) -> PathBuf {
+    PathBuf::from(format!("{disk}.golden"))
+}
+
+/// Prove the landed shell, deterministically: banner up, readiness probe
+/// passing, and a real exec returning the right user. No clocks, no
+/// windows — each check is present-tense evidence, and the snapshot below
+/// is voided the moment the banner drops, so no prediction is needed.
+async fn prove_landed_shell(port: u16, user: &str, password: &str) -> Result<()> {
+    if banner_once(port).await.is_none() {
+        anyhow::bail!("no SSH banner at snapshot time");
+    }
+    if !crate::ssh::probe_setup_done(PROVEN_SSH_HOST, port, user, password)
+        .await
+        .is_ok_and(|g| g.is_ready())
+    {
+        anyhow::bail!("guest not READY at snapshot time");
+    }
+    // LITERAL shell landing: a pty shell answering back, the exact path
+    // a user login takes — not a banner read, not an exec probe.
+    crate::ssh::prove_interactive_shell(PROVEN_SSH_HOST, port, user, password).await?;
+    eprintln!("shell proven (prompt answered), saving golden ...");
+    Ok(())
+}
+
+/// Watch the golden snapshot's premise: any banner loss after snapshotting
+/// means the guest bounced (the extra reboot the first banner never shows),
+/// so the sidecar is deleted on the spot. Returns when voided. Safe
+/// direction only: losing golden just means the next boot is normal.
+async fn watch_golden_void(port: u16, disk: String) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if banner_once(port).await.is_none() {
+            let _ = std::fs::remove_file(golden_sidecar(&disk));
+            eprintln!("guest bounced after golden — snapshot voided, next boot is normal ...");
+            return;
+        }
+    }
+}
+
+/// Disk-only golden snapshot of the landed state + sidecar. QEMU must
+/// already be stopped (this runs post-kill): offline `qemu-img snapshot`
+/// sidesteps live device state entirely — boots rewind with `snapshot -a`
+/// and enumerate devices fresh, so pflash never blocks anything.
+async fn snapshot_golden(img_bin: &Path, disk: &str) -> Result<()> {
+    // Best-effort delete first: re-snapshotting over an existing tag must
+    // not fail. Stderr nulled: deleting a nonexistent tag is the normal
+    // first-snapshot case, not an error worth printing.
+    use std::process::Stdio;
+    let _ = tokio::process::Command::new(img_bin)
+        .args(["snapshot", "-d", timeouts::GOLDEN_TAG, disk])
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    let st = tokio::process::Command::new(img_bin)
+        .args(["snapshot", "-c", timeouts::GOLDEN_TAG, disk])
+        .status()
+        .await?;
+    if !st.success() {
+        anyhow::bail!("qemu-img snapshot failed");
+    }
+    std::fs::write(
+        golden_sidecar(disk),
+        format!("{}\n", crate::provenance::now_epoch()),
+    )?;
+    eprintln!("golden snapshot saved — next boots resume in seconds.");
+    Ok(())
+}
+
 /// Live installer session: QEMU still running after the OS reports ready.
 /// The caller owns the tail (capture a final frame, optionally offer a
 /// shell, wait for Ctrl-C, kill) via the shared helpers below — `cmd_install`
@@ -768,6 +873,9 @@ pub struct InstallSession {
     pub mon: std::sync::Arc<crate::ipc::Monitor>,
     pub vm_dir: PathBuf,
     pub screenshots: Option<tokio::task::JoinHandle<()>>,
+    /// `qemu-img` binary used for this install (for the post-kill golden
+    /// snapshot — the session outlives the paths that found it).
+    pub img_bin: PathBuf,
 }
 
 /// Shared middle of the run/install tails (defined once, called twice):
@@ -1062,6 +1170,9 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
         )
     })?;
     let _ = std::fs::remove_file(&target);
+    // A new install voids any golden snapshot (sidecar dies with the
+    // disk it blessed — a stale sidecar must never bless new bytes).
+    let _ = std::fs::remove_file(golden_sidecar(&target_s));
     eprintln!(
         "installing Windows to {target_s} (new {}G disk, {} MB RAM, {} vCPUs) ...",
         p.disk_size_gb, p.memory_mb, p.cpus
@@ -1272,6 +1383,7 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
         mon,
         vm_dir,
         screenshots,
+        img_bin,
     })
 }
 
@@ -1283,20 +1395,42 @@ pub async fn cmd_install(p: InstallParams, shell: bool) -> Result<()> {
     let password = p.password.clone();
     let mut session = install_to_ready(p).await?;
     finish_install_capture(&mut session).await;
+    // Golden before shell/kill: prove the shell now, snapshot now. A bounce
+    // afterward voids the sidecar (watcher below) instead of having been
+    // predicted by a timer.
+    prove_landed_shell(PROVEN_SSH_PORT, &username, &password).await?;
+    let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
+    let target_s = target.to_string_lossy().into_owned();
     if shell {
-        shell_then_wait(
-            true,
-            PROVEN_SSH_HOST,
-            PROVEN_SSH_PORT,
-            &username,
-            &password,
-            "press Ctrl-C to shut the VM down cleanly",
-        )
-        .await?;
+        let disk = target_s.clone();
+        tokio::select! {
+            _ = shell_then_wait(
+                true,
+                PROVEN_SSH_HOST,
+                PROVEN_SSH_PORT,
+                &username,
+                &password,
+                "press Ctrl-C to shut the VM down cleanly",
+            ) => {},
+            // Bounce voids golden but the install stands: keep waiting for
+            // Ctrl-C afterward instead of exiting early.
+            _ = watch_golden_void(PROVEN_SSH_PORT, disk) => {
+                shell_then_wait(
+                    true,
+                    PROVEN_SSH_HOST,
+                    PROVEN_SSH_PORT,
+                    &username,
+                    &password,
+                    "press Ctrl-C to shut the VM down cleanly",
+                )
+                .await?;
+            }
+        }
     } else {
         eprintln!("install complete (non-interactive — shutting down guest)...");
     }
     session.child.kill().await?;
+    snapshot_golden(&session.img_bin, &target_s).await?;
     Ok(())
 }
 
@@ -2841,6 +2975,11 @@ mod tests {
     fn install_sizing_reaches_qemu_argv() {
         // The flags a user passes must be the bytes QEMU gets: no QEMU
         // needed, just the pure argv constructors.
+        // Golden sidecar lives next to the disk it blesses.
+        assert_eq!(
+            golden_sidecar("disk.qcow2"),
+            std::path::PathBuf::from("disk.qcow2.golden")
+        );
         let (argv, img) = install_fixture(8192, 8);
         let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
         assert_eq!(at("-m"), "8192");

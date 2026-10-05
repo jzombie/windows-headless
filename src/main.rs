@@ -273,9 +273,12 @@ enum Cmd {
         #[arg(long)]
         arch: Option<Architecture>,
     },
-    /// Build the USB installer image: `setup` (fetch deps) + `build-media`.
-    /// One command, one artifact. Only `--win-iso` is required (your Windows
-    /// ISO); drivers, OpenSSH, wimlib, and output all default to the cache.
+    /// Build the USB installer image: `setup` (fetch deps) + `build-media`,
+    /// then install to a disk with proven defaults, settle, and snapshot the
+    /// golden landed state. One command from ISO to snapshot, unattended to
+    /// completion (CI takes its first snapshot exactly this way); `run`
+    /// connects afterward. Only `--win-iso` is required. Sizing stays
+    /// default here (prove it stock first); `install` takes the flags.
     #[cfg(feature = "downloader")]
     Build {
         /// Windows ISO path.
@@ -429,15 +432,37 @@ async fn async_main() -> Result<()> {
             password,
             locale,
         } => {
-            cmd_build(BuildArgs {
+            // Full chain with proven defaults: media, then install, settle,
+            // golden snapshot — then exit. Never a shell here: `build` must
+            // complete unattended (CI takes its first snapshot exactly this
+            // way); `run` is the command that connects.
+            let media = cmd_build(BuildArgs {
                 win_iso,
                 arch,
                 out,
                 force,
-                username,
-                password,
+                username: username.clone(),
+                password: password.clone(),
                 locale,
             })
+            .await?;
+            cmd_install(
+                InstallParams {
+                    usb_image: Some(media),
+                    win_iso: None,
+                    screenshots_every_secs: windows_headless::timeouts::SCREENSHOTS_EVERY_SECS,
+                    username,
+                    password,
+                    recovery: false,
+                    auto_updates: false,
+                    install_timeout_secs: windows_headless::timeouts::INSTALL_SSH_DEADLINE_SECS,
+                    memory_mb: 4096,
+                    cpus: 4,
+                    disk_size_gb: 64,
+                    display: windows_headless::Display::Vnc(PROVEN_VNC_DISPLAY.to_string()),
+                },
+                false,
+            )
             .await
         }
         Cmd::Gen {

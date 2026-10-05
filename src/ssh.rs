@@ -471,6 +471,49 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     Ok(())
 }
 
+/// Prove a usable interactive shell, not just an exec channel: open a
+/// real pty shell (the exact path a user login takes — profile, prompt,
+/// the lot), send a marker, and read it back. An exec `whoami` passing
+/// while interactive logon hangs is a real failure mode (profile load,
+/// shell startup); only a prompt answering proves the prompt exists.
+/// Bounded by [`timeouts::READINESS_PROBE_BUDGET`]: answers in milliseconds
+/// on a landed guest, loud error otherwise — never a hang.
+pub async fn prove_interactive_shell(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    const MARKER: &str = "GOLDEN_SHELL_PROBE_READY";
+    let session = authed_session(host, port, user, pass).await?;
+    let mut ch = session.channel_open_session().await?;
+    ch.request_pty(false, DEFAULT_PTY_TERM, 80, 24, 0, 0, &[])
+        .await?;
+    ch.request_shell(false).await?;
+    ch.data(format!("echo {MARKER}\r\n").as_bytes()).await?;
+    tokio::time::timeout(timeouts::READINESS_PROBE_BUDGET, async {
+        let mut seen = Vec::new();
+        loop {
+            match ch.wait().await {
+                Some(russh::ChannelMsg::Data { data })
+                | Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                    seen.extend_from_slice(&data);
+                    if seen.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                Some(russh::ChannelMsg::ExitStatus { .. }) | None => {
+                    anyhow::bail!("shell closed before answering");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "no shell prompt within {} s — interactive logon is not usable",
+            timeouts::READINESS_PROBE_BUDGET.as_secs()
+        )
+    })??;
+    Ok(())
+}
+
 /// What the guest itself reports about Setup: finished, or still working —
 /// with a human-readable description of what is pending. Callers narrate
 /// that description only when it changes, so a long install logs a handful

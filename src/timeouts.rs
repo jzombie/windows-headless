@@ -37,6 +37,9 @@ pub const INSTALL_SSH_DEADLINE_SECS: u64 = 6 * 60 * 60;
 /// its install-chain time-lapse, which has no flag of its own).
 pub const SCREENSHOTS_EVERY_SECS: u64 = 60;
 
+/// Internal snapshot tag for the landed state (`qemu-img snapshot -c`).
+pub const GOLDEN_TAG: &str = "golden";
+
 // ---------------------------------------------------------------------------
 // Per-poll SSH mechanics (the inner loops under those deadlines)
 // ---------------------------------------------------------------------------
