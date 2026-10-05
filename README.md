@@ -34,17 +34,17 @@ Sizing applies to installs too, so `run --win-iso` honors the same flags.
 
 Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
 `demo2026`); a screenshot lands in `<cache>/vms/win11/screenshots/` every
-60 seconds until SSH answers — installs as a time-lapse, `run` boots as a
+60 seconds until SSH answers (installs as a time-lapse; `run` boots as a
 boot time-lapse (`--screenshots-every-secs`, `0` disables). Boot failures
 end with a diagnosis block: latest frame path + screen state (black /
 solid color field / modal error dialog / content) + last serial line, so
 dead boots are readable without VNC. `black` means literally no visible
-pixel — text or a spinner on black is content. The classifier never
+pixel. Text or a spinner on black is content. The classifier never
 claims "error" from color shape alone: the main Windows Setup progress
 screen is itself a flat saturated blue, so a flat frame only counts when
 nothing at all is rendered on it (≥99.5% one color, <0.1% white, no UI),
 and it says `solid color field`, not "error". Black and flat-field
-verdicts only stand while the frame is static — animated screens demote
+verdicts only stand while the frame is static. Animated screens demote
 to content (spinner/percent).
 Firmware reboots are counted from the serial log (OVMF `BdsDxe: starting`
 handoffs): `guest rebooted (firmware boot #N seen on serial)` lines print
@@ -94,7 +94,7 @@ Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`
 ## Snapshots
 
 Every boot starts clean: `build` and `install` snapshot the landed state
-once the shell is proven, and `run` rewinds to it before booting — so a
+once the shell is proven, and `run` rewinds to it before booting, so a
 dirty stop (Ctrl-C kill) can never park the next boot at Recovery. Take a
 new snapshot any time with `snapshot` on a running guest (proves the
 shell, halts cleanly, snapshots, stops).
@@ -102,20 +102,19 @@ shell, halts cleanly, snapshots, stops).
 `--live` (experimental) trades the rewind for a migrated RAM snapshot:
 `snapshot --live` pivots an overlay and migrates guest state to a file
 with the guest still running; `run --live` streams it back with no boot.
-Tradeoffs, measured head-to-head on Apple Silicon (4 GB guest):
+Which wins depends on hardware: on Apple Silicon (fast CPU, external
+USB drive holding the cache) the plain rewind takes **~19 s** spawn-to-SSH
+while live resume takes **~23 s** (the 2-3 GB state stream plus Windows'
+post-resume settle outweigh the skipped boot), but on older, slower hosts
+live resume is much faster. Skipping a slow firmware + Windows boot beats
+streaming gigabytes. Time both on your own hardware (`run` vs `run --live`)
+and use what wins.
 
-- Plain rewind: **~19 s** spawn-to-SSH. Always works; costs a full
-  firmware + Windows boot every time.
-- Live resume: **~23 s** here — slower, not faster. The 2-3 GB state
-  stream plus Windows' post-resume settle (clock jump, network re-link)
-  outweigh the skipped boot on this hardware.
-
-Live may win on faster state storage with freshly taken saves, which is
-why it stays. It also costs more: multi-GB state files beside the disk,
-a brief guest stun during the save, and more moving parts (overlay,
-VARS backup, migration stream — any missing piece refuses loudly rather
-than booting a half-state). Default to the rewind unless you have timed
-live faster on your own hardware.
+Live costs more regardless: multi-GB state files beside the disk, a brief
+guest stun during the save, and more moving parts (overlay, VARS backup,
+migration stream. Any missing piece refuses loudly rather than booting
+a half-state). Default to the rewind unless you have timed live faster
+on your own hardware.
 
 ## Tested
 
