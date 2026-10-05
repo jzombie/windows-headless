@@ -139,7 +139,8 @@ Golden and live coexist (separate sidecars) and `run` selects by flag, so you
 can alternate between them. Plain `run` rewinds to golden and drops any
 orphaned live overlay out loud; `run --live` skips the rewind and requires
 every live piece or refuses. A new install voids both. Re-taking either
-overwrites that type only; run one `snapshot` at a time (QMP is single-client).
+overwrites that type only; run one `snapshot` at a time (the [QMP](https://www.qemu.org/docs/master/interop/qmp-spec.html) control
+channel to the running VM allows a single client).
 
 Storage: golden is a single named snapshot inside `disk.qcow2` (re-taking it
 replaces it, so nothing accumulates). Live state is separate files beside the
