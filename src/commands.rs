@@ -771,18 +771,30 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // user decision: a forgotten snapshot is the user's fault, and a
     // 90-second wait that reads as a hang is worse than a dirty bit that
     // chkdsk replays. The overlay/golden design absorbs the risk.
-    shell_then_wait(
-        a.shell,
-        PROVEN_SSH_HOST,
-        a.ssh_port,
-        &a.username,
-        &a.password,
-        "press Ctrl-C to stop the VM (immediate kill, no graceful wait)...",
-    )
-    .await?;
-    eprintln!("killing guest...");
-    if let Err(e) = vm.kill().await {
-        eprintln!("warning: kill failed: {e:#}");
+    // A second branch watches the child: `snapshot` from another terminal
+    // quits this QEMU out from under us — exit with the news instead of
+    // parking at the Ctrl-C prompt on a dead VM.
+    tokio::select! {
+        r = shell_then_wait(
+            a.shell,
+            PROVEN_SSH_HOST,
+            a.ssh_port,
+            &a.username,
+            &a.password,
+            "press Ctrl-C to stop the VM (immediate kill, no graceful wait)...",
+        ) => {
+            r?;
+            eprintln!("killing guest...");
+            if let Err(e) = vm.kill().await {
+                eprintln!("warning: kill failed: {e:#}");
+            }
+        }
+        s = vm.child.wait() => {
+            match s {
+                Ok(status) => eprintln!("VM exited underneath us (status {status}) — e.g. `snapshot` from another terminal. Exiting ..."),
+                Err(e) => eprintln!("VM wait failed ({e:#}) — exiting ..."),
+            }
+        }
     }
     let _ = std::fs::remove_file(pidfile);
     eprintln!("stopped");
