@@ -3864,6 +3864,14 @@ mod tests {
             classify_screen(&fixture_rgb("installing-spinner.png")),
             ScreenState::Content
         );
+        assert_eq!(
+            classify_screen(&fixture_rgb("setup-license-terms.png")),
+            ScreenState::Content
+        );
+        assert_eq!(
+            classify_screen(&fixture_rgb("lock-screen.png")),
+            ScreenState::Content
+        );
     }
 
     /// Test-only PNG decode (our [`write_png`] emits palette PNGs for flat
