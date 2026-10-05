@@ -49,8 +49,9 @@ to content (spinner/percent).
 Firmware reboots are counted from the serial log (OVMF `BdsDxe: starting`
 handoffs): `guest rebooted (firmware boot #N seen on serial)` lines print
 while waiting for SSH, and failure reports carry `guest boots seen`.
-Installer screenshots that catch a modal failure dialog print a
-`WARNING:` line as soon as it appears.
+Installer screenshots that catch a modal failure dialog on two screenshots in
+a row print a single `WARNING:` line (one per episode, not every frame, since
+slow firmware screens can trip the red-icon heuristic once).
 
 ## Where things live
 

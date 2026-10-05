@@ -24,8 +24,9 @@ Silicon) and Linux (amd64 + arm64); Intel Macs are not supported.
 - Install observability: phase banners, VNC URL + password, and a
   configurable screenshot time-lapse (`--screenshots-every-secs`, `0`
   disables) until SSH answers; dead boots end with a diagnosis block
-  (screen state + last serial line), firmware reboot counting, and an
-  immediate `WARNING:` on modal failure dialogs.
+  (screen state + last serial line), firmware reboot counting, and a
+  `WARNING:` on confirmed modal failure dialogs (two screenshots in a row,
+  once per episode).
 - Proven-install log: each green install records itself in
   `tested-isos.jsonl` and refreshes the README's Tested table.
 - Snapshots: `build`/`install` snapshot the proven shell state and `run`

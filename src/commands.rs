@@ -2799,15 +2799,29 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
     // flat-field gate (a bare color field keeps its own verdict), and
     // quantitatively loose (>= 50 sampled red pixels ≈ a ~200 px icon)
     // because this only ever feeds an announcement — never an automatic
-    // failure verdict.
-    let red = rgb
+    // failure verdict. The icon must also be a solid blob: longest run of
+    // consecutive red samples >= 6 (≈ 24 px across). Thin orange lettering
+    // (the TianoCore splash "Core", observed 2026-10-06: ~80 red samples but
+    // longest run 4) trips the per-pixel test but never forms a run, so it
+    // stays content.
+    let mut red = 0u32;
+    let mut run = 0u32;
+    let mut best_run = 0u32;
+    for px in rgb
         .as_chunks::<3>()
         .0
         .iter()
         .step_by(4)
-        .filter(|px| px[0] >= 170 && px[1] <= 90 && px[2] <= 90)
-        .count();
-    if red >= 50 {
+    {
+        if px[0] >= 170 && px[1] <= 90 && px[2] <= 90 {
+            red += 1;
+            run += 1;
+            best_run = best_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if red >= 50 && best_run >= 6 {
         return ScreenState::ErrorDialog;
     }
     ScreenState::Content
@@ -2842,6 +2856,30 @@ fn frame_moved(prev: &[u8], cur: &[u8]) -> bool {
     // every progress screen that ticks also spins — the spinner is the
     // signal we key on.
     changed > 50
+}
+
+/// Scene cut vs animation tick: shares [`frame_moved`]'s tolerance, but asks
+/// whether the frame is a *different screen* rather than a spinner tick on
+/// the same one. Above a quarter of sampled pixels changed (or a resolution
+/// change), the raw verdict stands: a pure-black frame after a firmware
+/// screen is black, not content (observed 2026-10-06: a BIOS-to-black cut
+/// read as content because any change demoted Dark). Small motion still
+/// demotes via [`effective_state`].
+fn scene_cut(prev: &[u8], cur: &[u8]) -> bool {
+    let (prev, _) = prev.as_chunks::<3>();
+    let (cur, _) = cur.as_chunks::<3>();
+    if prev.len() != cur.len() {
+        return true;
+    }
+    let mut changed = 0u32;
+    let mut total = 0u32;
+    for (a, b) in prev.iter().step_by(4).zip(cur.iter().step_by(4)) {
+        total += 1;
+        if a.iter().zip(b).any(|(x, y)| x.abs_diff(*y) > 8) {
+            changed += 1;
+        }
+    }
+    total > 0 && changed * 4 > total
 }
 
 /// Motion-aware adjustment of [`classify_screen`]: a bare-color-field or
@@ -2939,8 +2977,13 @@ async fn take_screenshot(
                 let mut last = LAST_FRAME
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let moved = last.as_deref().is_some_and(|p| frame_moved(p, &rgb));
-                let state = effective_state(raw, moved);
+                // A scene cut (firmware screen to black) is not animation:
+                // trust the raw verdict instead of demoting it to content.
+                let state = match last.as_deref() {
+                    None => raw,
+                    Some(p) if scene_cut(p, &rgb) => raw,
+                    Some(p) => effective_state(raw, frame_moved(p, &rgb)),
+                };
                 *last = Some(rgb.clone());
                 state
             };
@@ -3072,11 +3115,23 @@ fn spawn_screenshots(
         // then on cadence. Numbered, basename-only (the dir was announced
         // once above), so the log reads as progress toward the SSH answer.
         let mut n = 0u64;
-        let announce = |n: u64, p: PathBuf, s: ScreenState| {
+        // Consecutive ErrorDialog frames: a single-frame red verdict can be a
+        // slow firmware screen tripping the icon heuristic (observed: repeated
+        // WARNINGs on a BIOS screen inside slow nested virt), so only a
+        // verdict that survives two screenshots in a row earns one WARNING.
+        // Warn once per episode (streak resets on any other verdict), never
+        // every frame.
+        let mut error_streak = 0u32;
+        let mut announce = |n: u64, p: PathBuf, s: ScreenState| {
+            if matches!(s, ScreenState::ErrorDialog) {
+                error_streak += 1;
+            } else {
+                error_streak = 0;
+            }
             // A modal failure dialog must not read as routine "content":
             // flag it loudly so a 3-hour no-progress stall is obvious in
-            // the output the moment the dialog first appears.
-            let warn = if matches!(s, ScreenState::ErrorDialog) {
+            // the output the moment the dialog is confirmed.
+            let warn = if matches!(s, ScreenState::ErrorDialog) && error_streak == 2 {
                 "WARNING: "
             } else {
                 ""
@@ -3769,6 +3824,113 @@ mod tests {
             classify_screen(&flat(64, 64, [220, 60, 50])),
             ScreenState::FlatField
         );
+    }
+
+    #[test]
+    fn screen_state_thin_orange_lettering_is_not_a_dialog() {
+        // TianoCore splash (observed 2026-10-06, 800x600): orange "Core"
+        // text trips the per-pixel red test (~80 samples) but its strokes
+        // are thin (longest run 4 samples), unlike a solid error icon blob.
+        let (w, h) = (160u32, 100u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        for y in (10..90).step_by(4) {
+            for x in 20..32 {
+                let i = ((y * w + x) * 3) as usize;
+                rgb[i..i + 3].copy_from_slice(&[255, 85, 0]);
+            }
+        }
+        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+    }
+
+    #[test]
+    fn screen_state_real_frames_from_orbstack_run() {
+        // Integration over real screendumps (observed 2026-10-06, OrbStack
+        // nested virt): the TianoCore splash warned MODAL ERROR DIALOG on
+        // four consecutive screenshots, and the pure-black frame after it
+        // read as content. Fixtures live in tests/fixtures.
+        assert_eq!(
+            classify_screen(&fixture_rgb("tianocore-splash.png")),
+            ScreenState::Content
+        );
+        assert_eq!(
+            classify_screen(&fixture_rgb("pure-black.png")),
+            ScreenState::Dark
+        );
+        assert_eq!(
+            classify_screen(&fixture_rgb("installer-progress.png")),
+            ScreenState::Content
+        );
+        assert_eq!(
+            classify_screen(&fixture_rgb("installing-spinner.png")),
+            ScreenState::Content
+        );
+    }
+
+    /// Test-only PNG decode (our [`write_png`] emits palette PNGs for flat
+    /// UI, RGB otherwise): expand any color type to raw RGB for the
+    /// classifier. Fixtures, not live captures, so unsupported shapes panic.
+    fn fixture_rgb(name: &str) -> Vec<u8> {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let file = std::fs::File::open(&path)
+            .unwrap_or_else(|e| panic!("open fixture {path}: {e}"));
+        let decoder = png::Decoder::new(file);
+        let mut reader = decoder
+            .read_info()
+            .unwrap_or_else(|e| panic!("read fixture {path}: {e}"));
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let frame = reader
+            .next_frame(&mut buf)
+            .unwrap_or_else(|e| panic!("decode fixture {path}: {e}"));
+        assert_eq!(
+            frame.bit_depth,
+            png::BitDepth::Eight,
+            "fixture {path} is not 8-bit"
+        );
+        let px = &buf[..frame.buffer_size()];
+        match frame.color_type {
+            png::ColorType::Rgb => px.to_vec(),
+            png::ColorType::Rgba => px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect(),
+            png::ColorType::Grayscale => {
+                px.iter().flat_map(|&g| [g, g, g]).collect()
+            }
+            png::ColorType::GrayscaleAlpha => px
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[0], p[0]])
+                .collect(),
+            png::ColorType::Indexed => {
+                let palette = reader
+                    .info()
+                    .palette
+                    .clone()
+                    .expect("indexed fixture has no palette");
+                px.iter()
+                    .flat_map(|&i| {
+                        let o = i as usize * 3;
+                        [palette[o], palette[o + 1], palette[o + 2]]
+                    })
+                    .collect()
+            }
+        }
+    }
+    #[test]
+    fn scene_cut_keeps_black_verdict_after_screen_change() {
+        // Screenshot 65 (observed 2026-10-06): pure-black frame after the
+        // firmware screen read as content because any change demoted Dark.
+        let prior = flat(64, 64, [200, 200, 200]);
+        let black = flat(64, 64, [0, 0, 0]);
+        assert!(scene_cut(&prior, &black));
+        assert!(!scene_cut(&black, &black.clone()));
+        // Spinner-sized change is animation, not a cut.
+        let mut ticked = black.clone();
+        ticked[0..3].copy_from_slice(&[255, 255, 255]);
+        assert!(!scene_cut(&black, &ticked));
     }
 
     #[test]
