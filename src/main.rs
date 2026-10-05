@@ -100,6 +100,11 @@ enum Cmd {
         /// time-lapse, so a slow or stuck boot is readable without VNC.
         #[arg(long, default_value_t = windows_headless::timeouts::SCREENSHOTS_EVERY_SECS)]
         screenshots_every_secs: u64,
+        /// Resume the experimental live snapshot (migrated RAM, no boot):
+        /// instant when it works. Default off — golden rewind always works.
+        /// Take one first with `snapshot --live` on a running guest.
+        #[arg(long, default_value_t = false)]
+        live: bool,
     },
     /// Proven install: USB-HDD media + NVMe target, unattended answer
     /// file, ends at SSH with the guest reporting Setup complete.
@@ -238,6 +243,10 @@ enum Cmd {
         password: String,
         #[arg(long, default_value_t = PROVEN_SSH_PORT)]
         ssh_port: u16,
+        /// Live snapshot (overlay pivot + RAM migration, guest keeps
+        /// running): instant-boot state, experimental.
+        #[arg(long, default_value_t = false)]
+        live: bool,
     },
     /// Graceful shutdown via QMP + pidfile cleanup (no orphans).
     #[command(hide = true)]
@@ -542,6 +551,7 @@ async fn async_main() -> Result<()> {
             win_iso,
             install_timeout_secs,
             screenshots_every_secs,
+            live,
         } => {
             cmd_run(RunArgs {
                 disk,
@@ -558,6 +568,7 @@ async fn async_main() -> Result<()> {
                 win_iso,
                 install_timeout_secs,
                 screenshots_every_secs,
+                live,
             })
             .await
         }
@@ -607,7 +618,8 @@ async fn async_main() -> Result<()> {
             username,
             password,
             ssh_port,
-        } => cmd_snapshot(vm_dir, qemu_dir, username, password, ssh_port).await,
+            live,
+        } => cmd_snapshot(vm_dir, qemu_dir, username, password, ssh_port, live).await,
         Cmd::Guest {
             op,
             ssh_port,

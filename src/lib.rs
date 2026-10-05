@@ -24,7 +24,7 @@ pub use media::{
 };
 pub use qemu::{
     Display, HeadlessVm, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
-    PROVEN_VNC_PASSWORD, WindowsVersion, qmp_alive, vnc_url,
+    PROVEN_VNC_PASSWORD, WindowsVersion, machine_for, qmp_alive, vnc_url,
 };
 #[cfg(feature = "downloader")]
 pub use qemu_portable::{PortableQemu, PortableWimlib};

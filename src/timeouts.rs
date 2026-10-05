@@ -40,6 +40,13 @@ pub const SCREENSHOTS_EVERY_SECS: u64 = 60;
 /// Internal snapshot tag for the landed state (`qemu-img snapshot -c`).
 pub const GOLDEN_TAG: &str = "golden";
 
+/// Bound for a live migration-to-file (`snapshot --live`): 4 GB of guest
+/// RAM over loopback lands in seconds; this only ever fires on a wedged
+/// migration, never on a slow-but-moving one.
+pub const MIGRATION_BUDGET_SECS: u64 = 600;
+/// Poll cadence while a live migration runs.
+pub const MIGRATION_POLL_SECS: u64 = 2;
+
 /// Bound for a clean guest shutdown ahead of a golden snapshot: the guest
 /// gets this long to halt after `Stop-Computer` before the snapshot path
 /// gives up and reports instead of capturing a dirty disk.

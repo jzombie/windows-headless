@@ -463,6 +463,9 @@ pub struct RunArgs {
     pub username: String,
     pub password: String,
     pub shell: bool,
+    /// Opt into the experimental live snapshot resume (`savevm` state):
+    /// instant boot when it works. Default off — golden rewind always works.
+    pub live: bool,
     /// Windows ISO: when the disk is missing, run the install chain
     /// (setup + build-media + install) instead of bailing.
     pub win_iso: Option<PathBuf>,
@@ -584,24 +587,60 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // (`snapshot -a`) rather than `-loadvm`: loadvm restores device state
     // too, and QEMU refuses it with a writable pflash drive attached.
     // Runs after qemu_dir resolution so the same portable qemu-img that
-    // wrote the snapshot applies it.
-    if golden_sidecar(&disk).is_file() {
-        let img_bin = match &b.qemu_dir {
-            Some(d) => d
-                .join(crate::paths::PORTABLE_BIN_DIR)
-                .join(crate::paths::QEMU_IMG_NAME),
-            None => PathBuf::from(crate::paths::QEMU_IMG_NAME),
-        };
-        eprintln!("rewinding to golden snapshot (landed state) ...");
-        let st = tokio::process::Command::new(&img_bin)
-            .args(["snapshot", "-a", crate::timeouts::GOLDEN_TAG, &disk])
-            .status()
-            .await?;
-        if !st.success() {
-            anyhow::bail!(
-                "golden sidecar present but snapshot apply failed — disk left untouched, refusing to boot a half-state (delete {} to boot normally)",
-                golden_sidecar(&disk).display()
+    // wrote the snapshot applies it. Skipped under --live with a live
+    // snapshot present: the live state carries the disk, so rewinding
+    // first is pure waste (and costs a multi-GB copy for nothing).
+    let live_armed = a.live && live_sidecar(&disk).is_file();
+    if live_armed {
+        // Live resume prep, all pre-boot: the state file, VARS backup, and
+        // sidecar must all exist (a partial save resumes nothing); VARS is
+        // restored over the live file (raw pflash is outside every
+        // snapshot); the save-time overlay is consumed (its post-save
+        // writes are superseded by the rewind-to-save-point semantics).
+        let vm_dir_pb = b.workdir.clone();
+        let (state, vars_backup, overlay) = live_paths(&vm_dir_pb);
+        for p in [&state, &vars_backup] {
+            if !p.is_file() {
+                anyhow::bail!(
+                    "live sidecar present but {} is missing (partial save?) — delete {} and re-take with `snapshot --live`",
+                    p.display(),
+                    live_sidecar(&disk).display()
+                );
+            }
+        }
+        std::fs::copy(&vars_backup, vm_dir_pb.join(crate::paths::VARS_FILE))?;
+        if overlay.is_file() {
+            let _ = std::fs::remove_file(&overlay);
+            eprintln!("consuming save-time overlay (post-save writes superseded) ...");
+        }
+        eprintln!("resuming live state (RAM streams in over -incoming, no boot) ...");
+        b = b.incoming(migrate_read_uri(&state));
+    } else {
+        // Orphaned overlay without a live resume: its writes are
+        // unreachable once the base boots alone — drop it out loud rather
+        // than hoarding a dead file.
+        let workdir = b.workdir.clone();
+        let (_, _, overlay) = live_paths(&workdir);
+        if overlay.is_file() {
+            let _ = std::fs::remove_file(&overlay);
+            eprintln!(
+                "dropping orphaned live overlay {} (plain boot cannot reach it) ...",
+                overlay.file_name().unwrap_or_default().to_string_lossy()
             );
+        }
+        if golden_sidecar(&disk).is_file() {
+            let img_bin = img_bin_for(&b.qemu_dir);
+            eprintln!("rewinding to golden snapshot (landed state) ...");
+            let st = tokio::process::Command::new(&img_bin)
+                .args(["snapshot", "-a", crate::timeouts::GOLDEN_TAG, &disk])
+                .status()
+                .await?;
+            if !st.success() {
+                anyhow::bail!(
+                    "golden sidecar present but snapshot apply failed — disk left untouched, refusing to boot a half-state (delete {} to boot normally)",
+                    golden_sidecar(&disk).display()
+                );
+            }
         }
     }
     eprintln!(
@@ -634,7 +673,110 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         let url = vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg());
         eprintln!("VNC {url} (password {PROVEN_VNC_PASSWORD})");
     }
-    eprintln!("QEMU launched; guest is booting ...");
+    // Opt-in live resume is fully pre-boot now (state streams in over
+    // `-incoming`, VARS + disk restored above): by the time the monitor is
+    // up the guest is already continuing, so SSH should answer in seconds.
+    if a.live {
+        let phase_start = std::time::Instant::now();
+        eprintln!("live state streaming in (2-3 GB over -incoming; watch it land) ...");
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(timeouts::MIGRATION_BUDGET_SECS);
+        loop {
+            let mut qmp = vm.qmp().await?;
+            match qmp.query_migrate_status().await?.as_str() {
+                "completed" => break,
+                "failed" | "cancelled" | "cancelling" => {
+                    anyhow::bail!(
+                        "incoming migration failed — state file may be truncated; re-take with `snapshot --live`"
+                    );
+                }
+                status => {
+                    if std::time::Instant::now() > deadline {
+                        anyhow::bail!(
+                            "incoming migration still '{status}' after {} s — state file unreadable or stream stalled; plain `run` (golden rewind) stays the default that works",
+                            timeouts::MIGRATION_BUDGET_SECS
+                        );
+                    }
+                    eprintln!("... incoming migration '{status}' ...");
+                    tokio::time::sleep(Duration::from_secs(timeouts::MIGRATION_POLL_SECS)).await;
+                }
+            }
+        }
+        eprintln!(
+            "live state loaded in {} s — guest resuming ...",
+            phase_start.elapsed().as_secs()
+        );
+        // Mirror of the save-side guard: a completed incoming stream can
+        // still leave the destination paused (login screen up, nothing
+        // executing — SSH can never answer). Verify running, resume if not.
+        // Then a stop/cont round-trip regardless: HVF may not re-arm
+        // halted-vCPU timers on the incoming path (frozen lock-screen
+        // clock, static frames), and the cycle re-arms them.
+        {
+            let mut qmp = vm.qmp().await?;
+            match qmp.query_vm_status().await?.as_str() {
+                "running" => eprintln!("guest executing after restore."),
+                stalled => {
+                    eprintln!("guest {stalled} after restore — resuming ...");
+                    qmp.resume_vm().await?;
+                }
+            }
+            eprintln!("re-arming guest timers (stop/cont cycle) ...");
+            qmp.pause_vm().await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            qmp.resume_vm().await?;
+            eprintln!(
+                "restore overhead total: {} s (stream + re-arm) — SSH settle next ...",
+                phase_start.elapsed().as_secs()
+            );
+        }
+        // The restored virtio-net rings point at the OLD slirp backend
+        // (gone with the saving QEMU): packets blackhole while Windows
+        // believes nothing changed — healthy desktop, dead SSH (observed).
+        // A link flap forces DHCP + NLA + the listener to re-run against
+        // the fresh backend. The NIC's device name comes from `info
+        // network` (auto-assigned, never guessed); best-effort throughout.
+        let nic = mon
+            .command("info network")
+            .await
+            .ok()
+            .and_then(|info| find_nic_name(&info).map(str::to_string))
+            .unwrap_or_else(|| "n1".to_string());
+        for (state, cmd) in [
+            ("down", format!("set_link {nic} off")),
+            ("up", format!("set_link {nic} on")),
+        ] {
+            if let Err(e) = mon.command(&cmd).await {
+                eprintln!("warning: link flap {state} failed ({e:#}); continuing without it ...");
+                break;
+            }
+            if state == "down" {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+        // Classify the wire before the blind wait: refused means the guest
+        // stack is alive with nothing listening (sshd died in restore);
+        // timeout means packets blackhole (NIC/backend mismatch). The fix
+        // differs completely, so say which.
+        match classify_port(a.ssh_port).await {
+            PortState::Open => eprintln!(
+                "port {} accepts TCP — waiting for the SSH banner ...",
+                a.ssh_port
+            ),
+            PortState::Refused => eprintln!(
+                "port {} REFUSED (guest stack alive, sshd not listening — service did not survive restore)",
+                a.ssh_port
+            ),
+            PortState::Timeout => eprintln!(
+                "port {} connect timeout (packets blackholed — NIC/backend mismatch despite flap)",
+                a.ssh_port
+            ),
+        }
+        eprintln!("link flapped — waiting for SSH to re-bind ...");
+    }
+    if !a.live {
+        eprintln!("QEMU launched; guest is booting ...");
+    }
     let pidfile = vm.builder.pidfile();
     let start = std::time::Instant::now();
     // One shots dir for the whole wait: periodic boot frames land here and
@@ -810,6 +952,106 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
 /// so a stale sidecar can never bless a half-written disk.
 pub fn golden_sidecar(disk: &str) -> PathBuf {
     PathBuf::from(format!("{disk}.golden"))
+}
+
+/// Sidecar for the experimental live snapshot (`--live`): migrated RAM +
+/// device state plus VARS backup, kept strictly separate from golden so a
+/// failed live experiment can never confuse the rewind path.
+pub fn live_sidecar(disk: &str) -> PathBuf {
+    PathBuf::from(format!("{disk}.golden-live"))
+}
+
+/// NIC device name from HMP `info network` (first `type=nic` entry):
+/// auto-assigned by QEMU, never guessed — the flap must name the device,
+/// not the netdev.
+fn find_nic_name(info: &str) -> Option<&str> {
+    info.lines().find_map(|l| {
+        let l = l.trim();
+        let (name, rest) = l.split_once(':')?;
+        if rest.contains("type=nic") {
+            Some(name.trim())
+        } else {
+            None
+        }
+    })
+}
+
+/// One-shot TCP classification for the SSH port: does the restored guest
+/// accept, refuse, or swallow SYNs? Decides between "sshd died" and
+/// "packets blackholed" without a VNC session.
+enum PortState {
+    Open,
+    Refused,
+    Timeout,
+}
+
+async fn classify_port(port: u16) -> PortState {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect((PROVEN_SSH_HOST, port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => PortState::Open,
+        Ok(Err(_)) => PortState::Refused,
+        Err(_) => PortState::Timeout,
+    }
+}
+/// Shell-quote a path for QEMU `exec:` migration URIs (single-quote with
+/// embedded quotes escaped — cache paths routinely contain spaces).
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Migration-write URI for `snapshot --live` (`migrate` streams the guest
+/// out through `cat` into the state file).
+pub fn migrate_write_uri(state: &Path) -> String {
+    format!("exec:cat > {}", shell_quote(state))
+}
+
+/// Migration-read URI for `run --live` (`-incoming` streams the state file
+/// back into a fresh QEMU).
+pub fn migrate_read_uri(state: &Path) -> String {
+    format!("exec:cat {}", shell_quote(state))
+}
+
+/// Live-snapshot companions inside the VM dir.
+fn live_paths(vm_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        vm_dir.join(crate::paths::LIVE_STATE_FILE),
+        vm_dir.join(crate::paths::LIVE_VARS_BACKUP),
+        vm_dir.join(crate::paths::LIVE_OVERLAY),
+    )
+}
+
+/// Remove all live-snapshot remnants (announced): a new install or rewind
+/// voids them — resuming post-save writes against a rewound base would
+/// boot a half-state.
+fn clear_live_state(vm_dir: &Path) {
+    let disk = vm_dir
+        .join(crate::paths::DISK_IMAGE)
+        .to_string_lossy()
+        .into_owned();
+    let (state, vars, overlay) = live_paths(vm_dir);
+    for p in [live_sidecar(&disk), state, vars, overlay] {
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+            eprintln!(
+                "dropping stale live snapshot file {} ...",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+        }
+    }
+}
+
+/// Portable `qemu-img` for `qemu_dir` (resolved tree) or PATH fallback.
+fn img_bin_for(qemu_dir: &Option<PathBuf>) -> PathBuf {
+    match qemu_dir {
+        Some(d) => d
+            .join(crate::paths::PORTABLE_BIN_DIR)
+            .join(crate::paths::QEMU_IMG_NAME),
+        None => PathBuf::from(crate::paths::QEMU_IMG_NAME),
+    }
 }
 
 /// Prove the landed shell, deterministically: banner up, readiness probe
@@ -1235,6 +1477,11 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     // A new install voids any golden snapshot (sidecar dies with the
     // disk it blessed — a stale sidecar must never bless new bytes).
     let _ = std::fs::remove_file(golden_sidecar(&target_s));
+    // ...and any live snapshot (its base, RAM, and VARS all predate this
+    // disk — resuming them would boot a half-state).
+    if let Some(parent) = std::path::Path::new(&target_s).parent() {
+        clear_live_state(parent);
+    }
     eprintln!(
         "installing Windows to {target_s} (new {}G disk, {} MB RAM, {} vCPUs) ...",
         p.disk_size_gb, p.memory_mb, p.cpus
@@ -1453,12 +1700,16 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
 /// commit`): proves the shell, stops QEMU, snapshots offline, and writes
 /// the sidecar. The guest must be up (boot it with `run` first); QEMU is
 /// left stopped afterward, so boot again to resume the new golden.
+/// With `live`: QMP `savevm` on the running guest instead (no shutdown —
+/// instant-boot state, experimental; the writable pflash drive may veto
+/// it, in which case nothing is written and the guest keeps running).
 pub async fn cmd_snapshot(
     vm_dir: Option<PathBuf>,
     qemu_dir: Option<PathBuf>,
     username: String,
     password: String,
     ssh_port: u16,
+    live: bool,
 ) -> Result<()> {
     let vm_dir = match vm_dir {
         Some(d) => d,
@@ -1479,6 +1730,72 @@ pub async fn cmd_snapshot(
         );
     }
     prove_landed_shell(ssh_port, &username, &password).await?;
+    if live {
+        // Live path: pivot an overlay (atomic — the base freezes at this
+        // instant, post-save writes land in the overlay), then migrate
+        // RAM + devices to the state file (migration transfers pflash
+        // content, so the savevm veto does not apply), then back up VARS
+        // (raw pflash lives outside every snapshot). Guest keeps running
+        // throughout; crash-consistent like a power cut at the pivot.
+        let (state, vars_backup, overlay) = live_paths(&vm_dir);
+        // Fresh pivot each save: a leftover overlay would fail the pivot
+        // and poison the consistency story.
+        for p in [&state, &vars_backup, &overlay] {
+            let _ = std::fs::remove_file(p);
+        }
+        let qmp_sock = crate::ipc::vm_endpoint(&vm_dir, crate::ipc::QMP_SOCK_NAME);
+        let mut qmp = crate::qmp::QmpClient::connect(&qmp_sock).await?;
+        eprintln!("pivoting live overlay (freezing base) ...");
+        qmp.live_overlay("tgt", &overlay.to_string_lossy())
+            .await
+            .map_err(|e| anyhow::anyhow!("live overlay pivot refused ({e:#}) — guest untouched"))?;
+        eprintln!("migrating guest state to file (brief stun) ...");
+        qmp.migrate_to_file(&state).await.map_err(|e| {
+            anyhow::anyhow!(
+                "live migration refused ({e:#}) — guest still running on the overlay; delete {} to unwind",
+                overlay.display()
+            )
+        })?;
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(timeouts::MIGRATION_BUDGET_SECS);
+        loop {
+            let status = qmp.query_migrate_status().await?;
+            if status == "completed" {
+                break;
+            }
+            if status == "failed" || status == "cancelled" {
+                anyhow::bail!(
+                    "live migration {status} — guest still running on the overlay; delete {} to unwind",
+                    overlay.display()
+                );
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "live migration still '{status}' after {} s — guest still running on the overlay; delete {} to unwind",
+                    timeouts::MIGRATION_BUDGET_SECS,
+                    overlay.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(timeouts::MIGRATION_POLL_SECS)).await;
+        }
+        std::fs::copy(vm_dir.join(crate::paths::VARS_FILE), &vars_backup)?;
+        // Post-migration liveness: a completed job can still leave the VM
+        // paused (observed: guest "locked up" after a clean save). Verify
+        // running, resume if paused — never hand back a frozen guest.
+        match qmp.query_vm_status().await?.as_str() {
+            "running" => {}
+            stalled => {
+                eprintln!("guest {stalled} after migration — resuming ...");
+                qmp.resume_vm().await?;
+            }
+        }
+        std::fs::write(
+            live_sidecar(&disk),
+            format!("{}\n", crate::provenance::now_epoch()),
+        )?;
+        eprintln!("live snapshot saved — `run --live` resumes it instantly; guest still running.");
+        return Ok(());
+    }
     let img_bin = match qemu_dir {
         Some(d) => d
             .join(crate::paths::PORTABLE_BIN_DIR)
@@ -3118,6 +3435,37 @@ mod tests {
         let img64 = qemu_img_create_args("disk.qcow2", 64);
         assert_eq!(img64.last().unwrap(), "64G");
         assert_eq!(img[..5], img64[..5]);
+    }
+
+    #[test]
+    fn live_migration_uris_quote_paths() {
+        // NIC name comes from `info network`, never guessed: first
+        // type=nic entry wins, netdev/user lines are skipped.
+        let info = "virtio-net-pci.0: index=0,type=nic,model=virtio-net-pci,macaddr=52:54:00:12:34:56\n \\ n1: index=0,type=user,net=10.0.2.0/24,hostfwd=tcp::2232-:22\n";
+        assert_eq!(find_nic_name(info), Some("virtio-net-pci.0"));
+        assert_eq!(find_nic_name("n1: index=0,type=user\n"), None);
+        assert_eq!(find_nic_name("garbage\n"), None);
+        // Migration URIs quote paths (cache dirs contain spaces) and the
+        // live companions live next to the disk they belong to.
+        let spaced = std::path::Path::new("/Volumes/2TB Storage Vault/vm/golden-live.state");
+        assert_eq!(
+            migrate_write_uri(spaced),
+            "exec:cat > '/Volumes/2TB Storage Vault/vm/golden-live.state'"
+        );
+        assert_eq!(
+            migrate_read_uri(spaced),
+            "exec:cat '/Volumes/2TB Storage Vault/vm/golden-live.state'"
+        );
+        let quoted = std::path::Path::new("/tmp/o'brien/state");
+        assert_eq!(
+            migrate_write_uri(quoted),
+            "exec:cat > '/tmp/o'\\''brien/state'"
+        );
+        let dir = std::path::Path::new("/tmp/vm");
+        let (state, vars, overlay) = live_paths(dir);
+        assert_eq!(state, dir.join(crate::paths::LIVE_STATE_FILE));
+        assert_eq!(vars, dir.join(crate::paths::LIVE_VARS_BACKUP));
+        assert_eq!(overlay, dir.join(crate::paths::LIVE_OVERLAY));
     }
 
     #[test]

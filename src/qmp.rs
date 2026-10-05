@@ -118,23 +118,91 @@ impl QmpClient {
         Ok(())
     }
 
-    /// HMP escape hatch for full state checkpoints.
-    pub async fn savevm(&mut self, name: &str) -> Result<()> {
+    /// HMP escape hatch for full state checkpoints. Returns the HMP output
+    /// text: success prints nothing, so ANY output is suspect (a refusal
+    /// like the pflash veto surfaces here rather than as a QMP error —
+    /// observed live as a silent no-op save). Callers check the text.
+    pub async fn savevm(&mut self, name: &str) -> Result<String> {
+        let res = self
+            .execute(json!({
+                "execute": "human-monitor-command",
+                "arguments": { "command-line": format!("savevm {name}") }
+            }))
+            .await?;
+        Ok(res
+            .get("return")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Live RAM + device migration to a file (`snapshot --live`): unlike
+    /// `savevm`, migration transfers pflash content instead of refusing
+    /// it, so the writable-VARS veto does not apply. Async job — poll
+    /// [`QmpClient::query_migrate_status`] until `completed`.
+    pub async fn migrate_to_file(&mut self, file: &std::path::Path) -> Result<()> {
         self.execute(json!({
-            "execute": "human-monitor-command",
-            "arguments": { "command-line": format!("savevm {name}") }
+            "execute": "migrate",
+            "arguments": { "uri": crate::commands::migrate_write_uri(file) }
         }))
         .await?;
         Ok(())
     }
 
-    pub async fn loadvm(&mut self, name: &str) -> Result<()> {
-        self.execute(json!({
-            "execute": "human-monitor-command",
-            "arguments": { "command-line": format!("loadvm {name}") }
-        }))
-        .await?;
+    /// Migration job status (`active`, `completed`, `failed`, `cancelled`,
+    /// ...). Bails on unexpected shapes — a status we cannot parse is not
+    /// a status we should wait on.
+    pub async fn query_migrate_status(&mut self) -> Result<String> {
+        let res = self.execute(json!({ "execute": "query-migrate" })).await?;
+        res.get("return")
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("unparseable query-migrate: {res}"))
+    }
+
+    /// VM run state (`running`, `paused`, ...). After a migration the guest
+    /// must be `running` — a completed job can still leave it paused, which
+    /// reads as a lockup from the outside.
+    pub async fn query_vm_status(&mut self) -> Result<String> {
+        let res = self.execute(json!({ "execute": "query-status" })).await?;
+        res.get("return")
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("unparseable query-status: {res}"))
+    }
+
+    /// Resume a paused VM. No-op against a running one is an error from
+    /// QEMU, so callers check [`QmpClient::query_vm_status`] first.
+    pub async fn resume_vm(&mut self) -> Result<()> {
+        self.execute(json!({ "execute": "cont" })).await?;
         Ok(())
+    }
+
+    /// Pause a running VM. Used post-restore as half of a stop/cont cycle:
+    /// HVF can fail to re-arm halted-vCPU timers on the incoming path, and
+    /// a pause/resume round-trip re-arms them (observed downstream fix).
+    pub async fn pause_vm(&mut self) -> Result<()> {
+        self.execute(json!({ "execute": "stop" })).await?;
+        Ok(())
+    }
+
+    /// HMP escape hatch for state restore. Same output-text contract as
+    /// [`QmpClient::savevm`]: empty is success, anything else is a refusal.
+    /// (Kept for forensics; the live path resumes via `-incoming`, not this.)
+    pub async fn loadvm(&mut self, name: &str) -> Result<String> {
+        let res = self
+            .execute(json!({
+                "execute": "human-monitor-command",
+                "arguments": { "command-line": format!("loadvm {name}") }
+            }))
+            .await?;
+        Ok(res
+            .get("return")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// ACPI power-button event: the guest OS shuts itself down cleanly
