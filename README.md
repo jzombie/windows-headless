@@ -93,28 +93,48 @@ Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`
 
 ## Snapshots
 
-Every boot starts clean: `build` and `install` snapshot the landed state
-once the shell is proven, and `run` rewinds to it before booting, so a
-dirty stop (Ctrl-C kill) can never park the next boot at Recovery. Take a
-new snapshot any time with `snapshot` on a running guest (proves the
-shell, halts cleanly, snapshots, stops).
+Golden rewind is the default. `build`/`install` prove the shell, then save
+that disk state as the golden snapshot. Every `run` rewinds to it first, so
+a dirty stop (Ctrl-C) can't leave the next boot in Recovery.
 
-`--live` (experimental) trades the rewind for a migrated RAM snapshot:
-`snapshot --live` pivots an overlay and migrates guest state to a file
-with the guest still running; `run --live` streams it back with no boot.
-Which wins depends on hardware: on Apple Silicon (fast CPU, external
-USB drive holding the cache) the plain rewind takes **~19 s** spawn-to-SSH
-while live resume takes **~23 s** (the 2-3 GB state stream plus Windows'
-post-resume settle outweigh the skipped boot), but on older, slower hosts
-live resume is much faster. Skipping a slow firmware + Windows boot beats
-streaming gigabytes. Time both on your own hardware (`run` vs `run --live`)
-and use what wins.
+```sh
+# Terminal 1: `run` blocks, so boot and leave it running.
+cargo run -- run
+```
 
-Live costs more regardless: multi-GB state files beside the disk, a brief
-guest stun during the save, and more moving parts (overlay, VARS backup,
-migration stream. Any missing piece refuses loudly rather than booting
-a half-state). Default to the rewind unless you have timed live faster
-on your own hardware.
+```sh
+# Terminal 2: re-take golden from the running guest (proves shell,
+# shuts down cleanly, snapshots). The next `run` resumes the new state.
+cargo run -- snapshot
+```
+
+Live resume (experimental) also saves RAM, so `run --live` restores the
+running guest with no boot.
+
+```sh
+# Terminal 1: boot and leave it running.
+cargo run -- run
+```
+
+```sh
+# Terminal 2: save live state (brief guest stun; guest keeps running).
+cargo run -- snapshot --live
+```
+
+```sh
+# Stop the guest first (Ctrl-C terminal 1, or `stop`), then resume with no boot.
+# A missing piece (overlay, VARS backup, migration stream) fails loudly
+# rather than booting a half-state.
+cargo run -- run --live
+```
+
+Rewind is CPU-bound (full firmware + Windows boot); live is I/O-bound (2–3 GB
+stream + settle). On Apple Silicon with the cache on external USB, rewind wins:
+~19s spawn-to-SSH vs ~23s live, since the boot is fast and the USB stream is
+slow. On an older Intel i7 with an internal SSD the balance flips: the boot is
+much slower while the 2–3 GB stream off SSD is fast, so live wins. Live also
+costs multi-GB sidecars. Time `run` vs `run --live` on your hardware; default
+to the rewind unless live is faster.
 
 ## Tested
 
