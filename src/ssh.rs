@@ -229,6 +229,21 @@ fn bcdedit_value_verified(out: &str, key: &str, want: &str) -> bool {
     })
 }
 
+/// Headless service diet + NLA profile, applied once over SSH after the
+/// guest reports Ready — deliberately NOT a specialize step: each list
+/// used to be its own synchronous PowerShell cold start serializing into
+/// Setup. One invocation here costs a single cold start off the critical
+/// path. Best-effort (warn, never fail): Setup is done, this is hygiene.
+/// Defender real-time monitoring is tamper-locked headless — not attempted.
+pub async fn apply_headless_diet(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    const SERVICES: &str = "'Spooler','WSearch','SysMain','DiagTrack','WerSvc','BITS','DoSvc','wisvc','RetailDemo','MapsBroker','Fax','WbioSrvc','PhoneSvc','RemoteRegistry','lfsvc','XblAuthManager','XblGameSave','dmwappushservice'";
+    let cmd = format!(
+        "powershell -NoProfile -Command \"Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; {SERVICES}|%{{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue}}\""
+    );
+    ssh_exec(host, port, user, pass, &cmd).await?;
+    Ok(())
+}
+
 /// Enable or disable Windows Automatic Repair ("Diagnosing your PC") on
 /// the guest. Disabled = boots fail fast instead of parking at recovery;
 /// snapshots are the safety net, not WinRE. Toggles BOTH BCD switches:

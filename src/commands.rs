@@ -2693,6 +2693,14 @@ async fn wait_install_ready(
                 {
                     eprintln!("warning: wuauserv disable failed ({e:#})");
                 }
+                // Headless diet (was specialize orders; moved post-READY so
+                // four PowerShell cold starts stop serializing into Setup):
+                // NLA Private + service trim in one invocation, best-effort.
+                if let Err(e) =
+                    crate::ssh::apply_headless_diet(PROVEN_SSH_HOST, port, user, password).await
+                {
+                    eprintln!("warning: headless diet failed ({e:#})");
+                }
                 eprintln!(
                     "guest reports Setup complete across {reboots} reboot(s) — install complete"
                 );

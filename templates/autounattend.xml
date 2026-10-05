@@ -152,17 +152,6 @@
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
           <Description>Configure Firewall for SSH</Description>
         </RunSynchronousCommand>
-        <!-- NLA only assigns a firewall profile once EventLog is up (its
-             identify events are logged there). With gpsvc broken, EventLog
-             sat Start Pending ~300 s and inbound SSH waited on that profile
-             (Order 1 repairs it). Force Private anyway so background probes
-             can't re-stall identification (the firewall rule above already
-             accepts port 22 on Any profile regardless). -->
-        <RunSynchronousCommand wcm:action="add">
-          <Order>12</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"</Path>
-          <Description>Set Network Category to Private</Description>
-        </RunSynchronousCommand>
         <!-- Headless hard stops (Ctrl-C, SIGKILL, QEMU crash) dirty the
              guest; the next boot must NOT park at "Diagnosing your PC" /
              Startup Repair. IgnoreAllFailures makes winload skip the
@@ -171,47 +160,26 @@
              step applies the same policy but only when Setup reaches
              Ready, which an early stop never does. -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>13</Order>
+          <Order>12</Order>
           <Path>cmd /c bcdedit /set {current} bootstatuspolicy IgnoreAllFailures</Path>
           <Description>Skip "Diagnosing your PC" after unclean stops</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>14</Order>
+          <Order>13</Order>
           <Path>cmd /c bcdedit /set {current} recoveryenabled No</Path>
           <Description>WinRE off by default (fail fast, not repair)</Description>
         </RunSynchronousCommand>
-        <!-- Headless network + service diet (measured live 2026-10-04):
-             with the firewall on, inbound SSH sat blocked ~27s AFTER sshd
-             was already listening (kernel->banner 64s); firewall off, the
-             banner answers within seconds of bind (kernel->banner 32.5s).
-             Slirp NAT is the real gate — only the SSH port is forwarded —
-             so in-guest inbound filtering is pure latency here. The
-             Set-Service loops drop what an SSH-only box never needs
-             (print, search, indexer, telemetry, WER, update orchestration,
-             Xbox, fax, biometrics...); one name per iteration because
-             PowerShell 5.1 Set-Service rejects name arrays, -EA keeps a
-             missing name out of setuperr.log. Defender's real-time
-             monitoring CANNOT be disabled headless (tamper protection
-             silently reverts Set-MpPreference) — no no-op order for it. -->
+        <!-- Firewall off here (measured live 2026-10-04): with it on,
+             inbound SSH sat blocked ~27s AFTER sshd was already listening;
+             off, the banner answers within seconds of bind. Slirp NAT is
+             the real gate — only the SSH port is forwarded — so in-guest
+             inbound filtering is pure latency here. The NLA profile force
+             and the service diet live post-READY (one SSH call) instead of
+             serializing PowerShell cold starts into specialize. -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>15</Order>
+          <Order>14</Order>
           <Path>cmd /c netsh advfirewall set allprofiles state off</Path>
           <Description>Firewall off (slirp NAT is the gate; saves ~30s to SSH)</Description>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>16</Order>
-          <Path>powershell.exe -NoProfile -Command "'Spooler','WSearch','SysMain','DiagTrack','WerSvc','BITS','DoSvc'|%{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue};exit 0"</Path>
-          <Description>Disable print/index/superfetch/telemetry/WER/update services</Description>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>17</Order>
-          <Path>powershell.exe -NoProfile -Command "'wisvc','RetailDemo','MapsBroker','Fax','WbioSrvc','PhoneSvc'|%{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue};exit 0"</Path>
-          <Description>Disable insider/demo/maps/fax/biometric/phone services</Description>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>18</Order>
-          <Path>powershell.exe -NoProfile -Command "'RemoteRegistry','lfsvc','XblAuthManager','XblGameSave','dmwappushservice'|%{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue};exit 0"</Path>
-          <Description>Disable remote-registry/geolocation/push/xbox services</Description>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
