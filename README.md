@@ -91,6 +91,32 @@ Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`
 
 > Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
 
+## Snapshots
+
+Every boot starts clean: `build` and `install` snapshot the landed state
+once the shell is proven, and `run` rewinds to it before booting — so a
+dirty stop (Ctrl-C kill) can never park the next boot at Recovery. Take a
+new snapshot any time with `snapshot` on a running guest (proves the
+shell, halts cleanly, snapshots, stops).
+
+`--live` (experimental) trades the rewind for a migrated RAM snapshot:
+`snapshot --live` pivots an overlay and migrates guest state to a file
+with the guest still running; `run --live` streams it back with no boot.
+Tradeoffs, measured head-to-head on Apple Silicon (4 GB guest):
+
+- Plain rewind: **~19 s** spawn-to-SSH. Always works; costs a full
+  firmware + Windows boot every time.
+- Live resume: **~23 s** here — slower, not faster. The 2-3 GB state
+  stream plus Windows' post-resume settle (clock jump, network re-link)
+  outweigh the skipped boot on this hardware.
+
+Live may win on faster state storage with freshly taken saves, which is
+why it stays. It also costs more: multi-GB state files beside the disk,
+a brief guest stun during the save, and more moving parts (overlay,
+VARS backup, migration stream — any missing piece refuses loudly rather
+than booting a half-state). Default to the rewind unless you have timed
+live faster on your own hardware.
+
 ## Tested
 
 Proven installs, logged automatically by `install` to [tested-isos.jsonl](./tested-isos.jsonl) (`*` = built from a dirty tree). Regenerate with `cargo run -- report --readme README.md`.

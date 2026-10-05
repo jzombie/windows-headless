@@ -25,6 +25,10 @@ Silicon) and Linux (amd64 + arm64); Intel Macs are not supported.
   numbered screenshot every 60 seconds until SSH answers.
 - Proven-install log: each green install records itself in
   `tested-isos.jsonl` and refreshes the README's Tested table.
+- Snapshots: `build`/`install` snapshot the landed shell state and every
+  boot rewinds to it (dirty stops can't park the next boot at Recovery);
+  `snapshot` re-takes it on demand, with an experimental `--live`
+  migration-based variant (see README tradeoffs).
 - Rust library surface: `VmConfig`, `HeadlessVmBuilder`, `DiskManager`,
   and friends are exported for programmatic use.
 
