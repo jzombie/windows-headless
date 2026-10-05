@@ -65,8 +65,11 @@ user cache dir. Layout:
   wimlib-portable/<tag>/... # wimlib-imagex used to build installer media
   iso/                      # downloaded virtio-win.iso + OpenSSH zips (+ .sha256)
   media/winusb.dmg          # built installer image (+ .json provenance sidecar)
-  vms/win11/                # the VM: disk.qcow2, VARS.fd, qemu.pid,
-                            # install.log (QEMU output), screenshots/*.png
+  vms/win11/                # the VM: disk.qcow2 (+ .golden sidecar),
+                            # VARS.fd, qemu.pid, install.log (QEMU output),
+                            # screenshots/*.png; live snapshot files when saved:
+                            # golden-live.state, VARS.fd.golden-live,
+                            # disk-live-overlay.qcow2, disk.qcow2.golden-live
 ```
 
 Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
