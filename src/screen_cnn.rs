@@ -23,12 +23,15 @@ use std::sync::LazyLock;
 /// Input frame edge length: every screendump is resampled to this square
 /// before inference, so any source resolution feeds the same descriptor.
 pub const GRID: usize = 32;
-/// Convolution filters in the single conv layer.
-pub const N_FILTERS: usize = 8;
+/// Convolution filters in the single conv layer. Four forces macro-features
+/// (bars, boxes, text bands): fewer than the frames could memorize.
+pub const N_FILTERS: usize = 4;
 /// Convolution kernel edge length (square, odd, stride 1, pad 1).
 pub const KERNEL: usize = 3;
-/// Max-pool window edge length (square, stride equals window).
-pub const POOL: usize = 2;
+/// Max-pool window edge length (square, stride equals window). Eight
+/// collapses each filter to a 4x4 thumbnail: position within quadrants
+/// survives, exact pixels do not.
+pub const POOL: usize = 8;
 /// Pooled feature edge length per filter (`GRID / POOL`).
 pub const POOLED: usize = GRID / POOL;
 /// Pooled features per filter (`POOLED * POOLED`).
@@ -46,7 +49,7 @@ pub const N_WEIGHTS: usize =
     N_FILTERS * 3 * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_INPUTS + N_CLASSES;
 
 /// Number of screen classes (dense outputs).
-pub const N_CLASSES: usize = 8;
+pub const N_CLASSES: usize = 9;
 
 /// Decoded weights (f32), parsed once on first use.
 static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
@@ -86,11 +89,17 @@ pub enum ScreenClass {
     /// between firmware handoff and the OS, visually distinct from both
     /// text consoles and OS screens.
     FirmwareBoot,
+    /// Bugcheck screens: full-blue :( screen with stop code. Same palette
+    /// as the installer by design, separated by layout, never by color.
+    ErrorBluescreen,
 }
 
-/// Nearest-neighbor downsample of full-resolution RGB to GRID x GRID.
+/// Brightest-pixel downsample of full-resolution RGB to GRID x GRID.
 /// `src` is row-major `src_w` x `src_h` RGB; resolution-independent, so any
-/// screendump size feeds the same descriptor.
+/// screendump size feeds the same descriptor. Each output pixel takes the
+/// brightest source pixel in its cell (per channel) rather than the nearest
+/// neighbor: thin white text and spinner arcs on black survive the shrink
+/// instead of sampling out of existence.
 pub fn downsample_to_32x32_rgb(
     src: &[u8],
     src_w: usize,
@@ -99,14 +108,24 @@ pub fn downsample_to_32x32_rgb(
     assert_eq!(src.len(), src_w * src_h * 3, "downsample size mismatch");
     let mut out = [0u8; 3 * GRID * GRID];
     for y in 0..GRID {
-        let src_y = (y * src_h / GRID).min(src_h - 1);
+        let y0 = y * src_h / GRID;
+        let y1 = ((y + 1) * src_h / GRID).max(y0 + 1).min(src_h);
         for x in 0..GRID {
-            let src_x = (x * src_w / GRID).min(src_w - 1);
-            let src_idx = (src_y * src_w + src_x) * 3;
-            let out_idx = (y * GRID + x) * 3;
-            out[out_idx] = src[src_idx];
-            out[out_idx + 1] = src[src_idx + 1];
-            out[out_idx + 2] = src[src_idx + 2];
+            let x0 = x * src_w / GRID;
+            let x1 = ((x + 1) * src_w / GRID).max(x0 + 1).min(src_w);
+            let mut best = [0u8; 3];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let s = (sy * src_w + sx) * 3;
+                    for c in 0..3 {
+                        if src[s + c] > best[c] {
+                            best[c] = src[s + c];
+                        }
+                    }
+                }
+            }
+            let d = (y * GRID + x) * 3;
+            out[d..d + 3].copy_from_slice(&best);
         }
     }
     out
@@ -206,7 +225,8 @@ pub fn predict_32x32_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
         4 => ScreenClass::ErrorRecovery,
         5 => ScreenClass::ErrorModal,
         6 => ScreenClass::Lockscreen,
-        _ => ScreenClass::FirmwareBoot,
+        7 => ScreenClass::FirmwareBoot,
+        _ => ScreenClass::ErrorBluescreen,
     }
 }
 
@@ -281,8 +301,8 @@ mod tests {
 
     #[test]
     fn downsample_keeps_corners_at_32x32_grid() {
-        // 64x64 with distinct quadrants: nearest sampling must land each
-        // quadrant's color in the matching output corner.
+        // 64x64 with distinct quadrants: brightest-pixel reduction must land
+        // each quadrant's color in the matching output corner.
         let mut src = vec![0u8; 64 * 64 * 3];
         for y in 0..64 {
             for x in 0..64 {
@@ -310,7 +330,7 @@ mod tests {
     #[test]
     fn prediction_is_deterministic() {
         let (rgb, w, _) = load_rgb_8bit(&format!(
-            "{}/tests/fixtures/tianocore-splash.png",
+            "{}/tests/fixtures/win11-26300-en-us-retail/firmware-boot/tianocore-splash.png",
             env!("CARGO_MANIFEST_DIR")
         ));
         let a = predict_full(&rgb, w);

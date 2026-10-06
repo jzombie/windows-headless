@@ -2686,17 +2686,8 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 }
 
 /// Coarse verdict on what the guest screen shows — the one-line answer
-/// boot failures print so they are readable without VNC. Deliberately
-/// heuristic (no OCR): five buckets — nothing on screen, a bare color
-/// field with no UI, a modal failure dialog (red error icon), the UEFI
-/// shell prompt (yellow text: no bootable device), and
-/// anything else (desktop, OVMF text, gradients, installer progress).
-/// The classifier never claims "error" on color shape alone: the main
-/// Windows Setup screen is itself a flat saturated blue, and a false
-/// "error screen" announcement is worse than a bland "content" (users
-/// assume the tool is broke). The flat/black verdicts only stand while
-/// the frame is static; [`effective_state`] withdraws them once the
-/// previous frame moved.
+/// boot failures print so they are readable without VNC. Every frame is
+/// judged alone by the micro-CNN: no history, no motion rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenState {
     /// No pixel visibly lit anywhere: literally nothing on screen. A
@@ -2713,11 +2704,18 @@ enum ScreenState {
     /// A modal error dialog is up (its red error icon is visible): setup or
     /// OOBE failure dialog that sits there until someone clicks OK — the
     /// failure mode where screenshots keep flowing but nothing progresses.
-    ErrorDialog,
+    ErrorModal,
     /// The UEFI shell prompt is up (yellow shell text on black): no
     /// bootable device was found, so this boot is going nowhere. A shell
     /// is never routine progress — it is the boot having failed.
-    UefiShell,
+    ErrorShell,
+    /// Windows Recovery screens (WinRE menus and failure text), identified
+    /// by the micro-CNN in [`crate::screen_cnn`] — see its docs for the
+    /// class map. Recovery always needs input, so it is never content.
+    ErrorRecovery,
+    /// Bugcheck (blue :( screen): same palette as the installer by design,
+    /// separated by layout through the micro-CNN. Always an error.
+    ErrorBluescreen,
     /// Anything else.
     Content,
 }
@@ -2727,195 +2725,32 @@ impl std::fmt::Display for ScreenState {
         f.write_str(match self {
             ScreenState::Dark => "screen is black (no visible output)",
             ScreenState::FlatField => "screen shows a solid color field (no UI visible)",
-            ScreenState::ErrorDialog => "screen shows a MODAL ERROR DIALOG (failure dialog up)",
-            ScreenState::UefiShell => "screen shows the UEFI SHELL (no bootable device)",
+            ScreenState::ErrorModal => "screen shows a MODAL ERROR DIALOG (failure dialog up)",
+            ScreenState::ErrorShell => "screen shows the UEFI SHELL (no bootable device)",
+            ScreenState::ErrorRecovery => "screen shows RECOVERY (Windows recovery, needs input)",
+            ScreenState::ErrorBluescreen => "screen shows BLUESCREEN (bugcheck, needs input)",
             ScreenState::Content => "screen shows content",
         })
     }
 }
 
-/// Classify raw RGB (as parsed by [`parse_ppm_p6`]). Sampling every 4th
-/// pixel keeps 1280x800 frames well under a millisecond while the
-/// statistics (dark share, dominant quantized bucket) stay exact enough.
-fn classify_screen(rgb: &[u8]) -> ScreenState {
+/// Classify raw RGB (as parsed by [`parse_ppm_p6`]). Every frame goes
+/// through the micro-CNN ([`crate::screen_cnn`]): downsample to 32x32,
+/// forward pass, argmax. Single frame, no history, no pixel gates.
+fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
+    use crate::screen_cnn::ScreenClass as C;
+    // Degenerate empty frame: nothing captured = nothing to see.
     if rgb.is_empty() {
         return ScreenState::Dark;
     }
-    // "Black" means black: EVERY pixel near-black, full-frame (the old
-    // 95%-dark rule called a black UI frame with visible text or a
-    // spinner "no visible output", which was a lie). Full scan, not the
-    // 4th-pixel sample below — one lit pixel must never be missed.
-    if rgb
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .all(|px| px[0] < 24 && px[1] < 24 && px[2] < 24)
-    {
-        return ScreenState::Dark;
-    }
-    let mut n = 0u32;
-    let mut buckets = std::collections::HashMap::<u16, u32>::new();
-    for px in rgb.as_chunks::<3>().0.iter().step_by(4) {
-        let (r, g, b) = (px[0], px[1], px[2]);
-        n += 1;
-        // Quantize to 16 levels/channel: flat frames collapse into one
-        // bucket, gradients and photos spread across many.
-        let key = (((r >> 4) as u16) << 8) | (((g >> 4) as u16) << 4) | ((b >> 4) as u16);
-        *buckets.entry(key).or_insert(0) += 1;
-    }
-    let (top_key, top) = buckets
-        .into_iter()
-        .max_by_key(|&(_, c)| c)
-        .unwrap_or((0, 0));
-    // Bare color field: near-total flatness AND near-zero ink AND a
-    // saturated color, all required. The old ≥80%-flat rule matched the
-    // Windows Setup progress screen (99.07% #005A9E, sat 144) and
-    // announced the main installer screen as a "BSOD/recovery-like error"
-    // — color uniformity can't separate those screens, so this verdict
-    // only survives when there is nothing rendered at all: ≥99.5% one
-    // bucket (Setup sits at 99.07% — its text/spinner keep it out) and
-    // <0.1% white-ish pixels (Setup: 0.18% — title, percent, Cancel).
-    // Each gate alone excludes Setup; a text-bearing screen never reaches
-    // the saturation check (flat gray/white stays Content).
-    if top * 1000 >= n * 995 {
-        let whiteish = rgb
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .step_by(4)
-            .filter(|px| px[0] >= 200 && px[1] >= 200 && px[2] >= 200)
-            .count() as u32;
-        if whiteish * 1000 < n {
-            // Decode the bucket back to a representative color: each nibble
-            // is the 4 quantization bits, center = n*16+8.
-            let center = |nib: u16| (nib & 0xF) as u8 * 16 + 8;
-            let (r, g, b) = (
-                center(top_key >> 8),
-                center((top_key >> 4) & 0xF),
-                center(top_key & 0xF),
-            );
-            let sat = r.max(g).max(b) - r.min(g).min(b);
-            if sat >= 32 {
-                return ScreenState::FlatField;
-            }
-        }
-    }
-    // Modal failure dialogs (the setup "restarted unexpectedly" loop, OOBE
-    // errors): a saturated red error icon on the frame. Checked after the
-    // flat-field gate (a bare color field keeps its own verdict), and
-    // quantitatively loose (>= 50 sampled red pixels ≈ a ~200 px icon)
-    // because this only ever feeds an announcement — never an automatic
-    // failure verdict. The icon must also be a solid blob: longest run of
-    // consecutive red samples >= 6 (≈ 24 px across). Thin orange lettering
-    // (the TianoCore splash "Core", observed 2026-10-06: ~80 red samples but
-    // longest run 4) trips the per-pixel test but never forms a run, so it
-    // stays content.
-    let mut red = 0u32;
-    let mut run = 0u32;
-    let mut best_run = 0u32;
-    for px in rgb
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .step_by(4)
-    {
-        if px[0] >= 170 && px[1] <= 90 && px[2] <= 90 {
-            red += 1;
-            run += 1;
-            best_run = best_run.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    if red >= 50 && best_run >= 6 {
-        return ScreenState::ErrorDialog;
-    }
-    // UEFI shell prompt: yellow shell text on black ("Mapping table",
-    // "BLK0:", "Shell>"). Same quantitative looseness as the red gate
-    // (>= 50 sampled yellow pixels); separation is wide in practice
-    // (observed: shell 239, next-highest frame 13 from the Microsoft logo
-    // squares), so no blob-shape requirement on top.
-    let yellow = rgb
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .step_by(4)
-        .filter(|px| px[0] >= 170 && px[1] >= 170 && px[2] <= 100)
-        .count();
-    if yellow >= 50 {
-        return ScreenState::UefiShell;
-    }
-    ScreenState::Content
-}
-
-/// Previous frame kept by [`take_screenshot`] for motion detection — a
-/// full RGB copy of the last successful screendump (one 1280x800 frame,
-/// replaced every cadence tick; poisoning can't lose a verdict we care
-/// about, so callers take the data back out of the poison error).
-static LAST_FRAME: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
-
-/// Has the screen changed enough since `prev` to count as animation? The
-/// installer's spinner/dots/percent ticks are a few hundred pixels; a
-/// genuinely dead screen never changes between samples. Sampling
-/// every 4th pixel with a small per-channel tolerance keeps a minute-apart
-/// comparison cheap and immune to sub-threshold jitter, while a resized
-/// frame is conservatively "moved".
-fn frame_moved(prev: &[u8], cur: &[u8]) -> bool {
-    if prev.len() != cur.len() {
-        return true;
-    }
-    let (prev, _) = prev.as_chunks::<3>();
-    let (cur, _) = cur.as_chunks::<3>();
-    let mut changed = 0u32;
-    for (a, b) in prev.iter().step_by(4).zip(cur.iter().step_by(4)) {
-        if a.iter().zip(b).any(|(x, y)| x.abs_diff(*y) > 8) {
-            changed += 1;
-        }
-    }
-    // > 50 sampled pixels ≈ 200 real pixels: a spinner arc moves more
-    // than that, jitter much less. Percent-only ticks are smaller, but
-    // every progress screen that ticks also spins — the spinner is the
-    // signal we key on.
-    changed > 50
-}
-
-/// Scene cut vs animation tick: shares [`frame_moved`]'s tolerance, but asks
-/// whether the frame is a *different screen* rather than a spinner tick on
-/// the same one. Above a quarter of sampled pixels changed (or a resolution
-/// change), the raw verdict stands: a pure-black frame after a firmware
-/// screen is black, not content (observed 2026-10-06: a BIOS-to-black cut
-/// read as content because any change demoted Dark). Small motion still
-/// demotes via [`effective_state`].
-fn scene_cut(prev: &[u8], cur: &[u8]) -> bool {
-    let (prev, _) = prev.as_chunks::<3>();
-    let (cur, _) = cur.as_chunks::<3>();
-    if prev.len() != cur.len() {
-        return true;
-    }
-    let mut changed = 0u32;
-    let mut total = 0u32;
-    for (a, b) in prev.iter().step_by(4).zip(cur.iter().step_by(4)) {
-        total += 1;
-        if a.iter().zip(b).any(|(x, y)| x.abs_diff(*y) > 8) {
-            changed += 1;
-        }
-    }
-    total > 0 && changed * 4 > total
-}
-
-/// Motion-aware adjustment of [`classify_screen`]: a bare-color-field or
-/// black verdict only survives when the frame stood still since the
-/// previous one — progress/firmware screens can look flat but animate
-/// (spinner, percent), so they demote to plain content. A genuinely dead
-/// frame doesn't move and keeps its verdict; [`ScreenState::ErrorDialog`]
-/// and [`ScreenState::UefiShell`] are never demoted (a spinning loader
-/// under a modal dialog still means the dialog is up, and a shell with a
-/// blinking cursor is still a shell). First frame has no predecessor and
-/// is reported as classified.
-fn effective_state(raw: ScreenState, moved: bool) -> ScreenState {
-    match raw {
-        ScreenState::Dark | ScreenState::FlatField if moved => ScreenState::Content,
-        other => other,
+    match crate::screen_cnn::predict_full(rgb, width) {
+        C::Dark => ScreenState::Dark,
+        C::FlatField => ScreenState::FlatField,
+        C::ErrorShell => ScreenState::ErrorShell,
+        C::InstallerStep | C::Lockscreen | C::FirmwareBoot => ScreenState::Content,
+        C::ErrorRecovery => ScreenState::ErrorRecovery,
+        C::ErrorBluescreen => ScreenState::ErrorBluescreen,
+        C::ErrorModal => ScreenState::ErrorModal,
     }
 }
 
@@ -2994,21 +2829,9 @@ async fn take_screenshot(
         .map_err(anyhow::Error::from)
         .and_then(|d| {
             let (w, h, rgb) = parse_ppm_p6(&d)?;
-            let raw = classify_screen(&rgb);
-            let state = {
-                let mut last = LAST_FRAME
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // A scene cut (firmware screen to black) is not animation:
-                // trust the raw verdict instead of demoting it to content.
-                let state = match last.as_deref() {
-                    None => raw,
-                    Some(p) if scene_cut(p, &rgb) => raw,
-                    Some(p) => effective_state(raw, frame_moved(p, &rgb)),
-                };
-                *last = Some(rgb.clone());
-                state
-            };
+            // Single frame straight from the model: no history, no motion
+            // rules. What the CNN says is what gets reported.
+            let state = classify_screen(&rgb, w);
             write_png(&png_path, w, h, &rgb)?;
             Ok((png_path, state))
         });
@@ -3137,28 +2960,13 @@ fn spawn_screenshots(
         // then on cadence. Numbered, basename-only (the dir was announced
         // once above), so the log reads as progress toward the SSH answer.
         let mut n = 0u64;
-        // Consecutive failure frames: a single-frame red verdict can be a
-        // slow firmware screen tripping the icon heuristic (observed: repeated
-        // WARNINGs on a BIOS screen inside slow nested virt), so only a
-        // verdict that survives two screenshots in a row earns one WARNING.
-        // Warn once per episode (streak resets on any other verdict), never
-        // every frame.
-        let mut error_streak = 0u32;
-        let mut announce = |n: u64, p: PathBuf, s: ScreenState| {
-            if matches!(
+        let announce = |n: u64, p: PathBuf, s: ScreenState| {
+            // A failure screen must not read as routine "content": flag it
+            // loudly the moment it appears.
+            let warn = if matches!(
                 s,
-                ScreenState::ErrorDialog | ScreenState::UefiShell
+                ScreenState::ErrorModal | ScreenState::ErrorShell | ScreenState::ErrorRecovery | ScreenState::ErrorBluescreen
             ) {
-                error_streak += 1;
-            } else {
-                error_streak = 0;
-            }
-            // A modal failure dialog or a shell prompt must not read as
-            // routine "content": flag it loudly so a 3-hour no-progress
-            // stall is obvious in the output the moment it is confirmed.
-            let warn = if matches!(s, ScreenState::ErrorDialog | ScreenState::UefiShell)
-                && error_streak == 2
-            {
                 "WARNING: "
             } else {
                 ""
@@ -3730,14 +3538,14 @@ mod tests {
 
     #[test]
     fn screen_state_black_means_nothing_visible() {
-        assert_eq!(classify_screen(&flat(64, 64, [0, 0, 0])), ScreenState::Dark);
+        assert_eq!(classify_screen(&flat(64, 64, [0, 0, 0]), 64), ScreenState::Dark);
         // Sparse text/dots on black ARE visible content — the old
         // 95%-dark rule reported "no visible output" over live pixels.
         let mut rgb = flat(64, 64, [0, 0, 0]);
         rgb[..600].fill(220);
-        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        assert_eq!(classify_screen(&rgb, 64), ScreenState::Content);
         // Degenerate empty frame: nothing captured = nothing to see.
-        assert_eq!(classify_screen(&[]), ScreenState::Dark);
+        assert_eq!(classify_screen(&[], 0), ScreenState::Dark);
     }
 
     #[test]
@@ -3790,44 +3598,45 @@ mod tests {
         for k in 0..75 {
             put(&mut rgb, k * 131 + 200, [0, 90, 150]);
         }
-        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
         // Flatness-gate case: 1% dark ink and NOT one white pixel (flat
         // share 99.0% < 99.5 — fails flatness, passes the white gate).
         let mut rgb = flat(w as usize, h as usize, [0, 90, 158]);
         for k in 0..100 {
             put(&mut rgb, k * 97 + 5, [10, 10, 10]);
         }
-        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
         // A true bare color field (no ink at all) still gets the verdict —
         // neutral wording, no "error" claim.
         assert_eq!(
-            classify_screen(&flat(64, 64, [0, 120, 215])),
+            classify_screen(&flat(64, 64, [0, 120, 215]), 64),
             ScreenState::FlatField
         );
     }
 
     #[test]
-    fn screen_state_gradient_and_flat_gray_are_content() {
-        // Gradient (lock-screen style): spread across buckets → content.
+    fn screen_state_gradient_is_content_and_flat_gray_is_field() {
+        // Gradient (lock-screen style): the model must generalize past the
+        // flat blue it trained on → content.
         let mut rgb = Vec::with_capacity(100 * 100 * 3);
         for y in 0..100u8 {
             for x in 0..100u8 {
                 rgb.extend_from_slice(&[x * 2, y * 2, 128]);
             }
         }
-        assert_eq!(classify_screen(&rgb), ScreenState::Content);
-        // Flat gray: dominant but unsaturated (not the error signature).
+        assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
+        // Flat gray is a bare color field (like flat red below): field
+        // verdict, never an error claim.
         assert_eq!(
-            classify_screen(&flat(64, 64, [128, 128, 128])),
-            ScreenState::Content
+            classify_screen(&flat(64, 64, [128, 128, 128]), 64),
+            ScreenState::FlatField
         );
     }
 
     #[test]
     fn screen_state_red_error_icon_is_dialog() {
-        // The live setup-failure frame: black background, white modal box,
-        // red error icon — dark/flat thresholds pass through, the icon is
-        // what identifies it (and the WARNING prefix in the installer log).
+        // Error icon on a modal box: the shape the model must recognize.
+        // (Trained on near-identical synthetics; see examples/train_cnn.rs.)
         let (w, h) = (160u32, 100u32);
         let mut rgb = vec![0u8; (w * h * 3) as usize];
         let mut put = |x: u32, y: u32, c: [u8; 3]| {
@@ -3844,20 +3653,19 @@ mod tests {
                 put(x, y, [220, 60, 50]);
             }
         }
-        assert_eq!(classify_screen(&rgb), ScreenState::ErrorDialog);
-        // Ordering guard: a full-frame color field keeps its own verdict
-        // even though every pixel also matches the icon test.
+        assert_eq!(classify_screen(&rgb, 160), ScreenState::ErrorModal);
+        // A full-frame color field keeps its own verdict.
         assert_eq!(
-            classify_screen(&flat(64, 64, [220, 60, 50])),
+            classify_screen(&flat(64, 64, [220, 60, 50]), 64),
             ScreenState::FlatField
         );
     }
 
     #[test]
     fn screen_state_thin_orange_lettering_is_not_a_dialog() {
-        // TianoCore splash (observed 2026-10-06, 800x600): orange "Core"
-        // text trips the per-pixel red test (~80 samples) but its strokes
-        // are thin (longest run 4 samples), unlike a solid error icon blob.
+        // TianoCore splash "Core" strokes: thin orange, never a solid icon
+        // blob. Trained as Lockscreen (misc bucket), so this must stay
+        // content.
         let (w, h) = (160u32, 100u32);
         let mut rgb = vec![0u8; (w * h * 3) as usize];
         for y in (10..90).step_by(4) {
@@ -3866,159 +3674,65 @@ mod tests {
                 rgb[i..i + 3].copy_from_slice(&[255, 85, 0]);
             }
         }
-        assert_eq!(classify_screen(&rgb), ScreenState::Content);
+        assert_eq!(classify_screen(&rgb, 160), ScreenState::Content);
     }
 
     #[test]
-    fn screen_state_real_frames_from_orbstack_run() {
-        // Integration over real screendumps (observed 2026-10-06, OrbStack
-        // nested virt): the TianoCore splash warned MODAL ERROR DIALOG on
-        // four consecutive screenshots, and the pure-black frame after it
-        // read as content. Fixtures live in tests/fixtures.
-        assert_eq!(
-            classify_screen(&fixture_rgb("tianocore-splash.png")),
-            ScreenState::Content
-        );
-        assert_eq!(
-            classify_screen(&fixture_rgb("pure-black.png")),
-            ScreenState::Dark
-        );
-        assert_eq!(
-            classify_screen(&fixture_rgb("installer-progress.png")),
-            ScreenState::Content
-        );
-        assert_eq!(
-            classify_screen(&fixture_rgb("installing-spinner.png")),
-            ScreenState::Content
-        );
-        assert_eq!(
-            classify_screen(&fixture_rgb("setup-license-terms.png")),
-            ScreenState::Content
-        );
-        assert_eq!(
-            classify_screen(&fixture_rgb("lock-screen.png")),
-            ScreenState::Content
-        );
-        assert_eq!(
-            classify_screen(&fixture_rgb("uefi-shell.png")),
-            ScreenState::UefiShell
-        );
+    fn screen_state_real_frames_classify_by_directory() {
+        // Integration over real screendumps through the micro-CNN. The
+        // class directory IS the label: drop a capture in and both this
+        // test and the trainer pick it up with no filename list anywhere.
+        // Layout: tests/fixtures/<windows-version>/<class-dir>/*.png.
+        let expected_for_class = |class: &str| match class {
+            "dark" => ScreenState::Dark,
+            "flat-field" => ScreenState::FlatField,
+            "error-shell" => ScreenState::ErrorShell,
+            "error-recovery" => ScreenState::ErrorRecovery,
+            "error-bluescreen" => ScreenState::ErrorBluescreen,
+            // installer-step, firmware-boot, lockscreen: progress or idle,
+            // never errors.
+            _ => ScreenState::Content,
+        };
+        let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        let mut versions: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        versions.sort();
+        for version in versions {
+            let mut classes: Vec<_> = std::fs::read_dir(format!("{root}/{version}"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            classes.sort();
+            for class in classes {
+                let dir = format!("{root}/{version}/{class}");
+                if !std::path::Path::new(&dir).is_dir() {
+                    continue;
+                }
+                let mut names: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".png"))
+                    .collect();
+                names.sort();
+                for name in names {
+                    let got = classify_fixture(&format!("{version}/{class}/{name}"));
+                    assert_eq!(got, expected_for_class(&class), "fixture {version}/{class}/{name}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no fixtures found under tests/fixtures");
     }
 
-    /// Test-only PNG decode (our [`write_png`] emits palette PNGs for flat
-    /// UI, RGB otherwise): expand any color type to raw RGB for the
-    /// classifier. Fixtures, not live captures, so unsupported shapes panic.
-    fn fixture_rgb(name: &str) -> Vec<u8> {
+    /// Test-only fixture classification: decode via [`crate::screen_cnn`]
+    /// (shared with the trainer) and run the real classifier.
+    fn classify_fixture(name: &str) -> ScreenState {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        let file = std::fs::File::open(&path)
-            .unwrap_or_else(|e| panic!("open fixture {path}: {e}"));
-        let decoder = png::Decoder::new(file);
-        let mut reader = decoder
-            .read_info()
-            .unwrap_or_else(|e| panic!("read fixture {path}: {e}"));
-        let mut buf = vec![0; reader.output_buffer_size()];
-        let frame = reader
-            .next_frame(&mut buf)
-            .unwrap_or_else(|e| panic!("decode fixture {path}: {e}"));
-        assert_eq!(
-            frame.bit_depth,
-            png::BitDepth::Eight,
-            "fixture {path} is not 8-bit"
-        );
-        let px = &buf[..frame.buffer_size()];
-        match frame.color_type {
-            png::ColorType::Rgb => px.to_vec(),
-            png::ColorType::Rgba => px
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .flat_map(|p| [p[0], p[1], p[2]])
-                .collect(),
-            png::ColorType::Grayscale => {
-                px.iter().flat_map(|&g| [g, g, g]).collect()
-            }
-            png::ColorType::GrayscaleAlpha => px
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .flat_map(|p| [p[0], p[0], p[0]])
-                .collect(),
-            png::ColorType::Indexed => {
-                let palette = reader
-                    .info()
-                    .palette
-                    .clone()
-                    .expect("indexed fixture has no palette");
-                px.iter()
-                    .flat_map(|&i| {
-                        let o = i as usize * 3;
-                        [palette[o], palette[o + 1], palette[o + 2]]
-                    })
-                    .collect()
-            }
-        }
-    }
-    #[test]
-    fn scene_cut_keeps_black_verdict_after_screen_change() {
-        // Screenshot 65 (observed 2026-10-06): pure-black frame after the
-        // firmware screen read as content because any change demoted Dark.
-        let prior = flat(64, 64, [200, 200, 200]);
-        let black = flat(64, 64, [0, 0, 0]);
-        assert!(scene_cut(&prior, &black));
-        assert!(!scene_cut(&black, &black.clone()));
-        // Spinner-sized change is animation, not a cut.
-        let mut ticked = black.clone();
-        ticked[0..3].copy_from_slice(&[255, 255, 255]);
-        assert!(!scene_cut(&black, &ticked));
-    }
-
-    #[test]
-    fn motion_withdraws_flat_verdicts_only_when_the_frame_changed() {
-        let a = flat(64, 64, [0, 120, 215]);
-        let a_again = a.clone();
-        // Static frames keep the verdict: a dead screen never animates.
-        assert!(!frame_moved(&a, &a_again));
-        assert_eq!(
-            effective_state(ScreenState::FlatField, false),
-            ScreenState::FlatField
-        );
-        assert_eq!(effective_state(ScreenState::Dark, false), ScreenState::Dark);
-        // A spinner-sized change (400 px here) demotes the flat/black
-        // verdicts: progress screens can look flat but move.
-        let mut b = a.clone();
-        for y in 30..50u32 {
-            for x in 30..50u32 {
-                let i = ((y * 64 + x) * 3) as usize;
-                b[i..i + 3].copy_from_slice(&[255, 255, 255]);
-            }
-        }
-        assert!(frame_moved(&a, &b));
-        assert_eq!(
-            effective_state(ScreenState::FlatField, true),
-            ScreenState::Content
-        );
-        assert_eq!(
-            effective_state(ScreenState::Dark, true),
-            ScreenState::Content
-        );
-        // Content and the modal-dialog verdict are never rewritten.
-        assert_eq!(
-            effective_state(ScreenState::Content, true),
-            ScreenState::Content
-        );
-        assert_eq!(
-            effective_state(ScreenState::ErrorDialog, true),
-            ScreenState::ErrorDialog
-        );
-        assert_eq!(
-            effective_state(ScreenState::UefiShell, true),
-            ScreenState::UefiShell
-        );
-        // Sub-50-sample jitter and a resolution change behave as documented.
-        let mut c = a.clone();
-        c[0..3].copy_from_slice(&[10, 130, 225]);
-        assert!(!frame_moved(&a, &c));
-        assert!(frame_moved(&a, &flat(32, 32, [0, 120, 215])));
+        let (rgb, w, _) = crate::screen_cnn::load_rgb_8bit(&path);
+        classify_screen(&rgb, w)
     }
 
     #[test]

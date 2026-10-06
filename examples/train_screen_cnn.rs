@@ -6,21 +6,22 @@
 //! `screen_cnn::N_WEIGHTS`).
 //!
 //! Corpus layout (labels come from directory names, never a filename
-//! list): `tests/fixtures/<class-dir>/*.png`, where each directory maps to
-//! a `ScreenClass` variant (see `CLASS_DIRS` below). Synthetic frames cover
-//! classes with no real capture yet (`error-modal`: red-icon blobs;
-//! `flat-field`: solid colors) plus shapes mirrored from the unit tests.
+//! list): `tests/fixtures/<windows-version>/<class-dir>/*.png`, where each
+//! class directory maps to a `ScreenClass` variant (see `CLASS_DIRS`
+//! below). The version directory carries no label: the classifier never
+//! sees it, it only keeps captures attributable over time. Synthetic
+//! frames cover classes with no real capture yet plus shapes mirrored from
+//! the unit tests.
+//!
+//! Augmentation is geometric and photometric only (flip, brightness,
+//! non-uniform rescale): never colorimetric. Hue shifts and theme
+//! inversions would fabricate screens that cannot occur (a red installer,
+//! a dark WinPE) and destroy the color-meaning classes.
 //!
 //! Regenerate: `cargo run --release --example train_screen_cnn` (release
 //! matters: hundreds of epochs over full-batch backprop). The trainer exits
 //! nonzero unless every training frame classifies correctly with margin, so
 //! a bad corpus or recipe fails loudly instead of baking silent weights.
-//!
-//! Honest caveat: two dozen frames against 16k parameters memorizes, it
-//! does not generalize by itself. What carries generalization is the
-//! architecture (shared conv filters, GRID bottleneck) plus the margin
-//! requirement below. Grow `tests/fixtures/` and re-run; never tune the
-//! recipe to fit one frame.
 
 use windows_headless::screen_cnn::{
     DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOLED, POOL, POOL_FEATURES,
@@ -32,8 +33,10 @@ const EPOCHS: usize = 3000;
 const LEARNING_RATE: f32 = 0.5;
 /// Required logit gap (winner minus runner-up) on every training frame.
 const REQUIRED_MARGIN: f32 = 2.0;
-/// Frames per side of the CNN input grid.
+/// Pixels per CNN input channel.
 const GRID_PIXELS: usize = GRID * GRID;
+/// Weights per convolution filter (all input channels).
+const FILTER_WEIGHTS: usize = 3 * KERNEL * KERNEL;
 
 // ---------------------------------------------------------------------------
 // tiny deterministic RNG (fixed seed: same corpus, same weights, every run)
@@ -62,19 +65,45 @@ impl Lcg {
 
 type Frame = [u8; 3 * GRID * GRID];
 
-fn push_frame(out: &mut Vec<(Frame, usize)>, rgb: &[u8], w: usize, h: usize, label: ScreenClass) {
-    out.push((downsample_to_32x32_rgb(rgb, w, h), label as usize));
-}
-
-fn augment(
-    out: &mut Vec<(Frame, usize)>,
+fn push_frame(
+    out: &mut Vec<(Frame, usize, String)>,
+    name: String,
     rgb: &[u8],
     w: usize,
     h: usize,
     label: ScreenClass,
 ) {
-    // Original, horizontal flip, dimmer, brighter.
-    push_frame(out, rgb, w, h, label);
+    out.push((downsample_to_32x32_rgb(rgb, w, h), label as usize, name));
+}
+
+/// Nearest-neighbor rescale of full-resolution RGB by fractional factors.
+fn rescale(rgb: &[u8], w: usize, h: usize, fx: f32, fy: f32) -> (Vec<u8>, usize, usize) {
+    let w2 = ((w as f32) * fx).round().max(1.0) as usize;
+    let h2 = ((h as f32) * fy).round().max(1.0) as usize;
+    let mut out = vec![0u8; w2 * h2 * 3];
+    for y in 0..h2 {
+        for x in 0..w2 {
+            let sx = ((x as f32) / fx) as usize;
+            let sy = ((y as f32) / fy) as usize;
+            let s = (sy.min(h - 1) * w + sx.min(w - 1)) * 3;
+            let d = (y * w2 + x) * 3;
+            out[d..d + 3].copy_from_slice(&rgb[s..s + 3]);
+        }
+    }
+    (out, w2, h2)
+}
+
+fn augment(
+    out: &mut Vec<(Frame, usize, String)>,
+    name: String,
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    label: ScreenClass,
+) {
+    // Original, horizontal flip, dimmer, brighter, and non-uniform rescales
+    // (DPI/aspect drift of +-15%).
+    push_frame(out, format!("{name}"), rgb, w, h, label);
     let mut flip = vec![0u8; rgb.len()];
     for y in 0..h {
         for x in 0..w {
@@ -83,24 +112,37 @@ fn augment(
             flip[d..d + 3].copy_from_slice(&rgb[s..s + 3]);
         }
     }
-    push_frame(out, &flip, w, h, label);
+    push_frame(out, format!("{name}[flip]"), &flip, w, h, label);
     for factor in [0.85f32, 1.15] {
         let shifted: Vec<u8> = rgb
             .iter()
             .map(|&v| ((v as f32) * factor).clamp(0.0, 255.0) as u8)
             .collect();
-        push_frame(out, &shifted, w, h, label);
+        push_frame(
+            out,
+            format!("{name}[x{factor}]"),
+            &shifted,
+            w,
+            h,
+            label,
+        );
+    }
+    for (fx, fy) in [(0.85f32, 1.0f32), (1.0, 0.85), (1.15, 1.0), (1.0, 1.15)] {
+        let (scaled, w2, h2) = rescale(rgb, w, h, fx, fy);
+        push_frame(out, format!("{name}[{fx}x{fy}]"), &scaled, w2, h2, label);
     }
 }
 
 fn flat_frame(w: usize, h: usize, c: [u8; 3]) -> Vec<u8> {
-    vec![c; w * h].concat().concat()
+    vec![c; w * h].concat()
 }
 
-/// Directory name under `tests/fixtures/` to training label. This table —
-/// not a filename list — is the corpus definition; drop new captures in and
-/// re-run.
-const CLASS_DIRS: [(&str, ScreenClass); 7] = [
+/// Directory name under each Windows-version directory in
+/// `tests/fixtures/` to training label. This table — not a filename list —
+/// is the corpus definition; drop new captures in and re-run. The version
+/// directory itself (`win11-26300-en-us-retail`, ...) carries no label: the
+/// classifier never sees it, it only keeps captures attributable over time.
+const CLASS_DIRS: [(&str, ScreenClass); 8] = [
     ("dark", ScreenClass::Dark),
     ("flat-field", ScreenClass::FlatField),
     ("error-shell", ScreenClass::ErrorShell),
@@ -108,25 +150,42 @@ const CLASS_DIRS: [(&str, ScreenClass); 7] = [
     ("error-recovery", ScreenClass::ErrorRecovery),
     ("lockscreen", ScreenClass::Lockscreen),
     ("firmware-boot", ScreenClass::FirmwareBoot),
+    ("error-bluescreen", ScreenClass::ErrorBluescreen),
 ];
 
-fn corpus() -> Vec<(Frame, usize)> {
+fn corpus() -> Vec<(Frame, usize, String)> {
     let mut out = Vec::new();
     let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-    for (dir, label) in CLASS_DIRS {
-        let mut names: Vec<_> = std::fs::read_dir(format!("{root}/{dir}"))
-            .unwrap_or_else(|e| panic!("read fixtures/{dir}: {e}"))
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".png"))
-            .collect();
-        names.sort();
-        assert!(
-            !names.is_empty(),
-            "no fixtures in tests/fixtures/{dir} (add captures or drop the class)"
-        );
-        for name in names {
-            let (rgb, w, h) = load_rgb_8bit(&format!("{root}/{dir}/{name}"));
-            augment(&mut out, &rgb, w as usize, h as usize, label);
+    // Two levels: Windows version (build + language + edition, unattributed,
+    // keeps captures identifiable over time) then class directory (the label).
+    let mut versions: Vec<_> = std::fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read {root}: {e}"))
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    versions.sort();
+    for version in versions {
+        for (dir, label) in CLASS_DIRS {
+            let dir_path = format!("{root}/{version}/{dir}");
+            if !std::path::Path::new(&dir_path).is_dir() {
+                continue;
+            }
+            let mut names: Vec<_> = std::fs::read_dir(&dir_path)
+                .unwrap_or_else(|e| panic!("read {dir_path}: {e}"))
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".png"))
+                .collect();
+            names.sort();
+            for name in names {
+                let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
+                augment(
+                    &mut out,
+                    format!("{version}/{dir}/{name}"),
+                    &rgb,
+                    w as usize,
+                    h as usize,
+                    label,
+                );
+            }
         }
     }
     // Synthetic error icons (white box + red blob on black): no real modal
@@ -151,11 +210,25 @@ fn corpus() -> Vec<(Frame, usize)> {
                 }
             }
         }
-        push_frame(&mut out, &rgb, w, h, ScreenClass::ErrorModal);
+        push_frame(&mut out, format!("icon{box_x},{box_y}"), &rgb, w, h, ScreenClass::ErrorModal);
     }
     // Synthetic flats: the bare-field shapes the unit tests pin.
     for c in [[0, 120, 215], [128, 128, 128], [220, 60, 50], [30, 140, 60]] {
-        push_frame(&mut out, &flat_frame(64, 64, c), 64, 64, ScreenClass::FlatField);
+        push_frame(&mut out, format!("flat{c:?}"), &flat_frame(64, 64, c), 64, 64, ScreenClass::FlatField);
+    }
+    // Synthetic thin orange strokes (TianoCore-like lettering): thin red
+    // strokes are lettering, never an icon. Mirrors the unit test
+    // generator exactly.
+    {
+        let (w, h) = (160usize, 100usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in (10..90).step_by(4) {
+            for x in 20..32 {
+                let i = (y * w + x) * 3;
+                rgb[i..i + 3].copy_from_slice(&[255, 85, 0]);
+            }
+        }
+        push_frame(&mut out, "orange-strokes".to_string(), &rgb, w, h, ScreenClass::Lockscreen);
     }
     // Synthetic sparse dots on black: visible, not Dark.
     {
@@ -164,7 +237,15 @@ fn corpus() -> Vec<(Frame, usize)> {
             let o = (i * 61) % (64 * 64) * 3;
             rgb[o..o + 3].copy_from_slice(&[220, 220, 220]);
         }
-        push_frame(&mut out, &rgb, 64, 64, ScreenClass::Lockscreen);
+        push_frame(&mut out, "sparse-dots".to_string(), &rgb, 64, 64, ScreenClass::Lockscreen);
+    }
+    // Synthetic cursor block on black (shell cursor, text caret edge):
+    // a solid lit block reads as visible, never Dark. Mirrors the unit
+    // test's filled-bytes case.
+    {
+        let mut rgb = vec![0u8; 64 * 64 * 3];
+        rgb[..600].fill(220);
+        push_frame(&mut out, "cursor-block".to_string(), &rgb, 64, 64, ScreenClass::Lockscreen);
     }
     // Synthetic installer-blue with sparse ink (the 99%-blue progress
     // screen shape): InstallerStep. Mirrors the unit test generator.
@@ -179,7 +260,7 @@ fn corpus() -> Vec<(Frame, usize)> {
             let o = ((k * 131 + seed + 5) % (w * h)) * 3;
             rgb[o..o + 3].copy_from_slice(&[0, 90, 150]);
         }
-        push_frame(&mut out, &rgb, w, h, ScreenClass::InstallerStep);
+        push_frame(&mut out, format!("blueink{seed}"), &rgb, w, h, ScreenClass::InstallerStep);
     }
     // Synthetic gradient (lock-screen style): Lockscreen.
     {
@@ -189,7 +270,7 @@ fn corpus() -> Vec<(Frame, usize)> {
                 rgb.extend_from_slice(&[x * 2, y * 2, 128]);
             }
         }
-        push_frame(&mut out, &rgb, 100, 100, ScreenClass::Lockscreen);
+        push_frame(&mut out, "gradient".to_string(), &rgb, 100, 100, ScreenClass::Lockscreen);
     }
     out
 }
@@ -229,7 +310,7 @@ fn forward(rgb: &Frame, conv_w: &[f32], conv_b: &[f32], out: &mut Caches) -> [f3
                                 continue;
                             }
                             sum += out.chw[ic * GRID_PIXELS + nr as usize * GRID + nc as usize]
-                                * conv_w[oc * 3 * KERNEL * KERNEL + ic * KERNEL * KERNEL
+                                * conv_w[oc * FILTER_WEIGHTS + ic * KERNEL * KERNEL
                                     + kr * KERNEL
                                     + kc];
                         }
@@ -263,9 +344,9 @@ fn main() {
     println!("corpus: {} frames", data.len());
     let mut rng = Lcg(0xC0FFEE);
     // He init scaled by each layer's fan-in.
-    const CONV_FAN_IN: f32 = (3 * KERNEL * KERNEL) as f32;
+    const CONV_FAN_IN: f32 = FILTER_WEIGHTS as f32;
     const DENSE_FAN_IN: f32 = DENSE_INPUTS as f32;
-    let mut conv_w = [0.0f32; N_FILTERS * 3 * KERNEL * KERNEL];
+    let mut conv_w = [0.0f32; N_FILTERS * FILTER_WEIGHTS];
     let mut conv_b = [0.0f32; N_FILTERS];
     let mut dense_w = [0.0f32; N_CLASSES * DENSE_INPUTS];
     let mut dense_b = [0.0f32; N_CLASSES];
@@ -277,20 +358,37 @@ fn main() {
     }
 
     let n = data.len() as f32;
+    // Class-weighted loss: minority classes (one shell capture) count as
+    // much as majority ones (ten installer blues), so the majority cannot
+    // drown them. Weights rebalance the gradient, not the data: no frame
+    // is duplicated.
+    let mut class_counts = [0usize; N_CLASSES];
+    for (_, label, _) in &data {
+        class_counts[*label] += 1;
+    }
+    let mut class_weights = [0.0f32; N_CLASSES];
+    for (c, count) in class_counts.iter().enumerate() {
+        assert!(*count > 0, "class {c} has no training frames");
+        class_weights[c] = n / (N_CLASSES as f32 * *count as f32);
+    }
+    println!("class counts: {class_counts:?}");
+    println!("class weights: {class_weights:?}");
     let mut caches = Caches {
         chw: [0.0; 3 * GRID * GRID],
         conv: [0.0; N_FILTERS * GRID * GRID],
         pool: [0.0; DENSE_INPUTS],
     };
     for epoch in 0..EPOCHS {
-        let mut g_conv_w = [0.0f32; N_FILTERS * 3 * KERNEL * KERNEL];
+        let mut g_conv_w = [0.0f32; N_FILTERS * FILTER_WEIGHTS];
         let mut g_conv_b = [0.0f32; N_FILTERS];
         let mut g_dense_w = [0.0f32; N_CLASSES * DENSE_INPUTS];
         let mut g_dense_b = [0.0f32; N_CLASSES];
         let mut loss = 0.0f32;
         let mut correct = 0;
+        let mut class_correct = [0usize; N_CLASSES];
+        let mut class_seen = [0usize; N_CLASSES];
         let mut min_margin = f32::INFINITY;
-        for (rgb, label) in &data {
+        for (rgb, label, name) in &data {
             let pool = forward(rgb, &conv_w, &conv_b, &mut caches);
             let mut logits = [0.0f32; N_CLASSES];
             for o in 0..N_CLASSES {
@@ -311,6 +409,7 @@ fn main() {
                 probs[o] /= denom;
             }
             loss += -(probs[*label].max(1e-12).ln());
+            class_seen[*label] += 1;
             let pred = probs
                 .iter()
                 .enumerate()
@@ -319,6 +418,7 @@ fn main() {
                 .0;
             if pred == *label {
                 correct += 1;
+                class_correct[*label] += 1;
                 let mut second = f32::NEG_INFINITY;
                 for o in 0..N_CLASSES {
                     if o != pred && logits[o] > second {
@@ -389,7 +489,7 @@ fn main() {
                                     if nc < 0 || nc >= GRID as isize {
                                         continue;
                                     }
-                                    g_conv_w[oc * 3 * KERNEL * KERNEL
+                                    g_conv_w[oc * FILTER_WEIGHTS
                                         + ic * KERNEL * KERNEL
                                         + kr * KERNEL
                                         + kc] += d
@@ -415,11 +515,15 @@ fn main() {
             *w -= LEARNING_RATE * g;
         }
         if epoch % 200 == 0 || epoch + 1 == EPOCHS {
+            let per_class: Vec<String> = (0..N_CLASSES)
+                .map(|c| format!("{c}:{}", class_correct[c]))
+                .collect();
             println!(
-                "epoch {epoch}: loss {:.4} acc {correct}/{} min_margin {:.2}",
+                "epoch {epoch}: loss {:.4} acc {correct}/{} min_margin {:.2} per_class [{}]",
                 loss / n,
                 data.len(),
-                min_margin
+                min_margin,
+                per_class.join(" ")
             );
         }
         if correct == data.len() && min_margin >= REQUIRED_MARGIN {
@@ -430,7 +534,7 @@ fn main() {
 
     // Final verdict on the corpus (report raw, no augmentation leniency).
     let mut fails = 0;
-    for (rgb, label) in &data {
+    for (rgb, label, name) in &data {
         let pool = forward(rgb, &conv_w, &conv_b, &mut caches);
         let mut best = 0;
         let mut best_val = f32::NEG_INFINITY;
@@ -446,7 +550,7 @@ fn main() {
         }
         if best != *label {
             fails += 1;
-            println!("MISCLASSIFIED want {label} got {best}");
+            println!("MISCLASSIFIED {name}: want {label} got {best}");
         }
     }
     if fails > 0 {
