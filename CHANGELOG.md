@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
-## [Unreleased]
+## [0.1.0-alpha] - TBD
 
 First public shape (`0.1.0-alpha`): one command takes a Microsoft ISO and
 hands back SSH into a headless Windows 11 VM. Tested on macOS (Apple
