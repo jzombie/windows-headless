@@ -1,8 +1,8 @@
 //! Micro-CNN screen classifier: a compiled static forward-pass engine with
-//! zero dependencies (`std` only). Architecture: 32x32 RGB in, Conv2D
-//! (8 filters 3x3, pad 1) + ReLU, MaxPool 2x2, dense + argmax over seven
-//! screen classes. About 14,567 parameters (~58 KB), microseconds per frame
-//! in release.
+//! zero dependencies (`std` only). Architecture: 64x64 RGB in, Conv2D
+//! (8 filters 3x3, pad 1) + ReLU, MaxPool 8x8, dense + argmax over nine
+//! screen classes. About 4,841 parameters (~19 KB), a few milliseconds per
+//! frame in release.
 //!
 //! The CNN is the whole classifier: every frame goes through it, no pixel
 //! gates in front. Class count and label order are fixed by [`ScreenClass`]
@@ -22,14 +22,15 @@ use std::sync::LazyLock;
 
 /// Input frame edge length: every screendump is resampled to this square
 /// before inference, so any source resolution feeds the same descriptor.
-pub const GRID: usize = 32;
-/// Convolution filters in the single conv layer. Four forces macro-features
-/// (bars, boxes, text bands): fewer than the frames could memorize.
-pub const N_FILTERS: usize = 4;
+pub const GRID: usize = 64;
+/// Convolution filters in the single conv layer. Eight leaves room for
+/// near-duplicate layouts (installer progress vs requirements block) to
+/// own separate filters: fewer than the frames could memorize.
+pub const N_FILTERS: usize = 8;
 /// Convolution kernel edge length (square, odd, stride 1, pad 1).
 pub const KERNEL: usize = 3;
 /// Max-pool window edge length (square, stride equals window). Eight
-/// collapses each filter to a 4x4 thumbnail: position within quadrants
+/// collapses each filter to an 8x8 thumbnail: position within fine cells
 /// survives, exact pixels do not.
 pub const POOL: usize = 8;
 /// Pooled feature edge length per filter (`GRID / POOL`).
@@ -97,7 +98,7 @@ pub enum ScreenClass {
 }
 
 /// Logit index to class. The single source of truth for index order:
-/// [`predict_32x32_rgb`] returns through this table, and the roundtrip
+/// [`predict_64x64_rgb`] returns through this table, and the roundtrip
 /// test below fails the build if the enum order ever drifts from it again.
 const BY_INDEX: [ScreenClass; N_CLASSES] = [
     ScreenClass::Dark,
@@ -117,7 +118,7 @@ const BY_INDEX: [ScreenClass; N_CLASSES] = [
 /// brightest source pixel in its cell (per channel) rather than the nearest
 /// neighbor: thin white text and spinner arcs on black survive the shrink
 /// instead of sampling out of existence.
-pub fn downsample_to_32x32_rgb(
+pub fn downsample_to_64x64_rgb(
     src: &[u8],
     src_w: usize,
     src_h: usize,
@@ -150,7 +151,7 @@ pub fn downsample_to_32x32_rgb(
 
 /// Micro-CNN forward pass over a GRID x GRID RGB frame. Pure function of the
 /// input and the baked weights: deterministic bit-for-bit.
-pub fn predict_32x32_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
+pub fn predict_64x64_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
     const GRID2: usize = GRID * GRID;
     const KERNEL2: usize = KERNEL * KERNEL;
     let w = &WEIGHTS[..];
@@ -245,8 +246,8 @@ pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
         width as usize * height * 3,
         "predict_full size mismatch"
     );
-    let small = downsample_to_32x32_rgb(rgb, width as usize, height);
-    predict_32x32_rgb(&small)
+    let small = downsample_to_64x64_rgb(rgb, width as usize, height);
+    predict_64x64_rgb(&small)
 }
 
 /// Load an 8-bit PNG from disk and expand any color type to raw RGB.
@@ -307,14 +308,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn downsample_keeps_corners_at_32x32_grid() {
-        // 64x64 with distinct quadrants: brightest-pixel reduction must land
+    fn downsample_keeps_corners_at_64x64_grid() {
+        // 128x128 with distinct quadrants: brightest-pixel reduction must land
         // each quadrant's color in the matching output corner.
-        let mut src = vec![0u8; 64 * 64 * 3];
-        for y in 0..64 {
-            for x in 0..64 {
-                let i = (y * 64 + x) * 3;
-                let c = match (y >= 32, x >= 32) {
+        let mut src = vec![0u8; 128 * 128 * 3];
+        for y in 0..128 {
+            for x in 0..128 {
+                let i = (y * 128 + x) * 3;
+                let c = match (y >= 64, x >= 64) {
                     (false, false) => [200, 0, 0],
                     (false, true) => [0, 200, 0],
                     (true, false) => [0, 0, 200],
@@ -323,15 +324,15 @@ mod tests {
                 src[i..i + 3].copy_from_slice(&c);
             }
         }
-        let small = downsample_to_32x32_rgb(&src, 64, 64);
+        let small = downsample_to_64x64_rgb(&src, 128, 128);
         let at = |x: usize, y: usize| {
-            let i = (y * 32 + x) * 3;
+            let i = (y * 64 + x) * 3;
             [small[i], small[i + 1], small[i + 2]]
         };
         assert_eq!(at(0, 0), [200, 0, 0]);
-        assert_eq!(at(31, 0), [0, 200, 0]);
-        assert_eq!(at(0, 31), [0, 0, 200]);
-        assert_eq!(at(31, 31), [200, 200, 200]);
+        assert_eq!(at(63, 0), [0, 200, 0]);
+        assert_eq!(at(0, 63), [0, 0, 200]);
+        assert_eq!(at(63, 63), [200, 200, 200]);
     }
 
     #[test]

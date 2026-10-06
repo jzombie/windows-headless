@@ -25,12 +25,15 @@
 
 use windows_headless::screen_cnn::{
     DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL, POOL_FEATURES, POOLED,
-    ScreenClass, downsample_to_32x32_rgb, load_rgb_8bit,
+    ScreenClass, downsample_to_64x64_rgb, load_rgb_8bit,
 };
 
-const EPOCHS: usize = 3000;
-/// Full-batch gradient descent step size.
-const LEARNING_RATE: f32 = 0.5;
+const EPOCHS: usize = 10_000;
+/// Full-batch gradient descent step size. Scales with 1/DENSE_INPUTS: 512
+/// pooled features move together per step at 8 filters (was 64 features
+/// with 0.5 at GRID 32 / 4 filters), so the rate drops to hold the output
+/// swing equal.
+const LEARNING_RATE: f32 = 0.06;
 /// Required logit gap (winner minus runner-up) on every training frame.
 const REQUIRED_MARGIN: f32 = 2.0;
 /// Pixels per CNN input channel.
@@ -73,7 +76,7 @@ fn push_frame(
     h: usize,
     label: ScreenClass,
 ) {
-    out.push((downsample_to_32x32_rgb(rgb, w, h), label as usize, name));
+    out.push((downsample_to_64x64_rgb(rgb, w, h), label as usize, name));
 }
 
 /// Nearest-neighbor rescale of full-resolution RGB by fractional factors.
@@ -213,7 +216,7 @@ fn corpus() -> Vec<(Frame, usize, String)> {
 }
 
 // ---------------------------------------------------------------------------
-// forward pass with caches (mirrors screen_cnn::predict_32x32_rgb exactly)
+// forward pass with caches (mirrors screen_cnn::predict_64x64_rgb exactly)
 // ---------------------------------------------------------------------------
 
 struct Caches {
@@ -476,7 +479,7 @@ fn main() {
         for (w, g) in dense_b.iter_mut().zip(g_dense_b.iter()) {
             *w -= LEARNING_RATE * g;
         }
-        if epoch % 50 == 0 || epoch + 1 == EPOCHS {
+        if epoch % 10 == 0 || epoch + 1 == EPOCHS {
             let per_class: Vec<String> = (0..N_CLASSES)
                 .map(|c| format!("{c}:{}", class_correct[c]))
                 .collect();
@@ -529,7 +532,7 @@ fn main() {
                 names.sort();
                 for name in names {
                     let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
-                    let small = downsample_to_32x32_rgb(&rgb, w as usize, h as usize);
+                    let small = downsample_to_64x64_rgb(&rgb, w as usize, h as usize);
                     let got =
                         predict_label(&small, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
                     hold_total += 1;
