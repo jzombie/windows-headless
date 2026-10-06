@@ -668,8 +668,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     )
     .await?;
     if a.display.is_vnc() {
-        mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
-            .await?;
+        mon.command(&vnc_password_command()).await?;
         let url = vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg());
         eprintln!("VNC {url} (password {PROVEN_VNC_PASSWORD})");
     }
@@ -1578,16 +1577,15 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
             }
         };
     // VNC-only step (same guard as the boot path): cocoa/gtk/sdl have
-    // no VNC server to p.password-protect.
+    // no VNC server to password-protect.
     if p.display.is_vnc() {
-        mon.command(&format!("change vnc p.password {PROVEN_VNC_PASSWORD}"))
-            .await?;
+        mon.command(&vnc_password_command()).await?;
     }
     let mon = std::sync::Arc::new(mon);
     let url = vnc_url(&p.display.as_arg()).unwrap_or_else(|| p.display.as_arg());
     if p.display.is_vnc() {
         eprintln!(
-            "Windows installer is running — watch it at {url} (VNC p.password: {PROVEN_VNC_PASSWORD})."
+            "Windows installer is running — watch it at {url} (VNC password: {PROVEN_VNC_PASSWORD})."
         );
     } else {
         eprintln!("Windows installer is running on the {url} display.");
@@ -2749,6 +2747,12 @@ fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
     }
 }
 
+/// Monitor command setting the VNC password. Single source so the run
+/// and install paths cannot drift (or typo) apart again.
+fn vnc_password_command() -> String {
+    format!("change vnc password {PROVEN_VNC_PASSWORD}")
+}
+
 /// Evidence block for a failed boot wait: final frame (path + screen
 /// classification), last serial line, VNC coordinates. Pure formatter so
 /// the layout is unit-testable; [`boot_failure_report`] gathers the parts.
@@ -3624,6 +3628,16 @@ mod tests {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
         let (rgb, w, _) = crate::screen_cnn::load_rgb_8bit(&path);
         classify_screen(&rgb, w)
+    }
+
+    #[test]
+    fn vnc_password_command_is_exact() {
+        // Regression: the install path once sent "change vnc p.password",
+        // which QEMU ignores — VNC auth then failed with no error anywhere.
+        assert_eq!(
+            vnc_password_command(),
+            format!("change vnc password {PROVEN_VNC_PASSWORD}")
+        );
     }
 
     #[test]
