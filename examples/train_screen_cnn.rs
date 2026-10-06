@@ -361,7 +361,7 @@ fn eval_holdout(
             }
         }
     }
-    println!("holdout: {hold_hits}/{hold_total} (eval only, never trained)");
+    println!("HOLDOUT {hold_hits}/{hold_total} (unseen files, never trained)");
     (hold_hits, hold_total)
 }
 
@@ -413,6 +413,9 @@ fn main() {
             .join(" ")
     );
     println!("views/class/epoch: {VIEWS_PER_CLASS} (batch {BATCH})");
+    println!(
+        "patience metric: HOLDOUT hits (tiebreak BASE margin), stops after {PATIENCE_EPOCHS} stale epochs"
+    );
     // Reused every epoch: `clear` keeps the allocation, so per-epoch
     // allocator traffic is zero (views carry no names; the verdict names
     // files, never batch frames).
@@ -498,9 +501,10 @@ fn main() {
                 }
                 let margin = logits[pred] - second;
                 min_margin = min_margin.min(margin);
-            } else {
-                min_margin = min_margin.min(-1.0);
             }
+            // Misses count in acc; margin measures the correctly-called
+            // frames only, so the number stays informative while misses
+            // remain instead of pinning at -1 forever.
             // Backprop: dL/dlogit = (p - y) / N. Unweighted: every class
             // draws the same view count per epoch, so the balance lives in
             // the sampling and the stats line reports exactly what trains.
@@ -607,7 +611,7 @@ fn main() {
                 .map(|(c, v)| format!("{v:?}:{}", class_correct[c]))
                 .collect();
             println!(
-                "epoch {epoch}: loss {:.4} acc {correct}/{BATCH} min_margin {:.2} per_class [{}]",
+                "epoch {epoch}: TRAIN loss {:.4} acc {correct}/{BATCH} min_margin {:.2} per_class [{}]",
                 loss / n,
                 min_margin,
                 per_class.join(" ")
@@ -624,15 +628,7 @@ fn main() {
             if got == *label {
                 base_correct += 1;
                 base_margin = base_margin.min(margin);
-            } else {
-                base_margin = base_margin.min(-1.0);
             }
-        }
-        if epoch % 10 == 0 || epoch + 1 == EPOCHS {
-            println!(
-                "epoch {epoch}: base {base_correct}/{} base_margin {base_margin:.2}",
-                files.len()
-            );
         }
         // Patience on the holdout, not a fixed-accuracy gate: the corpus
         // holds a known-unlearnable pair, so 100% never fires. Best
@@ -650,12 +646,15 @@ fn main() {
             best_dense_w = dense_w;
             best_dense_b = dense_b;
             stale_evals = 0;
-            println!(
-                "epoch {epoch}: new best (holdout {hold_hits}/{hold_total}, base_margin {base_margin:.2})"
-            );
         } else {
             stale_evals += 1;
         }
+        // One labeled line per epoch: TRAIN is the sampled batch, BASE
+        // the raw captures, HOLDOUT the unseen set patience judges.
+        println!(
+            "epoch {epoch}: HOLDOUT {hold_hits}/{hold_total} | BASE {base_correct}/{} margin {base_margin:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS}",
+            files.len()
+        );
         if base_correct == files.len() && base_margin >= REQUIRED_MARGIN {
             println!("converged at epoch {epoch}");
             break;
