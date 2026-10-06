@@ -158,12 +158,13 @@ fn flat_frame(w: usize, h: usize, c: [u8; 3]) -> Vec<u8> {
 /// is the corpus definition; drop new captures in and re-run. The version
 /// directory itself (`win11-26300-en-us-retail`, ...) carries no label: the
 /// classifier never sees it, it only keeps captures attributable over time.
-const CLASS_DIRS: [(&str, ScreenClass); 8] = [
+const CLASS_DIRS: [(&str, ScreenClass); 9] = [
     ("dark", ScreenClass::Dark),
     ("flat-field", ScreenClass::FlatField),
     ("error-shell", ScreenClass::ErrorShell),
     ("installer-step", ScreenClass::InstallerStep),
     ("error-recovery", ScreenClass::ErrorRecovery),
+    ("error-modal", ScreenClass::ErrorModal),
     ("lockscreen", ScreenClass::Lockscreen),
     ("firmware-boot", ScreenClass::FirmwareBoot),
     ("error-bluescreen", ScreenClass::ErrorBluescreen),

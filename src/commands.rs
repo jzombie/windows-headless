@@ -3676,6 +3676,7 @@ mod tests {
             "error-shell" => ScreenState::ErrorShell,
             "error-recovery" => ScreenState::ErrorRecovery,
             "error-bluescreen" => ScreenState::ErrorBluescreen,
+            "error-modal" => ScreenState::ErrorModal,
             // installer-step, firmware-boot, lockscreen: progress or idle,
             // never errors.
             _ => ScreenState::Content,
