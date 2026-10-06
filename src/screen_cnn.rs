@@ -1,8 +1,9 @@
 //! Micro-CNN screen classifier: a compiled static forward-pass engine with
-//! zero dependencies (`std` only). Architecture: 128x128 RGB in, Conv2D
-//! (16 filters 3x3, pad 1) + ReLU, MaxPool 8x8, dense + argmax over nine
-//! screen classes. About 37,321 parameters (~149 KB), tens of milliseconds
-//! per frame in release.
+//! zero dependencies (`std` only). Architecture: two 128x128 RGB streams
+//! in (full frame + center-half crop at 2x content magnification), Conv2D
+//! (16 filters 3x3, pad 1, shared across streams) + ReLU, MaxPool 8x8,
+//! concatenated dense + argmax over nine screen classes. About 74,185
+//! parameters (~290 KB), tens of milliseconds per frame in release.
 //!
 //! The CNN is the whole classifier: every frame goes through it, no pixel
 //! gates in front. Class count and label order are fixed by [`ScreenClass`]
@@ -39,15 +40,23 @@ pub const POOLED: usize = GRID / POOL;
 pub const POOL_FEATURES: usize = POOLED * POOLED;
 /// Flattened dense inputs (`N_FILTERS * POOL_FEATURES`).
 pub const DENSE_INPUTS: usize = N_FILTERS * POOL_FEATURES;
+/// Streams fused per frame: the full view plus the center-half crop (2x
+/// content magnification where window interiors live, while title bars
+/// and surrounds fall outside).
+pub const STREAMS: usize = 2;
+/// Flattened dense inputs across all streams (`STREAMS * DENSE_INPUTS`):
+/// the two pooled thumbnails concatenate before the dense layer.
+pub const DENSE_TOTAL: usize = STREAMS * DENSE_INPUTS;
 
 /// Raw trained weights (little-endian f32), baked into the binary.
 static WEIGHT_BYTES: &[u8] = include_bytes!("../artifacts/weights.bin");
 
 /// Weight layout inside [`WEIGHT_BYTES`]: conv weights
-/// `[N_FILTERS, 3, KERNEL, KERNEL]`, conv bias `[N_FILTERS]`, dense weights
-/// `[N_CLASSES, DENSE_INPUTS]`, dense bias `[N_CLASSES]`.
+/// `[N_FILTERS, 3, KERNEL, KERNEL]` (shared across streams), conv bias
+/// `[N_FILTERS]`, dense weights `[N_CLASSES, DENSE_TOTAL]` (full-stream
+/// thumbnail first, crop thumbnail second), dense bias `[N_CLASSES]`.
 pub const N_WEIGHTS: usize =
-    N_FILTERS * 3 * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_INPUTS + N_CLASSES;
+    N_FILTERS * 3 * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_TOTAL + N_CLASSES;
 
 /// Number of screen classes (dense outputs).
 pub const N_CLASSES: usize = 9;
@@ -100,7 +109,7 @@ pub enum ScreenClass {
 }
 
 /// Logit index to class. The single source of truth for index order:
-/// [`predict_grid_rgb`] returns through this table, and the roundtrip
+/// [`predict_two_stream`] returns through this table, and the roundtrip
 /// test below fails the build if the enum order ever drifts from it again.
 /// Public so the trainer's stats lines print variant names (`{:?}`), not
 /// bare indices no one can cross-correlate mid-run.
@@ -116,24 +125,48 @@ pub const BY_INDEX: [ScreenClass; N_CLASSES] = [
     ScreenClass::OobeStep,
 ];
 
-/// Brightest-pixel downsample of full-resolution RGB to GRID x GRID.
-/// `src` is row-major `src_w` x `src_h` RGB; resolution-independent, so any
-/// screendump size feeds the same descriptor. Each output pixel takes the
-/// brightest source pixel in its cell (per channel) rather than the nearest
-/// neighbor: thin white text and spinner arcs on black survive the shrink
-/// instead of sampling out of existence.
-pub fn downsample_to_grid_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 * GRID * GRID] {
+/// Center-half crop region (x0, y0, x1, y1) in source pixels: the middle
+/// quarter of the frame by area, where installer/error content lives.
+/// Shared with the trainer so both sides cut the same pixels.
+pub fn crop_region(src_w: usize, src_h: usize) -> (usize, usize, usize, usize) {
+    let x0 = src_w / 4;
+    let y0 = src_h / 4;
+    let x1 = (x0 + src_w / 2).min(src_w).max(x0 + 1);
+    let y1 = (y0 + src_h / 2).min(src_h).max(y0 + 1);
+    (x0, y0, x1, y1)
+}
+
+/// Brightest-pixel downsample of a source region to GRID x GRID.
+/// Full-frame `downsample_to_grid_rgb` is this over the whole frame.
+/// Each output pixel takes the brightest source pixel in its cell (per
+/// channel) rather than the nearest neighbor: thin white text and
+/// spinner arcs on black survive the shrink instead of sampling out
+/// of existence.
+pub fn downsample_region_to_grid_rgb(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> [u8; 3 * GRID * GRID] {
     assert_eq!(src.len(), src_w * src_h * 3, "downsample size mismatch");
+    assert!(
+        x0 < x1 && x1 <= src_w && y0 < y1 && y1 <= src_h,
+        "crop region out of bounds"
+    );
+    let (rw, rh) = (x1 - x0, y1 - y0);
     let mut out = [0u8; 3 * GRID * GRID];
     for y in 0..GRID {
-        let y0 = y * src_h / GRID;
-        let y1 = ((y + 1) * src_h / GRID).max(y0 + 1).min(src_h);
+        let sy0 = y0 + y * rh / GRID;
+        let sy1 = (y0 + (y + 1) * rh / GRID).max(sy0 + 1).min(y1);
         for x in 0..GRID {
-            let x0 = x * src_w / GRID;
-            let x1 = ((x + 1) * src_w / GRID).max(x0 + 1).min(src_w);
+            let sx0 = x0 + x * rw / GRID;
+            let sx1 = (x0 + (x + 1) * rw / GRID).max(sx0 + 1).min(x1);
             let mut best = [0u8; 3];
-            for sy in y0..y1 {
-                for sx in x0..x1 {
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
                     let s = (sy * src_w + sx) * 3;
                     for c in 0..3 {
                         if src[s + c] > best[c] {
@@ -149,70 +182,85 @@ pub fn downsample_to_grid_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 
     out
 }
 
-/// Micro-CNN forward pass over a GRID x GRID RGB frame. Pure function of the
-/// input and the baked weights: deterministic bit-for-bit.
-pub fn predict_grid_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
+/// Brightest-pixel downsample of full-resolution RGB to GRID x GRID.
+/// `src` is row-major `src_w` x `src_h` RGB; resolution-independent, so any
+/// screendump size feeds the same descriptor.
+pub fn downsample_to_grid_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 * GRID * GRID] {
+    downsample_region_to_grid_rgb(src, src_w, src_h, 0, 0, src_w, src_h)
+}
+
+/// Micro-CNN forward pass over two GRID x GRID RGB views: the full frame
+/// plus its center-half crop. Shared conv filters run each stream, the
+/// pooled thumbnails concatenate, one dense layer decides. Pure function
+/// of the inputs and the baked weights: deterministic bit-for-bit.
+pub fn predict_two_stream(
+    full: &[u8; 3 * GRID * GRID],
+    crop: &[u8; 3 * GRID * GRID],
+) -> ScreenClass {
     const GRID2: usize = GRID * GRID;
     const KERNEL2: usize = KERNEL * KERNEL;
     let w = &WEIGHTS[..];
     let (conv_w, rest) = w.split_at(N_FILTERS * 3 * KERNEL2);
     let (conv_b, rest) = rest.split_at(N_FILTERS);
-    let (dense_w, rest) = rest.split_at(N_CLASSES * DENSE_INPUTS);
+    let (dense_w, rest) = rest.split_at(N_CLASSES * DENSE_TOTAL);
     let (dense_b, _) = rest.split_at(N_CLASSES);
-
-    // 1. Normalize u8 [0, 255] to f32 [0, 1], CHW layout.
-    let mut chw = [0.0f32; 3 * GRID * GRID];
-    for c in 0..3 {
-        for i in 0..GRID2 {
-            chw[c * GRID2 + i] = rgb[i * 3 + c] as f32 / 255.0;
-        }
-    }
-
-    // 2. Conv2D + ReLU (pad 1 keeps GRID x GRID).
     let pad = KERNEL / 2;
-    let mut conv_out = [0.0f32; N_FILTERS * GRID * GRID];
-    for oc in 0..N_FILTERS {
-        let b = conv_b[oc];
-        for r in 0..GRID {
-            for c in 0..GRID {
-                let mut sum = b;
-                for ic in 0..3 {
-                    for kr in 0..KERNEL {
-                        let nr = r as isize + kr as isize - pad as isize;
-                        if nr < 0 || nr >= GRID as isize {
-                            continue;
-                        }
-                        for kc in 0..KERNEL {
-                            let nc = c as isize + kc as isize - pad as isize;
-                            if nc < 0 || nc >= GRID as isize {
-                                continue;
-                            }
-                            let in_idx = ic * GRID2 + (nr as usize) * GRID + (nc as usize);
-                            let w_idx = oc * 3 * KERNEL2 + ic * KERNEL2 + kr * KERNEL + kc;
-                            sum += chw[in_idx] * conv_w[w_idx];
-                        }
-                    }
-                }
-                conv_out[oc * GRID2 + r * GRID + c] = sum.max(0.0);
+
+    let mut pool_out = [0.0f32; DENSE_TOTAL];
+    for (s, rgb) in [full, crop].iter().enumerate() {
+        // 1. Normalize u8 [0, 255] to f32 [0, 1], CHW layout.
+        let mut chw = [0.0f32; 3 * GRID * GRID];
+        for c in 0..3 {
+            for i in 0..GRID2 {
+                chw[c * GRID2 + i] = rgb[i * 3 + c] as f32 / 255.0;
             }
         }
-    }
 
-    // 3. MaxPool (POOL x POOL, stride POOL).
-    let mut pool_out = [0.0f32; DENSE_INPUTS];
-    for ch in 0..N_FILTERS {
-        for r in 0..POOLED {
-            for c in 0..POOLED {
-                let mut max_v = f32::NEG_INFINITY;
-                for kr in 0..POOL {
-                    for kc in 0..POOL {
-                        let idx = ch * GRID2 + (r * POOL + kr) * GRID + (c * POOL + kc);
-                        if conv_out[idx] > max_v {
-                            max_v = conv_out[idx];
+        // 2. Conv2D + ReLU (pad 1 keeps GRID x GRID).
+        let mut conv_out = [0.0f32; N_FILTERS * GRID * GRID];
+        for oc in 0..N_FILTERS {
+            let b = conv_b[oc];
+            for r in 0..GRID {
+                for c in 0..GRID {
+                    let mut sum = b;
+                    for ic in 0..3 {
+                        for kr in 0..KERNEL {
+                            let nr = r as isize + kr as isize - pad as isize;
+                            if nr < 0 || nr >= GRID as isize {
+                                continue;
+                            }
+                            for kc in 0..KERNEL {
+                                let nc = c as isize + kc as isize - pad as isize;
+                                if nc < 0 || nc >= GRID as isize {
+                                    continue;
+                                }
+                                let in_idx = ic * GRID2 + (nr as usize) * GRID + (nc as usize);
+                                let w_idx = oc * 3 * KERNEL2 + ic * KERNEL2 + kr * KERNEL + kc;
+                                sum += chw[in_idx] * conv_w[w_idx];
+                            }
                         }
                     }
+                    conv_out[oc * GRID2 + r * GRID + c] = sum.max(0.0);
                 }
-                pool_out[ch * POOL_FEATURES + r * POOLED + c] = max_v;
+            }
+        }
+
+        // 3. MaxPool (POOL x POOL, stride POOL) into this stream's half.
+        let base = s * DENSE_INPUTS;
+        for ch in 0..N_FILTERS {
+            for r in 0..POOLED {
+                for c in 0..POOLED {
+                    let mut max_v = f32::NEG_INFINITY;
+                    for kr in 0..POOL {
+                        for kc in 0..POOL {
+                            let idx = ch * GRID2 + (r * POOL + kr) * GRID + (c * POOL + kc);
+                            if conv_out[idx] > max_v {
+                                max_v = conv_out[idx];
+                            }
+                        }
+                    }
+                    pool_out[base + ch * POOL_FEATURES + r * POOLED + c] = max_v;
+                }
             }
         }
     }
@@ -221,8 +269,8 @@ pub fn predict_grid_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
     let mut logits = [0.0f32; N_CLASSES];
     for o in 0..N_CLASSES {
         let mut sum = dense_b[o];
-        let row = &dense_w[o * DENSE_INPUTS..(o + 1) * DENSE_INPUTS];
-        for i in 0..DENSE_INPUTS {
+        let row = &dense_w[o * DENSE_TOTAL..(o + 1) * DENSE_TOTAL];
+        for i in 0..DENSE_TOTAL {
             sum += pool_out[i] * row[i];
         }
         logits[o] = sum;
@@ -238,7 +286,8 @@ pub fn predict_grid_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
     BY_INDEX[best]
 }
 
-/// Classify a full-resolution RGB frame: downsample, then predict.
+/// Classify a full-resolution RGB frame: full view plus center-half crop,
+/// then the two-stream predict.
 pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
     let height = rgb.len() / 3 / width as usize;
     assert_eq!(
@@ -246,8 +295,11 @@ pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
         width as usize * height * 3,
         "predict_full size mismatch"
     );
-    let small = downsample_to_grid_rgb(rgb, width as usize, height);
-    predict_grid_rgb(&small)
+    let w = width as usize;
+    let full = downsample_to_grid_rgb(rgb, w, height);
+    let (x0, y0, x1, y1) = crop_region(w, height);
+    let crop = downsample_region_to_grid_rgb(rgb, w, height, x0, y0, x1, y1);
+    predict_two_stream(&full, &crop)
 }
 
 /// Load an 8-bit PNG from disk and expand any color type to raw RGB.
@@ -333,6 +385,12 @@ mod tests {
         assert_eq!(at(GRID - 1, 0), [0, 200, 0]);
         assert_eq!(at(0, GRID - 1), [0, 0, 200]);
         assert_eq!(at(GRID - 1, GRID - 1), [200, 200, 200]);
+    }
+
+    #[test]
+    fn crop_region_is_center_half() {
+        // 800x600: center half by area, shared with the trainer.
+        assert_eq!(crop_region(800, 600), (200, 150, 600, 450));
     }
 
     #[test]
