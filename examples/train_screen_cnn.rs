@@ -552,10 +552,11 @@ fn backward(
     }
 }
 
-/// Best-checkpoint state for patience stopping: holdout score, base
-/// margin tiebreak, and the weights that earned them. What ships is the
-/// best observed model, never the last epoch's.
+/// Best-checkpoint state for patience stopping: lowest holdout loss, and
+/// the weights that earned it. What ships is the best observed model,
+/// never the last epoch's.
 struct Checkpoint {
+    hold_loss: f32,
     hold_hits: usize,
     hold_total: usize,
     margin: f32,
@@ -567,6 +568,11 @@ struct Checkpoint {
     stale_evals: usize,
 }
 
+/// Minimum holdout-loss drop that counts as improvement. Below this the
+/// clock keeps running: without a floor, floating-point dust resets
+/// patience forever and the run never stops.
+const MIN_LOSS_DELTA: f32 = 1e-4;
+
 impl Checkpoint {
     fn initial(
         conv_w: &[f32; N_FILTERS * FILTER_WEIGHTS],
@@ -575,6 +581,7 @@ impl Checkpoint {
         dense_b: &[f32; N_CLASSES],
     ) -> Self {
         Self {
+            hold_loss: f32::INFINITY,
             hold_hits: 0,
             hold_total: 0,
             margin: f32::NEG_INFINITY,
@@ -586,11 +593,9 @@ impl Checkpoint {
             stale_evals: 0,
         }
     }
-
-    /// Fold one epoch's reports in. Strict holdout improvement resets the
-    /// patience clock and returns true; a margin tiebreak refreshes the
-    /// shipped weights without resetting (a 22/23 seesaw with creeping
-    /// margin would stall the stop forever).
+    /// Fold one epoch's reports in. A holdout-loss drop beyond
+    /// MIN_LOSS_DELTA refreshes the shipped weights and resets the clock;
+    /// anything else advances it. Hit counts and margin report only.
     fn observe(
         &mut self,
         epoch: usize,
@@ -598,9 +603,8 @@ impl Checkpoint {
         base_margin: f32,
         net: TrainNet<'_>,
     ) -> bool {
-        let prev_best = self.hold_hits;
-        if hold.hits > self.hold_hits || (hold.hits == self.hold_hits && base_margin > self.margin)
-        {
+        if hold.mean_loss < self.hold_loss - MIN_LOSS_DELTA {
+            self.hold_loss = hold.mean_loss;
             self.hold_hits = hold.hits;
             self.hold_total = hold.total;
             self.margin = base_margin;
@@ -609,8 +613,6 @@ impl Checkpoint {
             self.conv_b = *net.conv_b;
             self.dense_w = *net.dense_w;
             self.dense_b = *net.dense_b;
-        }
-        if hold.hits > prev_best {
             self.stale_evals = 0;
             true
         } else {
@@ -741,7 +743,7 @@ fn main() {
     );
     println!("views/class/epoch: {VIEWS_PER_CLASS} (batch {BATCH})");
     println!(
-        "patience metric: HOLDOUT hits (tiebreak BASE margin), stops after {PATIENCE_EPOCHS} stale epochs"
+        "patience metric: HOLDOUT loss (min drop {MIN_LOSS_DELTA}), stops after {PATIENCE_EPOCHS} stale epochs"
     );
     // Reused every epoch: `clear` keeps the allocation, so per-epoch
     // allocator traffic is zero (views carry no names; the verdict names
@@ -843,15 +845,18 @@ fn main() {
         let stale_evals = best.stale_evals;
         // One labeled line per epoch: TRAIN is the sampled batch, BASE
         // the raw captures, HOLDOUT the unseen set patience judges. Both
-        // losses print as decimals so progress reads across the line.
+        // losses print as decimals so progress reads across the line. BEST
+        // carries the loss patience actually judges, so the target is
+        // visible every epoch.
         println!(
-            "epoch {epoch}: HOLDOUT {}/{} loss {:.4} | BASE {}/{} margin {:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS} | BEST {}/{}@e{}",
+            "epoch {epoch}: HOLDOUT {}/{} loss {:.4} | BASE {}/{} margin {:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS} | BEST loss {:.4} ({}/{})@e{}",
             hold.hits,
             hold.total,
             hold.mean_loss,
             base.hits,
             files.len(),
             base.margin,
+            best.hold_loss,
             best.hold_hits,
             best.hold_total,
             best.epoch
@@ -872,8 +877,8 @@ fn main() {
     // Ship the best observed weights, never the last epoch's.
     (conv_w, conv_b, dense_w, dense_b) = (best.conv_w, best.conv_b, best.dense_w, best.dense_b);
     println!(
-        "best epoch {}: holdout {}/{}, base_margin {:.2}",
-        best.epoch, best.hold_hits, best.hold_total, best.margin
+        "best epoch {}: holdout loss {:.4} ({}/{}), base_margin {:.2}",
+        best.epoch, best.hold_loss, best.hold_hits, best.hold_total, best.margin
     );
 
     // Final verdict on the raw base captures (no augmentation leniency).
@@ -906,7 +911,6 @@ fn main() {
     }
     assert_eq!(bytes.len(), N_WEIGHTS * 4);
     std::fs::create_dir_all(format!("{}/artifacts", env!("CARGO_MANIFEST_DIR"))).unwrap();
-    std::fs::write(&out_path, &bytes).unwrap();
     std::fs::write(&out_path, &bytes).unwrap();
     println!("wrote {out_path} ({} bytes)", bytes.len());
     println!(
