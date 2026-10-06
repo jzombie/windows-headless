@@ -1,52 +1,68 @@
 //! Dev-time trainer for the micro-CNN in `src/screen_cnn.rs`.
 //!
-//! Pure Rust, no ML libraries: full-batch gradient descent with
-//! cross-entropy over the labeled corpus, fixed-seed init, frozen recipe.
-//! Output: `artifacts/weights.bin` (little-endian f32, layout documented on
-//! `screen_cnn::N_WEIGHTS`).
+//! Pure Rust, no ML libraries: gradient descent with cross-entropy, fixed
+//! seeds throughout (same corpus, same weights, every run). Output:
+//! `artifacts/weights.bin` (little-endian f32, layout documented on
+//! `screen_cnn::N_WEIGHTS`). The run always exits 0 and always writes;
+//! a human decides merge from the printed report.
 //!
 //! Corpus layout (labels come from directory names, never a filename
 //! list): `tests/fixtures/<windows-version>/<class-dir>/*.png`, where each
 //! class directory maps to a `ScreenClass` variant (see `CLASS_DIRS`
 //! below). The version directory carries no label: the classifier never
-//! sees it, it only keeps captures attributable over time. Synthetic
-//! frames cover classes with no real capture yet plus shapes mirrored from
-//! the unit tests.
+//! sees it, it only keeps captures attributable over time.
 //!
-//! Augmentation is geometric and photometric only (flip, brightness,
-//! non-uniform rescale): never colorimetric. Hue shifts and theme
-//! inversions would fabricate screens that cannot occur (a red installer,
-//! a dark WinPE) and destroy the color-meaning classes.
+//! Sampling is fully dynamic: no fixed variants repeat across epochs.
+//! Every epoch draws `VIEWS_PER_CLASS` fresh stochastic views per class
+//! from its own base captures (flip, brightness, tint, rescale —
+//! photometric and geometric only, never new shapes). Bases are never
+//! trained on directly.
+//!
+//! Stopping is patience on the holdout, not a fixed-accuracy gate: the
+//! corpus holds a known-unlearnable pair, so 100% never fires. Best
+//! holdout hits win (base-capture margin breaks ties), the best
+//! checkpoint ships, and the run stops after `PATIENCE_EPOCHS` stale
+//! epochs. Margin is reported, never gating.
 //!
 //! Regenerate: `cargo run --release --example train_screen_cnn` (release
-//! matters: hundreds of epochs over full-batch backprop). The trainer exits
-//! nonzero unless every training frame classifies correctly with margin, so
-//! a bad corpus or recipe fails loudly instead of baking silent weights.
+//! matters: thousands of sampled views per epoch over hundreds of
+//! epochs).
 
 use windows_headless::screen_cnn::{
-    BY_INDEX, DENSE_INPUTS, DENSE_TOTAL, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL,
-    POOL_FEATURES, POOLED, STREAMS, ScreenClass, crop_region, downsample_region_to_grid_rgb,
-    downsample_to_grid_rgb, load_rgb_8bit,
+    BY_INDEX, DENSE_INPUTS, DENSE_TOTAL, GRID, INPUT_CHANNELS, KERNEL, N_CLASSES, N_FILTERS,
+    N_WEIGHTS, POOL, POOL_FEATURES, POOLED, STREAMS, ScreenClass, crop_region,
+    downsample_region_to_grid_rgb, downsample_to_grid_rgb, load_rgb_8bit,
 };
 
+/// Cap on epochs: patience stops the run first in practice; this bounds
+/// the pathological case (metric oscillating forever) to a finite bill.
 const EPOCHS: usize = 10_000;
 /// Full-batch gradient descent step size. Scales with 1/DENSE_TOTAL:
 /// 8192 pooled features move together per step across both streams
 /// (was 64 features with 0.5 at GRID 32 / 4 filters / one stream), so
 /// the rate drops to hold the output swing equal.
 const LEARNING_RATE: f32 = 0.004;
-/// Holdout evals without improvement before stopping. If the corpus holds an
+/// Epochs without holdout improvement before stopping. If the corpus holds an
 /// unlearnable pair, a fixed-accuracy gate never fires; patience
 /// banks the best model instead of grinding plateaus. Generous on purpose:
 /// whole classes (dark, flat-field) pop after epoch 100, and cutting the
 /// run at dozens of epochs executes it before the easy wins land.
 const PATIENCE_EPOCHS: usize = 200;
-/// Required logit gap (winner minus runner-up) on every training frame.
+/// Logit gap that counts as comfortably won. Informational only (tiebreak
+/// input and report line): nothing gates on it.
 const REQUIRED_MARGIN: f32 = 2.0;
+/// Fresh stochastic views drawn per class per epoch (288-frame batch).
+const VIEWS_PER_CLASS: usize = 32;
+const BATCH: usize = VIEWS_PER_CLASS * N_CLASSES;
+/// Epoch-seed stream for the per-epoch sampling RNG (xor-folded with the
+/// epoch number): same epoch, same views, every run.
+const AUG_SEED: u64 = 0x0A09;
+/// Fixed seed for He init.
+const INIT_SEED: u64 = 0xC0FFEE;
 /// Pixels per CNN input channel.
 const GRID_PIXELS: usize = GRID * GRID;
-/// Weights per convolution filter (all input channels).
-const FILTER_WEIGHTS: usize = 3 * KERNEL * KERNEL;
+/// Weights per convolution filter (all input channels, incl. Y-coord).
+const FILTER_WEIGHTS: usize = INPUT_CHANNELS * KERNEL * KERNEL;
 
 // ---------------------------------------------------------------------------
 // tiny deterministic RNG (fixed seed: same corpus, same weights, every run)
@@ -126,8 +142,14 @@ fn apply_view(params: &ViewParams, base: &Frame) -> Frame {
             let s = (sy * GRID + sx) * 3;
             let d = (y * GRID + x) * 3;
             for c in 0..3 {
-                out[d + c] = (f32::from(base[s + c]) * params.bright + params.shifts[c])
-                    .clamp(0.0, 255.0) as u8;
+                let raw = base[s + c];
+                // Black floor: near-black background pixels take brightness
+                // only, never positive tint. Firmware screens sit on pure
+                // #000000 while installer greys sit above it; an +8 shift
+                // would fold the two backgrounds onto each other and erase
+                // the cheapest separation signal the net owns.
+                let shift = if raw < 5 { 0.0 } else { params.shifts[c] };
+                out[d + c] = (f32::from(raw) * params.bright + shift).clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -205,7 +227,7 @@ fn corpus() -> Corpus {
 // ---------------------------------------------------------------------------
 
 struct Caches {
-    chw: [f32; 3 * GRID * GRID],
+    chw: [f32; INPUT_CHANNELS * GRID * GRID],
     conv: [f32; N_FILTERS * GRID * GRID],
 }
 
@@ -225,12 +247,19 @@ fn forward_stream(
             out.chw[c * GRID_PIXELS + i] = rgb[i * 3 + c] as f32 / 255.0;
         }
     }
+    // Static Y-coordinate plane (CoordConv anchor, mirrors the lib).
+    for r in 0..GRID {
+        let y_coord = (r as f32 / (GRID - 1) as f32) * 2.0 - 1.0;
+        for c in 0..GRID {
+            out.chw[3 * GRID_PIXELS + r * GRID + c] = y_coord;
+        }
+    }
     for oc in 0..N_FILTERS {
         let b = conv_b[oc];
         for r in 0..GRID {
             for c in 0..GRID {
                 let mut sum = b;
-                for ic in 0..3 {
+                for ic in 0..INPUT_CHANNELS {
                     for kr in 0..KERNEL {
                         let nr = r as isize + kr as isize - KERNEL_PAD;
                         if nr < 0 || nr >= GRID as isize {
@@ -284,91 +313,398 @@ fn forward(
     pool
 }
 
-/// Argmax class for one frame under explicit weights (shared by the final
-/// corpus verdict and the holdout report).
-fn predict_label(
+/// Accumulated per-epoch gradient plus the batch stats the log line
+/// reports. One struct so the epoch loop reads as accumulate-then-step.
+struct GradAccum {
+    g_conv_w: [f32; N_FILTERS * FILTER_WEIGHTS],
+    g_conv_b: [f32; N_FILTERS],
+    g_dense_w: [f32; N_CLASSES * DENSE_TOTAL],
+    g_dense_b: [f32; N_CLASSES],
+    loss: f32,
+    correct: usize,
+    class_correct: [usize; N_CLASSES],
+    class_seen: [usize; N_CLASSES],
+    min_margin: f32,
+}
+
+impl GradAccum {
+    fn zero() -> Self {
+        Self {
+            g_conv_w: [0.0; N_FILTERS * FILTER_WEIGHTS],
+            g_conv_b: [0.0; N_FILTERS],
+            g_dense_w: [0.0; N_CLASSES * DENSE_TOTAL],
+            g_dense_b: [0.0; N_CLASSES],
+            loss: 0.0,
+            correct: 0,
+            class_correct: [0; N_CLASSES],
+            class_seen: [0; N_CLASSES],
+            min_margin: f32::INFINITY,
+        }
+    }
+}
+
+/// Cross-entropy of one frame against a label from precomputed softmax
+/// parts. Shared by `frame_stats` and `train_frame` so eval and training
+/// can never disagree on the loss.
+fn logit_loss(logits: &[f32; N_CLASSES], label: usize, max: f32, denom: f32) -> f32 {
+    -(((logits[label] - max).exp() / denom).max(1e-12).ln())
+}
+
+/// One batch frame's forward statistics: predicted class, margin over the
+/// runner-up, and true-label cross-entropy. Shared by the batch loop (which
+/// also backprops) and `evaluate` above (which only reports).
+fn frame_stats(
     streams: &Streams,
+    label: usize,
     conv_w: &[f32],
     conv_b: &[f32],
     dense_w: &[f32],
     dense_b: &[f32],
     caches: &mut Caches,
-) -> (usize, f32) {
+) -> (usize, f32, f32) {
     let pool = forward(streams, conv_w, conv_b, caches);
-    let mut best = 0;
-    let mut best_val = f32::NEG_INFINITY;
-    let mut second = f32::NEG_INFINITY;
+    let mut logits = [0.0f32; N_CLASSES];
     for o in 0..N_CLASSES {
         let mut s = dense_b[o];
         for i in 0..DENSE_TOTAL {
             s += pool[i] * dense_w[o * DENSE_TOTAL + i];
         }
-        if s > best_val {
-            second = best_val;
-            best_val = s;
-            best = o;
-        } else if s > second {
-            second = s;
+        logits[o] = s;
+    }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut denom = 0.0f32;
+    let mut probs = [0.0f32; N_CLASSES];
+    for o in 0..N_CLASSES {
+        probs[o] = (logits[o] - max).exp();
+        denom += probs[o];
+    }
+    for p in probs.iter_mut() {
+        *p /= denom;
+    }
+    let pred = probs
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0;
+    let mut second = f32::NEG_INFINITY;
+    for (o, &v) in logits.iter().enumerate() {
+        if o != pred && v > second {
+            second = v;
         }
     }
-    (best, best_val - second)
+    let margin = logits[pred] - second;
+    (pred, margin, logit_loss(&logits, label, max, denom))
 }
 
-/// Holdout verdict: frames the model never trained on, all under
-/// tests/fixtures-holdout/<class>/ (near-duplicate run frames plus the
-/// unseen-layout and synthetic-to-real cases — the class directory
-/// supplies the expected label, no lists). Prints misses, returns
-/// (hits, total). Doubles as the early-stopping metric (see main).
-fn eval_holdout(
+/// Accumulate one batch frame's loss statistics and gradient. Backprop:
+/// dL/dlogit = (p - y) / N. Unweighted: every class draws the same view
+/// count per epoch, so the balance lives in the sampling and the stats
+/// line reports exactly what trains.
+fn train_frame(
+    streams: &Streams,
+    label: usize,
+    net: TrainNet<'_>,
+    caches: &mut Caches,
+    acc: &mut GradAccum,
+    n: f32,
+) {
+    let pool = forward(streams, net.conv_w, net.conv_b, caches);
+    // Recompute logits (forward returns pooled features): matches
+    // frame_stats without returning the pooled vector.
+    let mut logits = [0.0f32; N_CLASSES];
+    for (o, logit) in logits.iter_mut().enumerate() {
+        let mut s = net.dense_b[o];
+        for (i, &p) in pool.iter().enumerate() {
+            s += p * net.dense_w[o * DENSE_TOTAL + i];
+        }
+        *logit = s;
+    }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let denom: f32 = logits.iter().map(|v| (v - max).exp()).sum();
+    let mut probs = [0.0f32; N_CLASSES];
+    for (p, &v) in probs.iter_mut().zip(logits.iter()) {
+        *p = (v - max).exp() / denom;
+    }
+    acc.loss += logit_loss(&logits, label, max, denom);
+    acc.class_seen[label] += 1;
+    let mut second = f32::NEG_INFINITY;
+    let mut pred = 0;
+    for (o, &p) in probs.iter().enumerate() {
+        if p > probs[pred] {
+            pred = o;
+        }
+    }
+    for (o, &v) in logits.iter().enumerate() {
+        if o != pred && v > second {
+            second = v;
+        }
+    }
+    if pred == label {
+        acc.correct += 1;
+        acc.class_correct[label] += 1;
+        // Misses count in acc; margin measures the correctly-called
+        // frames only, so the number stays informative while misses
+        // remain instead of pinning at -1 forever.
+        acc.min_margin = acc.min_margin.min(logits[pred] - second);
+    }
+    let mut dlogit = [0.0f32; N_CLASSES];
+    for o in 0..N_CLASSES {
+        dlogit[o] = probs[o] - if o == label { 1.0 } else { 0.0 };
+        dlogit[o] /= n;
+    }
+    backward(streams, pool, dlogit, net, caches, acc);
+}
+
+/// Live weights: one struct so helpers take the net as a single argument
+/// instead of four slices. Copy (shared refs): every frame reborrows it
+/// freely inside the batch loop.
+#[derive(Clone, Copy)]
+struct TrainNet<'w> {
+    conv_w: &'w [f32; N_FILTERS * FILTER_WEIGHTS],
+    conv_b: &'w [f32; N_FILTERS],
+    dense_w: &'w [f32; N_CLASSES * DENSE_TOTAL],
+    #[allow(dead_code)]
+    dense_b: &'w [f32; N_CLASSES],
+}
+
+/// Backprop one frame's logit error through the two-stream net, adding
+/// into the accumulator: dense grads, then per-stream rematerialized
+/// conv grads (forward leaves only the last stream cached). Conv filters
+/// are shared, so both streams accumulate into the same weights.
+fn backward(
+    streams: &Streams,
+    pool: [f32; DENSE_TOTAL],
+    dlogit: [f32; N_CLASSES],
+    net: TrainNet<'_>,
+    caches: &mut Caches,
+    acc: &mut GradAccum,
+) {
+    // Dense grads + pool error (both streams concatenate).
+    let mut dpool = [0.0f32; DENSE_TOTAL];
+    for (o, &d) in dlogit.iter().enumerate() {
+        acc.g_dense_b[o] += d;
+        for i in 0..DENSE_TOTAL {
+            acc.g_dense_w[o * DENSE_TOTAL + i] += d * pool[i];
+            dpool[i] += d * net.dense_w[o * DENSE_TOTAL + i];
+        }
+    }
+    let mut scratch = [0.0f32; DENSE_INPUTS];
+    for s in 0..STREAMS {
+        forward_stream(&streams[s], net.conv_w, net.conv_b, caches, &mut scratch);
+        let err = &dpool[s * DENSE_INPUTS..(s + 1) * DENSE_INPUTS];
+        // Unpool (argmax routing) + ReLU gate.
+        let mut dconv = [0.0f32; N_FILTERS * GRID * GRID];
+        for ch in 0..N_FILTERS {
+            for r in 0..POOLED {
+                for c in 0..POOLED {
+                    let mut best = (0, 0);
+                    let mut m = f32::NEG_INFINITY;
+                    for kr in 0..POOL {
+                        for kc in 0..POOL {
+                            let v = caches.conv
+                                [ch * GRID_PIXELS + (r * POOL + kr) * GRID + (c * POOL + kc)];
+                            if v > m {
+                                m = v;
+                                best = (kr, kc);
+                            }
+                        }
+                    }
+                    if m > 0.0 {
+                        dconv
+                            [ch * GRID_PIXELS + (r * POOL + best.0) * GRID + (c * POOL + best.1)] =
+                            err[ch * POOL_FEATURES + r * POOLED + c];
+                    }
+                }
+            }
+        }
+        // Conv grads (accumulate: filters are shared across streams).
+        for oc in 0..N_FILTERS {
+            for r in 0..GRID {
+                for c in 0..GRID {
+                    let d = dconv[oc * GRID_PIXELS + r * GRID + c];
+                    if d == 0.0 {
+                        continue;
+                    }
+                    acc.g_conv_b[oc] += d;
+                    for ic in 0..INPUT_CHANNELS {
+                        for kr in 0..KERNEL {
+                            let nr = r as isize + kr as isize - KERNEL_PAD;
+                            if nr < 0 || nr >= GRID as isize {
+                                continue;
+                            }
+                            for kc in 0..KERNEL {
+                                let nc = c as isize + kc as isize - KERNEL_PAD;
+                                if nc < 0 || nc >= GRID as isize {
+                                    continue;
+                                }
+                                acc.g_conv_w[oc * FILTER_WEIGHTS
+                                    + ic * KERNEL * KERNEL
+                                    + kr * KERNEL
+                                    + kc] += d * caches.chw
+                                    [ic * GRID_PIXELS + nr as usize * GRID + nc as usize];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Best-checkpoint state for patience stopping: holdout score, base
+/// margin tiebreak, and the weights that earned them. What ships is the
+/// best observed model, never the last epoch's.
+struct Checkpoint {
+    hold_hits: usize,
+    hold_total: usize,
+    margin: f32,
+    epoch: usize,
+    conv_w: [f32; N_FILTERS * FILTER_WEIGHTS],
+    conv_b: [f32; N_FILTERS],
+    dense_w: [f32; N_CLASSES * DENSE_TOTAL],
+    dense_b: [f32; N_CLASSES],
+    stale_evals: usize,
+}
+
+impl Checkpoint {
+    fn initial(
+        conv_w: &[f32; N_FILTERS * FILTER_WEIGHTS],
+        conv_b: &[f32; N_FILTERS],
+        dense_w: &[f32; N_CLASSES * DENSE_TOTAL],
+        dense_b: &[f32; N_CLASSES],
+    ) -> Self {
+        Self {
+            hold_hits: 0,
+            hold_total: 0,
+            margin: f32::NEG_INFINITY,
+            epoch: 0,
+            conv_w: *conv_w,
+            conv_b: *conv_b,
+            dense_w: *dense_w,
+            dense_b: *dense_b,
+            stale_evals: 0,
+        }
+    }
+
+    /// Fold one epoch's reports in. Strict holdout improvement resets the
+    /// patience clock and returns true; a margin tiebreak refreshes the
+    /// shipped weights without resetting (a 22/23 seesaw with creeping
+    /// margin would stall the stop forever).
+    fn observe(
+        &mut self,
+        epoch: usize,
+        hold: &EvalReport,
+        base_margin: f32,
+        net: TrainNet<'_>,
+    ) -> bool {
+        let prev_best = self.hold_hits;
+        if hold.hits > self.hold_hits || (hold.hits == self.hold_hits && base_margin > self.margin)
+        {
+            self.hold_hits = hold.hits;
+            self.hold_total = hold.total;
+            self.margin = base_margin;
+            self.epoch = epoch;
+            self.conv_w = *net.conv_w;
+            self.conv_b = *net.conv_b;
+            self.dense_w = *net.dense_w;
+            self.dense_b = *net.dense_b;
+        }
+        if hold.hits > prev_best {
+            self.stale_evals = 0;
+            true
+        } else {
+            self.stale_evals += 1;
+            false
+        }
+    }
+}
+
+/// One deterministic evaluation over a named sample set: hits, worst-case
+/// margin over correctly-called frames, per-class hits, mean loss, and the
+/// miss list. Shared by the base-capture gate, the final verdict, and the
+/// holdout report, so the three can never drift apart again.
+struct EvalReport {
+    hits: usize,
+    total: usize,
+    margin: f32,
+    per_class: [usize; N_CLASSES],
+    mean_loss: f32,
+    misses: Vec<(String, usize, usize)>,
+}
+
+fn evaluate(
+    samples: &[Base],
     conv_w: &[f32],
     conv_b: &[f32],
     dense_w: &[f32],
     dense_b: &[f32],
     caches: &mut Caches,
-) -> (usize, usize) {
-    let mut hold_total = 0;
-    let mut hold_hits = 0;
-    let hold_root = format!("{}/tests/fixtures-holdout", env!("CARGO_MANIFEST_DIR"));
-    if std::path::Path::new(&hold_root).is_dir() {
-        for (dir, label) in CLASS_DIRS {
-            let dir_path = format!("{hold_root}/{dir}");
-            if !std::path::Path::new(&dir_path).is_dir() {
-                continue;
-            }
-            let mut names: Vec<_> = std::fs::read_dir(&dir_path)
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".png"))
-                .collect();
-            names.sort();
-            for name in names {
-                let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
-                let (w, h) = (w as usize, h as usize);
-                let full = downsample_to_grid_rgb(&rgb, w, h);
-                let (x0, y0, x1, y1) = crop_region(w, h);
-                let crop = downsample_region_to_grid_rgb(&rgb, w, h, x0, y0, x1, y1);
-                let streams = [full, crop];
-                let (got, _) = predict_label(&streams, conv_w, conv_b, dense_w, dense_b, caches);
-                hold_total += 1;
-                if got == label as usize {
-                    hold_hits += 1;
-                } else {
-                    println!(
-                        "HOLDOUT MISS {dir}/{name}: want {label:?}({}) got {:?}({got})",
-                        label as usize, BY_INDEX[got]
-                    );
-                }
-            }
+) -> EvalReport {
+    let mut report = EvalReport {
+        hits: 0,
+        total: samples.len(),
+        margin: f32::INFINITY,
+        per_class: [0; N_CLASSES],
+        mean_loss: 0.0,
+        misses: Vec::new(),
+    };
+    for (streams, label, name) in samples {
+        let (got, margin, loss) =
+            frame_stats(streams, *label, conv_w, conv_b, dense_w, dense_b, caches);
+        report.mean_loss += loss;
+        if got == *label {
+            report.hits += 1;
+            report.per_class[*label] += 1;
+            report.margin = report.margin.min(margin);
+        } else {
+            report.misses.push((name.clone(), *label, got));
         }
     }
-    println!("HOLDOUT {hold_hits}/{hold_total} (unseen files, never trained)");
-    (hold_hits, hold_total)
+    if report.total > 0 {
+        report.mean_loss /= report.total as f32;
+    }
+    report
+}
+
+/// Holdout samples, loaded once at startup: `tests/fixtures-holdout/`
+/// `<class>/*.png` (near-duplicate run frames plus unseen layouts — the
+/// class directory supplies the expected label, no lists).
+fn load_holdout() -> Vec<Base> {
+    let mut out = Vec::new();
+    let hold_root = format!("{}/tests/fixtures-holdout", env!("CARGO_MANIFEST_DIR"));
+    if !std::path::Path::new(&hold_root).is_dir() {
+        return out;
+    }
+    for (dir, label) in CLASS_DIRS {
+        let dir_path = format!("{hold_root}/{dir}");
+        if !std::path::Path::new(&dir_path).is_dir() {
+            continue;
+        }
+        let mut names: Vec<_> = std::fs::read_dir(&dir_path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".png"))
+            .collect();
+        names.sort();
+        for name in names {
+            let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
+            let (w, h) = (w as usize, h as usize);
+            let full = downsample_to_grid_rgb(&rgb, w, h);
+            let (x0, y0, x1, y1) = crop_region(w, h);
+            let crop = downsample_region_to_grid_rgb(&rgb, w, h, x0, y0, x1, y1);
+            out.push(([full, crop], label as usize, format!("{dir}/{name}")));
+        }
+    }
+    out
 }
 
 fn main() {
     let (files, bases) = corpus();
+    let holdout = load_holdout();
     println!("base captures: {} files", files.len());
-    let mut rng = Lcg(0xC0FFEE);
+    println!("holdout files: {}", holdout.len());
+    let mut rng = Lcg(INIT_SEED);
     // He init scaled by each layer's fan-in.
     const CONV_FAN_IN: f32 = FILTER_WEIGHTS as f32;
     const DENSE_FAN_IN: f32 = DENSE_TOTAL as f32;
@@ -382,15 +718,6 @@ fn main() {
     for v in dense_w.iter_mut() {
         *v = (rng.next_unit() as f32 * 2.0 - 1.0) * (6.0 / DENSE_FAN_IN).sqrt();
     }
-    // Fully dynamic sampling: no fixed variants repeat across epochs.
-    // Every epoch draws VIEWS_PER_CLASS fresh stochastic views per class
-    // from its own base captures (never other classes' frames, never new
-    // shapes). Smaller than the old fixed batch, so epochs run faster;
-    // every epoch sees all-new views, so variety is total. The sampling
-    // RNG is epoch-seeded, so the same epoch always draws the same views
-    // across runs.
-    const VIEWS_PER_CLASS: usize = 32;
-    const BATCH: usize = VIEWS_PER_CLASS * N_CLASSES;
     let n = BATCH as f32;
     let mut file_counts = [0usize; N_CLASSES];
     for (_, label, _) in &files {
@@ -421,26 +748,18 @@ fn main() {
     // files, never batch frames).
     let mut batch: Vec<(Streams, usize)> = Vec::with_capacity(BATCH);
     let mut caches = Caches {
-        chw: [0.0; 3 * GRID * GRID],
+        chw: [0.0; INPUT_CHANNELS * GRID * GRID],
         conv: [0.0; N_FILTERS * GRID * GRID],
     };
     // Best-checkpoint state for patience stopping: holdout score, base
     // margin tiebreak, and the weights that earned them. What ships is the
     // best observed model, never the last epoch's.
-    let mut best_hold = 0usize;
-    let mut best_hold_total = 0usize;
-    let mut best_margin = f32::NEG_INFINITY;
-    let mut best_epoch = 0usize;
-    let mut best_conv_w = conv_w;
-    let mut best_conv_b = conv_b;
-    let mut best_dense_w = dense_w;
-    let mut best_dense_b = dense_b;
-    let mut stale_evals = 0usize;
+    let mut best = Checkpoint::initial(&conv_w, &conv_b, &dense_w, &dense_b);
     for epoch in 0..EPOCHS {
         // Fresh batch every epoch: cycle each class's own base captures
         // with new stochastic draws. Epoch-seeded, so the same epoch
         // always draws the same views across runs.
-        let mut aug_rng = Lcg(0x0A09u64 ^ (epoch as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let mut aug_rng = Lcg(AUG_SEED ^ (epoch as u64).wrapping_mul(0x9E3779B97F4A7C15));
         batch.clear();
         for (c, pool) in bases.iter().enumerate() {
             for k in 0..VIEWS_PER_CLASS {
@@ -453,152 +772,26 @@ fn main() {
                 ));
             }
         }
-        let mut g_conv_w = [0.0f32; N_FILTERS * FILTER_WEIGHTS];
-        let mut g_conv_b = [0.0f32; N_FILTERS];
-        let mut g_dense_w = [0.0f32; N_CLASSES * DENSE_TOTAL];
-        let mut g_dense_b = [0.0f32; N_CLASSES];
-        let mut loss = 0.0f32;
-        let mut correct = 0;
-        let mut class_correct = [0usize; N_CLASSES];
-        let mut class_seen = [0usize; N_CLASSES];
-        let mut min_margin = f32::INFINITY;
+        let mut acc = GradAccum::zero();
+        let net = TrainNet {
+            conv_w: &conv_w,
+            conv_b: &conv_b,
+            dense_w: &dense_w,
+            dense_b: &dense_b,
+        };
         for (streams, label) in &batch {
-            let pool = forward(streams, &conv_w, &conv_b, &mut caches);
-            let mut logits = [0.0f32; N_CLASSES];
-            for o in 0..N_CLASSES {
-                let mut s = dense_b[o];
-                for i in 0..DENSE_TOTAL {
-                    s += pool[i] * dense_w[o * DENSE_TOTAL + i];
-                }
-                logits[o] = s;
-            }
-            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut denom = 0.0f32;
-            let mut probs = [0.0f32; N_CLASSES];
-            for o in 0..N_CLASSES {
-                probs[o] = (logits[o] - max).exp();
-                denom += probs[o];
-            }
-            for p in probs.iter_mut() {
-                *p /= denom;
-            }
-            loss += -(probs[*label].max(1e-12).ln());
-            class_seen[*label] += 1;
-            let pred = probs
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0;
-            if pred == *label {
-                correct += 1;
-                class_correct[*label] += 1;
-                let mut second = f32::NEG_INFINITY;
-                for (o, &v) in logits.iter().enumerate() {
-                    if o != pred && v > second {
-                        second = v;
-                    }
-                }
-                let margin = logits[pred] - second;
-                min_margin = min_margin.min(margin);
-            }
-            // Misses count in acc; margin measures the correctly-called
-            // frames only, so the number stays informative while misses
-            // remain instead of pinning at -1 forever.
-            // Backprop: dL/dlogit = (p - y) / N. Unweighted: every class
-            // draws the same view count per epoch, so the balance lives in
-            // the sampling and the stats line reports exactly what trains.
-            let mut dlogit = [0.0f32; N_CLASSES];
-            for o in 0..N_CLASSES {
-                dlogit[o] = probs[o] - if o == *label { 1.0 } else { 0.0 };
-                dlogit[o] /= n;
-            }
-            // Dense grads + pool error (both streams concatenate).
-            let mut dpool = [0.0f32; DENSE_TOTAL];
-            for o in 0..N_CLASSES {
-                g_dense_b[o] += dlogit[o];
-                for i in 0..DENSE_TOTAL {
-                    g_dense_w[o * DENSE_TOTAL + i] += dlogit[o] * pool[i];
-                    dpool[i] += dlogit[o] * dense_w[o * DENSE_TOTAL + i];
-                }
-            }
-            // Per-stream backward: rematerialize each stream's activations
-            // (forward leaves only the last stream in the caches), then
-            // unpool its error half and accumulate the shared conv grads.
-            let mut scratch = [0.0f32; DENSE_INPUTS];
-            for s in 0..STREAMS {
-                forward_stream(&streams[s], &conv_w, &conv_b, &mut caches, &mut scratch);
-                let err = &dpool[s * DENSE_INPUTS..(s + 1) * DENSE_INPUTS];
-                // Unpool (argmax routing) + ReLU gate.
-                let mut dconv = [0.0f32; N_FILTERS * GRID * GRID];
-                for ch in 0..N_FILTERS {
-                    for r in 0..POOLED {
-                        for c in 0..POOLED {
-                            let mut best = (0, 0);
-                            let mut m = f32::NEG_INFINITY;
-                            for kr in 0..POOL {
-                                for kc in 0..POOL {
-                                    let v = caches.conv[ch * GRID_PIXELS
-                                        + (r * POOL + kr) * GRID
-                                        + (c * POOL + kc)];
-                                    if v > m {
-                                        m = v;
-                                        best = (kr, kc);
-                                    }
-                                }
-                            }
-                            if m > 0.0 {
-                                dconv[ch * GRID_PIXELS
-                                    + (r * POOL + best.0) * GRID
-                                    + (c * POOL + best.1)] =
-                                    err[ch * POOL_FEATURES + r * POOLED + c];
-                            }
-                        }
-                    }
-                }
-                // Conv grads (accumulate: filters are shared across streams).
-                for oc in 0..N_FILTERS {
-                    for r in 0..GRID {
-                        for c in 0..GRID {
-                            let d = dconv[oc * GRID_PIXELS + r * GRID + c];
-                            if d == 0.0 {
-                                continue;
-                            }
-                            g_conv_b[oc] += d;
-                            for ic in 0..3 {
-                                for kr in 0..KERNEL {
-                                    let nr = r as isize + kr as isize - KERNEL_PAD;
-                                    if nr < 0 || nr >= GRID as isize {
-                                        continue;
-                                    }
-                                    for kc in 0..KERNEL {
-                                        let nc = c as isize + kc as isize - KERNEL_PAD;
-                                        if nc < 0 || nc >= GRID as isize {
-                                            continue;
-                                        }
-                                        g_conv_w[oc * FILTER_WEIGHTS
-                                            + ic * KERNEL * KERNEL
-                                            + kr * KERNEL
-                                            + kc] += d * caches.chw
-                                            [ic * GRID_PIXELS + nr as usize * GRID + nc as usize];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            train_frame(streams, *label, net, &mut caches, &mut acc, n);
         }
-        for (w, g) in conv_w.iter_mut().zip(g_conv_w.iter()) {
+        for (w, g) in conv_w.iter_mut().zip(acc.g_conv_w.iter()) {
             *w -= LEARNING_RATE * g;
         }
-        for (w, g) in conv_b.iter_mut().zip(g_conv_b.iter()) {
+        for (w, g) in conv_b.iter_mut().zip(acc.g_conv_b.iter()) {
             *w -= LEARNING_RATE * g;
         }
-        for (w, g) in dense_w.iter_mut().zip(g_dense_w.iter()) {
+        for (w, g) in dense_w.iter_mut().zip(acc.g_dense_w.iter()) {
             *w -= LEARNING_RATE * g;
         }
-        for (w, g) in dense_b.iter_mut().zip(g_dense_b.iter()) {
+        for (w, g) in dense_b.iter_mut().zip(acc.g_dense_b.iter()) {
             *w -= LEARNING_RATE * g;
         }
 
@@ -608,97 +801,99 @@ fn main() {
             let per_class: Vec<String> = BY_INDEX
                 .iter()
                 .enumerate()
-                .map(|(c, v)| format!("{v:?}:{}", class_correct[c]))
+                .map(|(c, v)| format!("{v:?}:{}", acc.class_correct[c]))
                 .collect();
             println!(
-                "epoch {epoch}: TRAIN loss {:.4} acc {correct}/{BATCH} min_margin {:.2} per_class [{}]",
-                loss / n,
-                min_margin,
+                "epoch {epoch}: TRAIN loss {:.4} acc {}/{BATCH} min_margin {:.2} per_class [{}]",
+                acc.loss / n,
+                acc.correct,
+                acc.min_margin,
                 per_class.join(" ")
             );
         }
         // Gate: deterministic eval over the raw base captures (never
         // trained on directly), so redrawn views can never move the
         // goalposts. Post-update weights: this judges what ships.
-        let mut base_correct = 0;
-        let mut base_margin = f32::INFINITY;
-        for (streams, label, _) in &files {
-            let (got, margin) =
-                predict_label(streams, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
-            if got == *label {
-                base_correct += 1;
-                base_margin = base_margin.min(margin);
-            }
-        }
+        let base = evaluate(&files, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
         // Patience on the holdout, not a fixed-accuracy gate: the corpus
         // holds a known-unlearnable pair, so 100% never fires. Best
         // holdout wins; base margin breaks ties toward robust models.
-        let (hold_hits, hold_total) =
-            eval_holdout(&conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
-        let prev_best = best_hold;
-        let better = hold_hits > best_hold || (hold_hits == best_hold && base_margin > best_margin);
-        if better {
-            best_hold = hold_hits;
-            best_hold_total = hold_total;
-            best_margin = base_margin;
-            best_epoch = epoch;
-            best_conv_w = conv_w;
-            best_conv_b = conv_b;
-            best_dense_w = dense_w;
-            best_dense_b = dense_b;
+        let hold = evaluate(&holdout, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+        for (name, want, got) in &hold.misses {
+            println!(
+                "HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got})",
+                BY_INDEX[*want], BY_INDEX[*got]
+            );
         }
-        // Patience resets on strict holdout improvement only. A margin
-        // tiebreak refreshes the shipped weights above but must not reset
-        // the clock, or a 22/23 seesaw with creeping margin stalls the stop
-        // forever.
-        if hold_hits > prev_best {
-            stale_evals = 0;
-        } else {
-            stale_evals += 1;
-        }
-        // One labeled line per epoch: TRAIN is the sampled batch, BASE
-        // the raw captures, HOLDOUT the unseen set patience judges.
-        println!(
-            "epoch {epoch}: HOLDOUT {hold_hits}/{hold_total} | BASE {base_correct}/{} margin {base_margin:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS} | BEST {best_hold}/{best_hold_total}@e{best_epoch}",
-            files.len()
+        best.observe(
+            epoch,
+            &hold,
+            base.margin,
+            TrainNet {
+                conv_w: &conv_w,
+                conv_b: &conv_b,
+                dense_w: &dense_w,
+                dense_b: &dense_b,
+            },
         );
-        if base_correct == files.len() && base_margin >= REQUIRED_MARGIN {
+        // Patience resets on strict holdout improvement only (inside
+        // observe): a margin tiebreak refreshes the shipped weights without
+        // resetting the clock, or a 22/23 seesaw with creeping margin
+        // stalls the stop forever.
+        let stale_evals = best.stale_evals;
+        // One labeled line per epoch: TRAIN is the sampled batch, BASE
+        // the raw captures, HOLDOUT the unseen set patience judges. Both
+        // losses print as decimals so progress reads across the line.
+        println!(
+            "epoch {epoch}: HOLDOUT {}/{} loss {:.4} | BASE {}/{} margin {:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS} | BEST {}/{}@e{}",
+            hold.hits,
+            hold.total,
+            hold.mean_loss,
+            base.hits,
+            files.len(),
+            base.margin,
+            best.hold_hits,
+            best.hold_total,
+            best.epoch
+        );
+        if base.hits == files.len() && base.margin >= REQUIRED_MARGIN {
             println!("converged at epoch {epoch}");
             break;
         }
-        if stale_evals >= PATIENCE_EPOCHS {
+        if best.stale_evals >= PATIENCE_EPOCHS {
             println!(
-                "early stop at epoch {epoch} ({PATIENCE_EPOCHS} epochs without improvement; best was {best_epoch})"
+                "early stop at epoch {epoch} ({PATIENCE_EPOCHS} epochs without improvement; best was {})",
+                best.epoch
             );
             break;
         }
     }
 
     // Ship the best observed weights, never the last epoch's.
-    conv_w = best_conv_w;
-    conv_b = best_conv_b;
-    dense_w = best_dense_w;
-    dense_b = best_dense_b;
+    (conv_w, conv_b, dense_w, dense_b) = (best.conv_w, best.conv_b, best.dense_w, best.dense_b);
     println!(
-        "best epoch {best_epoch}: holdout {best_hold}/{best_hold_total}, base_margin {best_margin:.2}"
+        "best epoch {}: holdout {}/{}, base_margin {:.2}",
+        best.epoch, best.hold_hits, best.hold_total, best.margin
     );
 
     // Final verdict on the raw base captures (no augmentation leniency).
-    let mut fails = 0;
-    for (streams, label, name) in &files {
-        let (got, _) = predict_label(streams, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
-        if got != *label {
-            fails += 1;
-            println!(
-                "MISCLASSIFIED {name}: want {:?}({label}) got {:?}({got})",
-                BY_INDEX[*label], BY_INDEX[got]
-            );
-        }
+    let verdict = evaluate(&files, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+    for (name, want, got) in &verdict.misses {
+        println!(
+            "MISCLASSIFIED {name}: want {:?}({want}) got {:?}({got})",
+            BY_INDEX[*want], BY_INDEX[*got]
+        );
     }
     // Holdout on the shipped (best) weights. Decisive for stopping, but
     // the run always exits 0: a human decides merge, and the misses print
     // by name above and below.
-    let (hold_hits, hold_total) = eval_holdout(&conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+    let hold = evaluate(&holdout, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+    for (name, want, got) in &hold.misses {
+        println!(
+            "HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got})",
+            BY_INDEX[*want], BY_INDEX[*got]
+        );
+    }
     let out_path = format!("{}/artifacts/weights.bin", env!("CARGO_MANIFEST_DIR"));
     let mut bytes = Vec::with_capacity(N_WEIGHTS * 4);
     for v in conv_w
@@ -712,8 +907,14 @@ fn main() {
     assert_eq!(bytes.len(), N_WEIGHTS * 4);
     std::fs::create_dir_all(format!("{}/artifacts", env!("CARGO_MANIFEST_DIR"))).unwrap();
     std::fs::write(&out_path, &bytes).unwrap();
+    std::fs::write(&out_path, &bytes).unwrap();
     println!("wrote {out_path} ({} bytes)", bytes.len());
     println!(
-        "done: best epoch {best_epoch}, base misses {fails}, holdout {hold_hits}/{hold_total}"
+        "done: best epoch {}, base misses {}, holdout {}/{} loss {:.4}",
+        best.epoch,
+        verdict.misses.len(),
+        hold.hits,
+        hold.total,
+        hold.mean_loss
     );
 }

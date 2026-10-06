@@ -1,9 +1,11 @@
 //! Micro-CNN screen classifier: a compiled static forward-pass engine with
-//! zero dependencies (`std` only). Architecture: two 128x128 RGB streams
-//! in (full frame + center-half crop at 2x content magnification), Conv2D
-//! (16 filters 3x3, pad 1, shared across streams) + ReLU, MaxPool 8x8,
-//! concatenated dense + argmax over nine screen classes. About 74,185
-//! parameters (~290 KB), tens of milliseconds per frame in release.
+//! zero dependencies (`std` only).
+//!
+//! Architecture: two 128x128 RGB streams in, full frame plus center-half
+//! crop at 2x content magnification. Conv2D with 16 filters over R, G, B
+//! and a Y-coordinate plane, pad 1, shared across streams. ReLU, MaxPool
+//! 8x8, concatenated dense, argmax over nine screen classes. About 74,329
+//! parameters (~297 KB), tens of milliseconds per frame in release.
 //!
 //! The CNN is the whole classifier: every frame goes through it, no pixel
 //! gates in front. Class count and label order are fixed by [`ScreenClass`]
@@ -30,6 +32,12 @@ pub const GRID: usize = 128;
 pub const N_FILTERS: usize = 16;
 /// Convolution kernel edge length (square, odd, stride 1, pad 1).
 pub const KERNEL: usize = 3;
+/// Model input channels: R, G, B plus a static vertical-coordinate map
+/// (CoordConv: -1.0 top row to +1.0 bottom row). Lets 3x3 kernels learn
+/// position-dependent features ("spinner under a logo" vs "spinner under
+/// setup text") instead of pure texture. RGB captures stay 3-channel;
+/// the coordinate plane is synthesized at normalize time.
+pub const INPUT_CHANNELS: usize = 4;
 /// Max-pool window edge length (square, stride equals window). Eight
 /// collapses each filter to a GRID/8 thumbnail: position within fine
 /// cells survives, exact pixels do not.
@@ -52,11 +60,12 @@ pub const DENSE_TOTAL: usize = STREAMS * DENSE_INPUTS;
 static WEIGHT_BYTES: &[u8] = include_bytes!("../artifacts/weights.bin");
 
 /// Weight layout inside [`WEIGHT_BYTES`]: conv weights
-/// `[N_FILTERS, 3, KERNEL, KERNEL]` (shared across streams), conv bias
-/// `[N_FILTERS]`, dense weights `[N_CLASSES, DENSE_TOTAL]` (full-stream
-/// thumbnail first, crop thumbnail second), dense bias `[N_CLASSES]`.
+/// `[N_FILTERS, INPUT_CHANNELS, KERNEL, KERNEL]` (shared across streams),
+/// conv bias `[N_FILTERS]`, dense weights `[N_CLASSES, DENSE_TOTAL]`
+/// (full-stream thumbnail first, crop thumbnail second), dense bias
+/// `[N_CLASSES]`.
 pub const N_WEIGHTS: usize =
-    N_FILTERS * 3 * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_TOTAL + N_CLASSES;
+    N_FILTERS * INPUT_CHANNELS * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_TOTAL + N_CLASSES;
 
 /// Number of screen classes (dense outputs).
 pub const N_CLASSES: usize = 9;
@@ -200,7 +209,7 @@ pub fn predict_two_stream(
     const GRID2: usize = GRID * GRID;
     const KERNEL2: usize = KERNEL * KERNEL;
     let w = &WEIGHTS[..];
-    let (conv_w, rest) = w.split_at(N_FILTERS * 3 * KERNEL2);
+    let (conv_w, rest) = w.split_at(N_FILTERS * INPUT_CHANNELS * KERNEL2);
     let (conv_b, rest) = rest.split_at(N_FILTERS);
     let (dense_w, rest) = rest.split_at(N_CLASSES * DENSE_TOTAL);
     let (dense_b, _) = rest.split_at(N_CLASSES);
@@ -208,11 +217,18 @@ pub fn predict_two_stream(
 
     let mut pool_out = [0.0f32; DENSE_TOTAL];
     for (s, rgb) in [full, crop].iter().enumerate() {
-        // 1. Normalize u8 [0, 255] to f32 [0, 1], CHW layout.
-        let mut chw = [0.0f32; 3 * GRID * GRID];
+        // 1. Normalize u8 [0, 255] to f32 [0, 1], CHW layout, plus the
+        // static Y-coordinate plane (CoordConv anchor).
+        let mut chw = [0.0f32; INPUT_CHANNELS * GRID * GRID];
         for c in 0..3 {
             for i in 0..GRID2 {
                 chw[c * GRID2 + i] = rgb[i * 3 + c] as f32 / 255.0;
+            }
+        }
+        for r in 0..GRID {
+            let y_coord = (r as f32 / (GRID - 1) as f32) * 2.0 - 1.0;
+            for c in 0..GRID {
+                chw[3 * GRID2 + r * GRID + c] = y_coord;
             }
         }
 
@@ -223,7 +239,7 @@ pub fn predict_two_stream(
             for r in 0..GRID {
                 for c in 0..GRID {
                     let mut sum = b;
-                    for ic in 0..3 {
+                    for ic in 0..INPUT_CHANNELS {
                         for kr in 0..KERNEL {
                             let nr = r as isize + kr as isize - pad as isize;
                             if nr < 0 || nr >= GRID as isize {
@@ -235,7 +251,8 @@ pub fn predict_two_stream(
                                     continue;
                                 }
                                 let in_idx = ic * GRID2 + (nr as usize) * GRID + (nc as usize);
-                                let w_idx = oc * 3 * KERNEL2 + ic * KERNEL2 + kr * KERNEL + kc;
+                                let w_idx =
+                                    oc * INPUT_CHANNELS * KERNEL2 + ic * KERNEL2 + kr * KERNEL + kc;
                                 sum += chw[in_idx] * conv_w[w_idx];
                             }
                         }
