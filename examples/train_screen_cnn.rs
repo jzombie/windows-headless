@@ -106,7 +106,7 @@ fn augment(
 ) {
     // Original, horizontal flip, dimmer, brighter, and non-uniform rescales
     // (DPI/aspect drift of +-15%).
-    push_frame(out, format!("{name}"), rgb, w, h, label);
+    push_frame(out, name.clone(), rgb, w, h, label);
     let mut flip = vec![0u8; rgb.len()];
     for y in 0..h {
         for x in 0..w {
@@ -132,7 +132,9 @@ fn augment(
     // covered above): this moves hues slightly without changing layout.
     for (dr, dg, db) in [(6i16, -4, -4), (-4, -4, 8)] {
         let tinted: Vec<u8> = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| {
                 [
                     (p[0] as i16 + dr).clamp(0, 255) as u8,
@@ -371,8 +373,8 @@ fn main() {
                 probs[o] = (logits[o] - max).exp();
                 denom += probs[o];
             }
-            for o in 0..N_CLASSES {
-                probs[o] /= denom;
+            for p in probs.iter_mut() {
+                *p /= denom;
             }
             loss += -(probs[*label].max(1e-12).ln());
             class_seen[*label] += 1;
@@ -386,9 +388,9 @@ fn main() {
                 correct += 1;
                 class_correct[*label] += 1;
                 let mut second = f32::NEG_INFINITY;
-                for o in 0..N_CLASSES {
-                    if o != pred && logits[o] > second {
-                        second = logits[o];
+                for (o, &v) in logits.iter().enumerate() {
+                    if o != pred && v > second {
+                        second = v;
                     }
                 }
                 min_margin = min_margin.min(logits[pred] - second);

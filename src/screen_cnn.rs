@@ -62,8 +62,10 @@ static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
         WEIGHT_BYTES.len()
     );
     WEIGHT_BYTES
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 });
 
@@ -225,9 +227,9 @@ pub fn predict_64x64_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
     }
     let mut best = 0;
     let mut best_val = logits[0];
-    for i in 1..N_CLASSES {
-        if logits[i] > best_val {
-            best_val = logits[i];
+    for (i, &v) in logits.iter().enumerate().skip(1) {
+        if v > best_val {
+            best_val = v;
             best = i;
         }
     }
