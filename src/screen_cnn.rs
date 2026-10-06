@@ -56,7 +56,7 @@ static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
     assert_eq!(
         WEIGHT_BYTES.len(),
         N_WEIGHTS * 4,
-        "artifacts/weights.bin corrupt: want {} bytes, have {} (regenerate with `cargo run --example train_cnn`)",
+        "artifacts/weights.bin corrupt: want {} bytes, have {} (regenerate with `cargo run --release --example train_screen_cnn`)",
         N_WEIGHTS * 4,
         WEIGHT_BYTES.len()
     );
@@ -83,9 +83,6 @@ pub enum ScreenClass {
     /// One class on purpose — the operational response is identical, and
     /// neither has enough captures to stand alone.
     ErrorScreen,
-    /// First-boot OOBE transitionals ("Just a moment", logo splash,
-    /// "Welcome"): post-install, pre-logon. Progress, never errors.
-    OobeStep,
     /// Anything else: lock screen, gradients. (No desktop ever appears in
     /// this flow, so the lock screen stands in as the class name for the
     /// remaining miscellaneous bucket.)
@@ -94,7 +91,25 @@ pub enum ScreenClass {
     /// between firmware handoff and the OS, visually distinct from both
     /// text consoles and OS screens.
     FirmwareBoot,
+    /// First-boot OOBE transitionals ("Just a moment", logo splash,
+    /// "Welcome"): post-install, pre-logon. Progress, never errors.
+    OobeStep,
 }
+
+/// Logit index to class. The single source of truth for index order:
+/// [`predict_32x32_rgb`] returns through this table, and the roundtrip
+/// test below fails the build if the enum order ever drifts from it again.
+const BY_INDEX: [ScreenClass; N_CLASSES] = [
+    ScreenClass::Dark,
+    ScreenClass::FlatField,
+    ScreenClass::ErrorShell,
+    ScreenClass::InstallerStep,
+    ScreenClass::ErrorRecovery,
+    ScreenClass::ErrorScreen,
+    ScreenClass::Lockscreen,
+    ScreenClass::FirmwareBoot,
+    ScreenClass::OobeStep,
+];
 
 /// Brightest-pixel downsample of full-resolution RGB to GRID x GRID.
 /// `src` is row-major `src_w` x `src_h` RGB; resolution-independent, so any
@@ -219,17 +234,7 @@ pub fn predict_32x32_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
             best = i;
         }
     }
-    match best {
-        0 => ScreenClass::Dark,
-        1 => ScreenClass::FlatField,
-        2 => ScreenClass::ErrorShell,
-        3 => ScreenClass::InstallerStep,
-        4 => ScreenClass::ErrorRecovery,
-        5 => ScreenClass::ErrorScreen,
-        6 => ScreenClass::Lockscreen,
-        7 => ScreenClass::FirmwareBoot,
-        _ => ScreenClass::OobeStep,
-    }
+    BY_INDEX[best]
 }
 
 /// Classify a full-resolution RGB frame: downsample, then predict.
@@ -327,6 +332,17 @@ mod tests {
         assert_eq!(at(31, 0), [0, 200, 0]);
         assert_eq!(at(0, 31), [0, 0, 200]);
         assert_eq!(at(31, 31), [200, 200, 200]);
+    }
+
+    #[test]
+    fn class_index_roundtrips() {
+        // The rotation guard: enum discriminants must equal the logit table
+        // positions, or training labels and inference mapping silently
+        // rotate past each other (observed: lockscreen/firmware/oobe).
+        for (i, c) in BY_INDEX.iter().enumerate() {
+            assert_eq!(*c as usize, i, "BY_INDEX[{i}] is {c:?}");
+        }
+        assert_eq!(BY_INDEX.len(), N_CLASSES);
     }
 
     #[test]
