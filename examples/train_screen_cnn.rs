@@ -141,15 +141,15 @@ fn apply_view(params: &ViewParams, base: &Frame) -> Frame {
             let sx = if params.flip { GRID - 1 - sx } else { sx };
             let s = (sy * GRID + sx) * 3;
             let d = (y * GRID + x) * 3;
+            // Uniform photometrics: no background-color assumptions. Setup,
+            // WinPE, and OOBE all render pure-black canvases identical to
+            // firmware's, so a black floor would bake in a class signal
+            // that does not exist. Tint shifts every pixel whole; spatial
+            // structure (CoordConv anchors, layout, glyph density) carries
+            // the firmware-vs-setup separation instead.
             for c in 0..3 {
-                let raw = base[s + c];
-                // Black floor: near-black background pixels take brightness
-                // only, never positive tint. Firmware screens sit on pure
-                // #000000 while installer greys sit above it; an +8 shift
-                // would fold the two backgrounds onto each other and erase
-                // the cheapest separation signal the net owns.
-                let shift = if raw < 5 { 0.0 } else { params.shifts[c] };
-                out[d + c] = (f32::from(raw) * params.bright + shift).clamp(0.0, 255.0) as u8;
+                out[d + c] = (f32::from(base[s + c]) * params.bright + params.shifts[c])
+                    .clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -235,12 +235,19 @@ const KERNEL_PAD: isize = KERNEL as isize / 2;
 
 /// One stream's conv+pool into `pool_out`: shared filters, reused caches.
 /// Mirrors the per-stream block of `predict_two_stream`.
+/// `y_min`/`y_max` is the stream's vertical span in global frame
+/// coordinates: full view (-1.0, 1.0), center-half crop (-0.5, 0.5).
+/// Shared filters demand globally consistent coordinates — synthesizing
+/// [-1, 1] per stream would tell the same kernel that the crop's top row
+/// is both the monitor top (stream 0) and the frame middle (stream 1).
 fn forward_stream(
     rgb: &Frame,
     conv_w: &[f32],
     conv_b: &[f32],
     out: &mut Caches,
     pool_out: &mut [f32],
+    y_min: f32,
+    y_max: f32,
 ) {
     for c in 0..3 {
         for i in 0..GRID_PIXELS {
@@ -249,7 +256,7 @@ fn forward_stream(
     }
     // Static Y-coordinate plane (CoordConv anchor, mirrors the lib).
     for r in 0..GRID {
-        let y_coord = (r as f32 / (GRID - 1) as f32) * 2.0 - 1.0;
+        let y_coord = y_min + (r as f32 / (GRID - 1) as f32) * (y_max - y_min);
         for c in 0..GRID {
             out.chw[3 * GRID_PIXELS + r * GRID + c] = y_coord;
         }
@@ -299,6 +306,14 @@ fn forward_stream(
     }
 }
 
+/// Global vertical span of one stream: full view covers the frame
+/// (-1.0, 1.0), the center-half crop covers its middle quarter by area
+/// (-0.5, 0.5). Single source so `forward` and the backward
+/// rematerialization can never disagree on a stream's coordinates.
+fn stream_y_range(s: usize) -> (f32, f32) {
+    if s == 0 { (-1.0, 1.0) } else { (-0.5, 0.5) }
+}
+
 fn forward(
     streams: &Streams,
     conv_w: &[f32],
@@ -308,7 +323,16 @@ fn forward(
     let mut pool = [0.0f32; DENSE_TOTAL];
     for (s, rgb) in streams.iter().enumerate() {
         let lo = s * DENSE_INPUTS;
-        forward_stream(rgb, conv_w, conv_b, out, &mut pool[lo..lo + DENSE_INPUTS]);
+        let (y_min, y_max) = stream_y_range(s);
+        forward_stream(
+            rgb,
+            conv_w,
+            conv_b,
+            out,
+            &mut pool[lo..lo + DENSE_INPUTS],
+            y_min,
+            y_max,
+        );
     }
     pool
 }
@@ -464,7 +488,6 @@ struct TrainNet<'w> {
     conv_w: &'w [f32; N_FILTERS * FILTER_WEIGHTS],
     conv_b: &'w [f32; N_FILTERS],
     dense_w: &'w [f32; N_CLASSES * DENSE_TOTAL],
-    #[allow(dead_code)]
     dense_b: &'w [f32; N_CLASSES],
 }
 
@@ -491,7 +514,16 @@ fn backward(
     }
     let mut scratch = [0.0f32; DENSE_INPUTS];
     for s in 0..STREAMS {
-        forward_stream(&streams[s], net.conv_w, net.conv_b, caches, &mut scratch);
+        let (y_min, y_max) = stream_y_range(s);
+        forward_stream(
+            &streams[s],
+            net.conv_w,
+            net.conv_b,
+            caches,
+            &mut scratch,
+            y_min,
+            y_max,
+        );
         let err = &dpool[s * DENSE_INPUTS..(s + 1) * DENSE_INPUTS];
         // Unpool (argmax routing) + ReLU gate.
         let mut dconv = [0.0f32; N_FILTERS * GRID * GRID];

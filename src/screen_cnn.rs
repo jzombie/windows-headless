@@ -218,7 +218,15 @@ pub fn predict_two_stream(
     let mut pool_out = [0.0f32; DENSE_TOTAL];
     for (s, rgb) in [full, crop].iter().enumerate() {
         // 1. Normalize u8 [0, 255] to f32 [0, 1], CHW layout, plus the
-        // static Y-coordinate plane (CoordConv anchor).
+        // static Y-coordinate plane. Ranges are global, not per-stream:
+        // the full view spans [-1, 1] while the center-half crop spans
+        // [-0.5, 0.5], so shared filters see consistent coordinates for
+        // the same physical screen region in both streams.
+        let (y_min, y_max) = if s == 0 {
+            (-1.0f32, 1.0f32)
+        } else {
+            (-0.5f32, 0.5f32)
+        };
         let mut chw = [0.0f32; INPUT_CHANNELS * GRID * GRID];
         for c in 0..3 {
             for i in 0..GRID2 {
@@ -226,7 +234,7 @@ pub fn predict_two_stream(
             }
         }
         for r in 0..GRID {
-            let y_coord = (r as f32 / (GRID - 1) as f32) * 2.0 - 1.0;
+            let y_coord = y_min + (r as f32 / (GRID - 1) as f32) * (y_max - y_min);
             for c in 0..GRID {
                 chw[3 * GRID2 + r * GRID + c] = y_coord;
             }
