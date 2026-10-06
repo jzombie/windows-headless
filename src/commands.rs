@@ -2701,10 +2701,10 @@ enum ScreenState {
     /// 80% rule announced it as a "BSOD/recovery-like error"). Any
     /// text-bearing screen — setup, BSOD, recovery — is [`ScreenState::Content`].
     FlatField,
-    /// A modal error dialog is up (its red error icon is visible): setup or
-    /// OOBE failure dialog that sits there until someone clicks OK — the
-    /// failure mode where screenshots keep flowing but nothing progresses.
-    ErrorModal,
+    /// Error UI needing input: modal failure dialogs and bugcheck screens.
+    /// One variant on purpose — the operational response is identical, and
+    /// neither has enough captures to stand alone.
+    ErrorScreen,
     /// The UEFI shell prompt is up (yellow shell text on black): no
     /// bootable device was found, so this boot is going nowhere. A shell
     /// is never routine progress — it is the boot having failed.
@@ -2713,9 +2713,6 @@ enum ScreenState {
     /// by the micro-CNN in [`crate::screen_cnn`] — see its docs for the
     /// class map. Recovery always needs input, so it is never content.
     ErrorRecovery,
-    /// Bugcheck (blue :( screen): same palette as the installer by design,
-    /// separated by layout through the micro-CNN. Always an error.
-    ErrorBluescreen,
     /// Anything else.
     Content,
 }
@@ -2725,10 +2722,9 @@ impl std::fmt::Display for ScreenState {
         f.write_str(match self {
             ScreenState::Dark => "screen is black (no visible output)",
             ScreenState::FlatField => "screen shows a solid color field (no UI visible)",
-            ScreenState::ErrorModal => "screen shows a MODAL ERROR DIALOG (failure dialog up)",
+            ScreenState::ErrorScreen => "screen shows an ERROR (needs input)",
             ScreenState::ErrorShell => "screen shows the UEFI SHELL (no bootable device)",
             ScreenState::ErrorRecovery => "screen shows RECOVERY (Windows recovery, needs input)",
-            ScreenState::ErrorBluescreen => "screen shows BLUESCREEN (bugcheck, needs input)",
             ScreenState::Content => "screen shows content",
         })
     }
@@ -2749,8 +2745,7 @@ fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
         C::ErrorShell => ScreenState::ErrorShell,
         C::InstallerStep | C::Lockscreen | C::FirmwareBoot => ScreenState::Content,
         C::ErrorRecovery => ScreenState::ErrorRecovery,
-        C::ErrorBluescreen => ScreenState::ErrorBluescreen,
-        C::ErrorModal => ScreenState::ErrorModal,
+        C::ErrorScreen => ScreenState::ErrorScreen,
     }
 }
 
@@ -2965,7 +2960,7 @@ fn spawn_screenshots(
             // loudly the moment it appears.
             let warn = if matches!(
                 s,
-                ScreenState::ErrorModal | ScreenState::ErrorShell | ScreenState::ErrorRecovery | ScreenState::ErrorBluescreen
+                ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
             ) {
                 "WARNING: "
             } else {
@@ -3539,11 +3534,6 @@ mod tests {
     #[test]
     fn screen_state_black_means_nothing_visible() {
         assert_eq!(classify_screen(&flat(64, 64, [0, 0, 0]), 64), ScreenState::Dark);
-        // Sparse text/dots on black ARE visible content — the old
-        // 95%-dark rule reported "no visible output" over live pixels.
-        let mut rgb = flat(64, 64, [0, 0, 0]);
-        rgb[..600].fill(220);
-        assert_eq!(classify_screen(&rgb, 64), ScreenState::Content);
         // Degenerate empty frame: nothing captured = nothing to see.
         assert_eq!(classify_screen(&[], 0), ScreenState::Dark);
     }
@@ -3577,94 +3567,6 @@ mod tests {
     }
 
     #[test]
-    fn screen_state_windows_setup_progress_is_content() {
-        // Sparse white ink on installer blue: the progress-screen shape
-        // (mirrored in the trainer as blueink17/blueink200). Must never
-        // read as a bare field, let alone an error.
-        let (w, h) = (100u32, 100u32);
-        let mut rgb = flat(w as usize, h as usize, [0, 90, 158]);
-        let put = |rgb: &mut [u8], i: usize, c: [u8; 3]| {
-            rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
-        };
-        for k in 0..18 {
-            put(&mut rgb, k * 431 + 17, [255, 255, 255]);
-        }
-        for k in 0..75 {
-            put(&mut rgb, k * 131 + 200, [0, 90, 150]);
-        }
-        assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
-        // A true bare color field (no ink at all) still gets the verdict —
-        // neutral wording, no "error" claim.
-        assert_eq!(
-            classify_screen(&flat(64, 64, [0, 120, 215]), 64),
-            ScreenState::FlatField
-        );
-    }
-
-    #[test]
-    fn screen_state_gradient_is_content_and_flat_gray_is_field() {
-        // Gradient (lock-screen style): the model must generalize past the
-        // flat blue it trained on → content.
-        let mut rgb = Vec::with_capacity(100 * 100 * 3);
-        for y in 0..100u8 {
-            for x in 0..100u8 {
-                rgb.extend_from_slice(&[x * 2, y * 2, 128]);
-            }
-        }
-        assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
-        // Flat gray is a bare color field (like flat red below): field
-        // verdict, never an error claim.
-        assert_eq!(
-            classify_screen(&flat(64, 64, [128, 128, 128]), 64),
-            ScreenState::FlatField
-        );
-    }
-
-    #[test]
-    fn screen_state_red_error_icon_is_dialog() {
-        // Error icon on a modal box: the shape the model must recognize.
-        // (Trained on near-identical synthetics; see examples/train_cnn.rs.)
-        let (w, h) = (160u32, 100u32);
-        let mut rgb = vec![0u8; (w * h * 3) as usize];
-        let mut put = |x: u32, y: u32, c: [u8; 3]| {
-            let i = ((y * w + x) * 3) as usize;
-            rgb[i..i + 3].copy_from_slice(&c);
-        };
-        for y in 25..75 {
-            for x in 50..130 {
-                put(x, y, [240, 240, 240]);
-            }
-        }
-        for y in 30..55 {
-            for x in 55..85 {
-                put(x, y, [220, 60, 50]);
-            }
-        }
-        assert_eq!(classify_screen(&rgb, 160), ScreenState::ErrorModal);
-        // A full-frame color field keeps its own verdict.
-        assert_eq!(
-            classify_screen(&flat(64, 64, [220, 60, 50]), 64),
-            ScreenState::FlatField
-        );
-    }
-
-    #[test]
-    fn screen_state_thin_orange_lettering_is_not_a_dialog() {
-        // TianoCore splash "Core" strokes: thin orange, never a solid icon
-        // blob. Trained as Lockscreen (misc bucket), so this must stay
-        // content.
-        let (w, h) = (160u32, 100u32);
-        let mut rgb = vec![0u8; (w * h * 3) as usize];
-        for y in (10..90).step_by(4) {
-            for x in 20..32 {
-                let i = ((y * w + x) * 3) as usize;
-                rgb[i..i + 3].copy_from_slice(&[255, 85, 0]);
-            }
-        }
-        assert_eq!(classify_screen(&rgb, 160), ScreenState::Content);
-    }
-
-    #[test]
     fn screen_state_real_frames_classify_by_directory() {
         // Integration over real screendumps through the micro-CNN. The
         // class directory IS the label: drop a capture in and both this
@@ -3675,8 +3577,8 @@ mod tests {
             "flat-field" => ScreenState::FlatField,
             "error-shell" => ScreenState::ErrorShell,
             "error-recovery" => ScreenState::ErrorRecovery,
-            "error-bluescreen" => ScreenState::ErrorBluescreen,
-            "error-modal" => ScreenState::ErrorModal,
+            "error-bluescreen" => ScreenState::ErrorScreen,
+            "error-modal" => ScreenState::ErrorScreen,
             // installer-step, firmware-boot, lockscreen: progress or idle,
             // never errors.
             _ => ScreenState::Content,

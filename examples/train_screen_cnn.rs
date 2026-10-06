@@ -149,25 +149,25 @@ fn augment(
     }
 }
 
-fn flat_frame(w: usize, h: usize, c: [u8; 3]) -> Vec<u8> {
-    vec![c; w * h].concat()
-}
-
 /// Directory name under each Windows-version directory in
 /// `tests/fixtures/` to training label. This table — not a filename list —
 /// is the corpus definition; drop new captures in and re-run. The version
-/// directory itself (`win11-26300-en-us-retail`, ...) carries no label: the
-/// classifier never sees it, it only keeps captures attributable over time.
+/// directory itself carries no label: the classifier never sees it, it only
+/// keeps captures attributable over time.
+///
+/// Holdout convention: files ending in `.holdout.png` train nothing and are
+/// evaluated only (unseen layouts, synthetic-to-real transfer). The class
+/// directory still supplies the expected label, so no list is maintained.
 const CLASS_DIRS: [(&str, ScreenClass); 9] = [
     ("dark", ScreenClass::Dark),
     ("flat-field", ScreenClass::FlatField),
     ("error-shell", ScreenClass::ErrorShell),
     ("installer-step", ScreenClass::InstallerStep),
     ("error-recovery", ScreenClass::ErrorRecovery),
-    ("error-modal", ScreenClass::ErrorModal),
+    ("error-modal", ScreenClass::ErrorScreen),
     ("lockscreen", ScreenClass::Lockscreen),
     ("firmware-boot", ScreenClass::FirmwareBoot),
-    ("error-bluescreen", ScreenClass::ErrorBluescreen),
+    ("error-bluescreen", ScreenClass::ErrorScreen),
 ];
 
 fn corpus() -> Vec<(Frame, usize, String)> {
@@ -205,90 +205,9 @@ fn corpus() -> Vec<(Frame, usize, String)> {
             }
         }
     }
-    // Synthetic error icons (white box + red blob on black): no real modal
-    // capture exists yet. Three placements.
-    for (box_x, box_y) in [(50u32, 25u32), (30, 40), (70, 20)] {
-        let (w, h) = (160usize, 100usize);
-        let mut rgb = vec![0u8; w * h * 3];
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 3;
-                if x >= box_x as usize
-                    && x < (box_x + 80) as usize
-                    && y >= box_y as usize
-                    && y < (box_y + 50) as usize
-                {
-                    let icon = x >= (box_x + 5) as usize
-                        && x < (box_x + 35) as usize
-                        && y >= (box_y + 5) as usize
-                        && y < (box_y + 30) as usize;
-                    let c = if icon { [220, 60, 50] } else { [240, 240, 240] };
-                    rgb[i..i + 3].copy_from_slice(&c);
-                }
-            }
-        }
-        push_frame(&mut out, format!("icon{box_x},{box_y}"), &rgb, w, h, ScreenClass::ErrorModal);
-    }
-    // Synthetic flats: the bare-field shapes the unit tests pin.
-    for c in [[0, 120, 215], [128, 128, 128], [220, 60, 50], [30, 140, 60]] {
-        push_frame(&mut out, format!("flat{c:?}"), &flat_frame(64, 64, c), 64, 64, ScreenClass::FlatField);
-    }
-    // Synthetic thin orange strokes (TianoCore-like lettering): thin red
-    // strokes are lettering, never an icon. Mirrors the unit test
-    // generator exactly.
-    {
-        let (w, h) = (160usize, 100usize);
-        let mut rgb = vec![0u8; w * h * 3];
-        for y in (10..90).step_by(4) {
-            for x in 20..32 {
-                let i = (y * w + x) * 3;
-                rgb[i..i + 3].copy_from_slice(&[255, 85, 0]);
-            }
-        }
-        push_frame(&mut out, "orange-strokes".to_string(), &rgb, w, h, ScreenClass::Lockscreen);
-    }
-    // Synthetic sparse dots on black: visible, not Dark.
-    {
-        let mut rgb = vec![0u8; 64 * 64 * 3];
-        for i in 0..200 {
-            let o = (i * 61) % (64 * 64) * 3;
-            rgb[o..o + 3].copy_from_slice(&[220, 220, 220]);
-        }
-        push_frame(&mut out, "sparse-dots".to_string(), &rgb, 64, 64, ScreenClass::Lockscreen);
-    }
-    // Synthetic cursor block on black (shell cursor, text caret edge):
-    // a solid lit block reads as visible, never Dark. Mirrors the unit
-    // test's filled-bytes case.
-    {
-        let mut rgb = vec![0u8; 64 * 64 * 3];
-        rgb[..600].fill(220);
-        push_frame(&mut out, "cursor-block".to_string(), &rgb, 64, 64, ScreenClass::Lockscreen);
-    }
-    // Synthetic installer-blue with sparse ink (the 99%-blue progress
-    // screen shape): InstallerStep. Mirrors the unit test generator.
-    for seed in [17usize, 200] {
-        let (w, h) = (100usize, 100usize);
-        let mut rgb = flat_frame(w, h, [0, 90, 158]);
-        for k in 0..18 {
-            let o = ((k * 431 + seed) % (w * h)) * 3;
-            rgb[o..o + 3].copy_from_slice(&[255, 255, 255]);
-        }
-        for k in 0..75 {
-            let o = ((k * 131 + seed + 5) % (w * h)) * 3;
-            rgb[o..o + 3].copy_from_slice(&[0, 90, 150]);
-        }
-        push_frame(&mut out, format!("blueink{seed}"), &rgb, w, h, ScreenClass::InstallerStep);
-    }
-    // Synthetic gradient (lock-screen style): Lockscreen.
-    {
-        let mut rgb = Vec::with_capacity(100 * 100 * 3);
-        for y in 0..100u8 {
-            for x in 0..100u8 {
-                rgb.extend_from_slice(&[x * 2, y * 2, 128]);
-            }
-        }
-        push_frame(&mut out, "gradient".to_string(), &rgb, 100, 100, ScreenClass::Lockscreen);
-    }
+    // No synthetic frames: every training sample is a real capture (plus
+    // mechanical alterations: flip, brightness, rescale, tint). Shapes no
+    // real frame produces are not taught.
     out
 }
 
@@ -431,7 +350,7 @@ fn main() {
         let mut class_correct = [0usize; N_CLASSES];
         let mut class_seen = [0usize; N_CLASSES];
         let mut min_margin = f32::INFINITY;
-        for (rgb, label, name) in &data {
+        for (rgb, label, _name) in &data {
             let pool = forward(rgb, &conv_w, &conv_b, &mut caches);
             let mut logits = [0.0f32; N_CLASSES];
             for o in 0..N_CLASSES {
@@ -587,16 +506,18 @@ fn main() {
         eprintln!("trainer FAILED: {fails} misclassifications, not writing weights");
         std::process::exit(1);
     }
-    // Holdout verdict: frames the model never trained on (near-duplicates
-    // from the same runs live in tests/fixtures-holdout/). Informational:
-    // reported, never gating.
+    // Holdout verdict: frames the model never trained on, all under
+    // tests/fixtures-holdout/<class>/ (near-duplicate run frames plus the
+    // unseen-layout and synthetic-to-real cases — the class directory
+    // supplies the expected label, no lists). Informational: reported,
+    // never gating.
     {
-        let root = format!("{}/tests/fixtures-holdout", env!("CARGO_MANIFEST_DIR"));
         let mut hold_total = 0;
         let mut hold_hits = 0;
-        if std::path::Path::new(&root).is_dir() {
+        let hold_root = format!("{}/tests/fixtures-holdout", env!("CARGO_MANIFEST_DIR"));
+        if std::path::Path::new(&hold_root).is_dir() {
             for (dir, label) in CLASS_DIRS {
-                let dir_path = format!("{root}/{dir}");
+                let dir_path = format!("{hold_root}/{dir}");
                 if !std::path::Path::new(&dir_path).is_dir() {
                     continue;
                 }

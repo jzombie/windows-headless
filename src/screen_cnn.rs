@@ -49,7 +49,7 @@ pub const N_WEIGHTS: usize =
     N_FILTERS * 3 * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_INPUTS + N_CLASSES;
 
 /// Number of screen classes (dense outputs).
-pub const N_CLASSES: usize = 9;
+pub const N_CLASSES: usize = 8;
 
 /// Decoded weights (f32), parsed once on first use.
 static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
@@ -79,8 +79,10 @@ pub enum ScreenClass {
     InstallerStep,
     /// Windows Recovery screens (WinRE menus and failure text).
     ErrorRecovery,
-    /// Modal error dialogs (setup/OOBE failure boxes with an icon).
-    ErrorModal,
+    /// Error UI needing input: modal failure dialogs and bugcheck screens.
+    /// One class on purpose — the operational response is identical, and
+    /// neither has enough captures to stand alone.
+    ErrorScreen,
     /// Anything else: lock screen, gradients. (No desktop ever appears in
     /// this flow, so the lock screen stands in as the class name for the
     /// remaining miscellaneous bucket.)
@@ -89,9 +91,6 @@ pub enum ScreenClass {
     /// between firmware handoff and the OS, visually distinct from both
     /// text consoles and OS screens.
     FirmwareBoot,
-    /// Bugcheck screens: full-blue :( screen with stop code. Same palette
-    /// as the installer by design, separated by layout, never by color.
-    ErrorBluescreen,
 }
 
 /// Brightest-pixel downsample of full-resolution RGB to GRID x GRID.
@@ -223,10 +222,9 @@ pub fn predict_32x32_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
         2 => ScreenClass::ErrorShell,
         3 => ScreenClass::InstallerStep,
         4 => ScreenClass::ErrorRecovery,
-        5 => ScreenClass::ErrorModal,
+        5 => ScreenClass::ErrorScreen,
         6 => ScreenClass::Lockscreen,
-        7 => ScreenClass::FirmwareBoot,
-        _ => ScreenClass::ErrorBluescreen,
+        _ => ScreenClass::FirmwareBoot,
     }
 }
 
