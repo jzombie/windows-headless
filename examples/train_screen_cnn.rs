@@ -635,6 +635,7 @@ fn main() {
         // holdout wins; base margin breaks ties toward robust models.
         let (hold_hits, hold_total) =
             eval_holdout(&conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+        let prev_best = best_hold;
         let better = hold_hits > best_hold || (hold_hits == best_hold && base_margin > best_margin);
         if better {
             best_hold = hold_hits;
@@ -645,6 +646,12 @@ fn main() {
             best_conv_b = conv_b;
             best_dense_w = dense_w;
             best_dense_b = dense_b;
+        }
+        // Patience resets on strict holdout improvement only. A margin
+        // tiebreak refreshes the shipped weights above but must not reset
+        // the clock, or a 22/23 seesaw with creeping margin stalls the stop
+        // forever.
+        if hold_hits > prev_best {
             stale_evals = 0;
         } else {
             stale_evals += 1;
