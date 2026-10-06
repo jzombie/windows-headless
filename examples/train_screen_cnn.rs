@@ -392,7 +392,7 @@ fn main() {
             for p in probs.iter_mut() {
                 *p /= denom;
             }
-            loss += -(probs[*label].max(1e-12).ln());
+            loss += class_weights[*label] * -(probs[*label].max(1e-12).ln());
             class_seen[*label] += 1;
             let pred = probs
                 .iter()
@@ -413,10 +413,12 @@ fn main() {
             } else {
                 min_margin = min_margin.min(-1.0);
             }
-            // Backprop: dL/dlogit = (p - y) / N.
+            // Backprop: dL/dlogit = w_class * (p - y) / N. The class weight
+            // is the oversampling: minority frames push proportionally
+            // harder so the majority cannot drown them.
             let mut dlogit = [0.0f32; N_CLASSES];
             for o in 0..N_CLASSES {
-                dlogit[o] = probs[o] - if o == *label { 1.0 } else { 0.0 };
+                dlogit[o] = class_weights[*label] * (probs[o] - if o == *label { 1.0 } else { 0.0 });
                 dlogit[o] /= n;
             }
             // Dense grads + pool error.
