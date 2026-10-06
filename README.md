@@ -35,24 +35,14 @@ Sizing applies to installs too, so `run --win-iso` honors the same flags.
 
 Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
 `demo2026`); a screenshot lands in `<cache>/vms/win11/screenshots/` every
-60 seconds until SSH answers (installs as a time-lapse; `run` boots as a
-boot time-lapse (`--screenshots-every-secs`, `0` disables). Boot failures
-end with a diagnosis block: latest frame path + screen state (black /
-solid color field / modal error dialog / content) + last serial line, so
-dead boots are readable without VNC. `black` means literally no visible
-pixel. Text or a spinner on black is content. The classifier never
-claims "error" from color shape alone: the main Windows Setup progress
-screen is itself a flat saturated blue, so a flat frame only counts when
-nothing at all is rendered on it (≥99.5% one color, <0.1% white, no UI),
-and it says `solid color field`, not "error". Black and flat-field
-verdicts only stand while the frame is static. Animated screens demote
-to content (spinner/percent).
-Firmware reboots are counted from the serial log (OVMF `BdsDxe: starting`
-handoffs): `guest rebooted (firmware boot #N seen on serial)` lines print
-while waiting for SSH, and failure reports carry `guest boots seen`.
-Installer screenshots that catch a modal failure dialog on two screenshots in
-a row print a single `WARNING:` line (one per episode, not every frame, since
-slow firmware screens can trip the red-icon heuristic once).
+60 seconds until SSH answers (`--screenshots-every-secs`, `0` disables).
+Dead boots end with a diagnosis block: latest frame path, screen state, last
+serial line, and firmware reboot count, so dead boots are readable without
+VNC. Screen states: `black` (no output), `solid color field` (no UI),
+`modal error dialog`, `UEFI shell` (no bootable device found), or `content`
+(everything else, including the installer and spinners). A modal dialog or
+shell prompt prints a single `WARNING:` line instead of reading as routine
+progress.
 
 ## Where things live
 
