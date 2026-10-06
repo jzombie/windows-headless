@@ -664,7 +664,7 @@ struct EvalReport {
     margin: f32,
     per_class: [usize; N_CLASSES],
     mean_loss: f32,
-    misses: Vec<(String, usize, usize)>,
+    misses: Vec<(String, usize, usize, f32)>,
 }
 
 fn evaluate(
@@ -692,7 +692,7 @@ fn evaluate(
             report.per_class[*label] += 1;
             report.margin = report.margin.min(margin);
         } else {
-            report.misses.push((name.clone(), *label, got));
+            report.misses.push((name.clone(), *label, got, loss));
         }
     }
     if report.total > 0 {
@@ -853,9 +853,9 @@ fn main() {
         // holds a known-unlearnable pair, so 100% never fires. Best
         // holdout wins; base margin breaks ties toward robust models.
         let hold = evaluate(&holdout, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
-        for (name, want, got) in &hold.misses {
+        for (name, want, got, loss) in &hold.misses {
             println!(
-                "HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got})",
+                "HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got}) loss {loss:.4}",
                 BY_INDEX[*want], BY_INDEX[*got]
             );
         }
@@ -915,9 +915,9 @@ fn main() {
 
     // Final verdict on the raw base captures (no augmentation leniency).
     let verdict = evaluate(&files, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
-    for (name, want, got) in &verdict.misses {
+    for (name, want, got, loss) in &verdict.misses {
         println!(
-            "MISCLASSIFIED {name}: want {:?}({want}) got {:?}({got})",
+            "MISCLASSIFIED {name}: want {:?}({want}) got {:?}({got}) loss {loss:.4}",
             BY_INDEX[*want], BY_INDEX[*got]
         );
     }
@@ -925,9 +925,9 @@ fn main() {
     // the run always exits 0: a human decides merge, and the misses print
     // by name above and below.
     let hold = evaluate(&holdout, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
-    for (name, want, got) in &hold.misses {
+    for (name, want, got, loss) in &hold.misses {
         println!(
-            "HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got})",
+            "HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got}) loss {loss:.4}",
             BY_INDEX[*want], BY_INDEX[*got]
         );
     }
