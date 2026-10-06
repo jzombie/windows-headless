@@ -505,9 +505,12 @@ fn main() {
             println!("MISCLASSIFIED {name}: want {label}");
         }
     }
-    if fails > 0 {
-        eprintln!("trainer FAILED: {fails} misclassifications, not writing weights");
-        std::process::exit(1);
+    // Weights always land: a human decides merge, not the gate. The gate
+    // still fails loudly (nonzero exit below) so CI never blesses a bad
+    // corpus silently.
+    let gate_failed = fails > 0;
+    if gate_failed {
+        eprintln!("trainer GATE FAILED: {fails} misclassifications (weights still written)");
     }
     // Holdout verdict: frames the model never trained on, all under
     // tests/fixtures-holdout/<class>/ (near-duplicate run frames plus the
@@ -563,4 +566,7 @@ fn main() {
     std::fs::create_dir_all(format!("{}/artifacts", env!("CARGO_MANIFEST_DIR"))).unwrap();
     std::fs::write(&out_path, &bytes).unwrap();
     println!("wrote {out_path} ({} bytes)", bytes.len());
+    if gate_failed {
+        std::process::exit(1);
+    }
 }
