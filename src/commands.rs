@@ -477,8 +477,29 @@ pub struct RunArgs {
     pub screenshots_every_secs: u64,
 }
 
+/// Install params for the `run --win-iso` chain (missing disk): everything
+/// the user sized carries through, nothing silently resets to defaults.
+/// Split out so a test pins the passthrough (the screenshot cadence was
+/// once hardcoded to 60 here while `run` advertised the flag).
+fn run_chain_install_params(a: &RunArgs, iso: PathBuf) -> InstallParams {
+    InstallParams {
+        usb_image: None,
+        win_iso: Some(iso),
+        screenshots_every_secs: a.screenshots_every_secs,
+        username: a.username.clone(),
+        password: a.password.clone(),
+        recovery: false,
+        auto_updates: false,
+        install_timeout_secs: a.install_timeout_secs,
+        memory_mb: a.memory,
+        cpus: a.cpus,
+        disk_size_gb: a.disk_size,
+        display: a.display.clone(),
+    }
+}
+
 pub async fn cmd_run(a: RunArgs) -> Result<()> {
-    let vm_dir = match a.vm_dir {
+    let vm_dir = match a.vm_dir.clone() {
         Some(d) => d,
         None => default_vm_dir()?,
     };
@@ -497,7 +518,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         return Ok(());
     }
     let _ = std::fs::remove_file(vm_dir.join(crate::paths::QEMU_PIDFILE));
-    let disk = a.disk.unwrap_or_else(|| {
+    let disk = a.disk.clone().unwrap_or_else(|| {
         vm_dir
             .join(crate::paths::DISK_IMAGE)
             .to_string_lossy()
@@ -512,7 +533,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         .map(|m| m.len() >= MIN_VIABLE_DISK)
         .unwrap_or(false);
     if !disk_viable {
-        match a.win_iso.map(expand_tilde) {
+        match a.win_iso.clone().map(expand_tilde) {
             // Chain: install the disk, then fall through to boot it below.
             // Uses the core only — no shell, no Ctrl-C wait mid-chain. The
             // installer VM is torn down immediately so this command blocks
@@ -526,21 +547,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     a.memory,
                     a.cpus,
                 );
-                let mut session = install_to_ready(InstallParams {
-                    usb_image: None,
-                    win_iso: Some(iso),
-                    screenshots_every_secs: timeouts::SCREENSHOTS_EVERY_SECS,
-                    username: a.username.clone(),
-                    password: a.password.clone(),
-                    recovery: false,
-                    auto_updates: false,
-                    install_timeout_secs: a.install_timeout_secs,
-                    memory_mb: a.memory,
-                    cpus: a.cpus,
-                    disk_size_gb: a.disk_size,
-                    display: a.display.clone(),
-                })
-                .await?;
+                let mut session =
+                    install_to_ready(run_chain_install_params(&a, iso)).await?;
                 finish_install_capture(&mut session).await;
                 prove_landed_shell(PROVEN_SSH_PORT, &a.username, &a.password).await?;
                 let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
@@ -3638,6 +3646,35 @@ mod tests {
             vnc_password_command(),
             format!("change vnc password {PROVEN_VNC_PASSWORD}")
         );
+    }
+
+    #[test]
+    fn run_chain_install_params_passes_cadence_through() {
+        // Regression: `run --win-iso --screenshots-every-secs 10` installed
+        // at 60s cadence because the chain hardcoded the default.
+        let args = RunArgs {
+            disk: None,
+            ssh_port: crate::qemu::PROVEN_SSH_PORT,
+            display: crate::qemu::Display::parse("vnc=127.0.0.1:10").unwrap(),
+            memory: 4096,
+            cpus: 4,
+            disk_size: 64,
+            vm_dir: None,
+            qemu_dir: None,
+            username: "u".into(),
+            password: "p".into(),
+            shell: false,
+            live: false,
+            win_iso: None,
+            install_timeout_secs: 60,
+            screenshots_every_secs: 10,
+        };
+        let p = run_chain_install_params(&args, PathBuf::from("w.iso"));
+        assert_eq!(p.screenshots_every_secs, 10);
+        assert_eq!(p.install_timeout_secs, 60);
+        assert_eq!(p.memory_mb, 4096);
+        assert_eq!(p.cpus, 4);
+        assert_eq!(p.disk_size_gb, 64);
     }
 
     #[test]
