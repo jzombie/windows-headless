@@ -118,11 +118,7 @@ const BY_INDEX: [ScreenClass; N_CLASSES] = [
 /// brightest source pixel in its cell (per channel) rather than the nearest
 /// neighbor: thin white text and spinner arcs on black survive the shrink
 /// instead of sampling out of existence.
-pub fn downsample_to_64x64_rgb(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-) -> [u8; 3 * GRID * GRID] {
+pub fn downsample_to_64x64_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 * GRID * GRID] {
     assert_eq!(src.len(), src_w * src_h * 3, "downsample size mismatch");
     let mut out = [0u8; 3 * GRID * GRID];
     for y in 0..GRID {
@@ -254,8 +250,7 @@ pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
 /// Shared by the trainer (`examples/train_cnn.rs`) and the classifier
 /// tests over `tests/fixtures/`.
 pub fn load_rgb_8bit(path: &str) -> (Vec<u8>, u32, u32) {
-    let file =
-        std::fs::File::open(path).unwrap_or_else(|e| panic!("open fixture {path}: {e}"));
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open fixture {path}: {e}"));
     let decoder = png::Decoder::new(file);
     let mut reader = decoder
         .read_info()

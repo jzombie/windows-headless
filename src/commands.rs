@@ -547,8 +547,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     a.memory,
                     a.cpus,
                 );
-                let mut session =
-                    install_to_ready(run_chain_install_params(&a, iso)).await?;
+                let mut session = install_to_ready(run_chain_install_params(&a, iso)).await?;
                 finish_install_capture(&mut session).await;
                 prove_landed_shell(PROVEN_SSH_PORT, &a.username, &a.password).await?;
                 let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
@@ -3545,7 +3544,10 @@ mod tests {
 
     #[test]
     fn screen_state_black_means_nothing_visible() {
-        assert_eq!(classify_screen(&flat(64, 64, [0, 0, 0]), 64), ScreenState::Dark);
+        assert_eq!(
+            classify_screen(&flat(64, 64, [0, 0, 0]), 64),
+            ScreenState::Dark
+        );
         // Degenerate empty frame: nothing captured = nothing to see.
         assert_eq!(classify_screen(&[], 0), ScreenState::Dark);
     }
@@ -3622,7 +3624,11 @@ mod tests {
                 names.sort();
                 for name in names {
                     let got = classify_fixture(&format!("{version}/{class}/{name}"));
-                    assert_eq!(got, expected_for_class(&class), "fixture {version}/{class}/{name}");
+                    assert_eq!(
+                        got,
+                        expected_for_class(&class),
+                        "fixture {version}/{class}/{name}"
+                    );
                     checked += 1;
                 }
             }

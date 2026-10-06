@@ -20,5 +20,9 @@ fn main() {
         std::hint::black_box(predict_full(&rgb, w));
     }
     let per = start.elapsed() / iters;
-    println!("predict_full ({}x{}): {per:?} per frame", w, rgb.len() / 3 / w as usize);
+    println!(
+        "predict_full ({}x{}): {per:?} per frame",
+        w,
+        rgb.len() / 3 / w as usize
+    );
 }
