@@ -47,7 +47,7 @@ const LEARNING_RATE: f32 = 0.004;
 /// banks the best model instead of grinding plateaus. Generous on purpose:
 /// whole classes (dark, flat-field) pop after epoch 100, and cutting the
 /// run at dozens of epochs executes it before the easy wins land.
-const PATIENCE_EPOCHS: usize = 200;
+const PATIENCE_EPOCHS: usize = 50;
 /// Logit gap that counts as comfortably won. Informational only (tiebreak
 /// input and report line): nothing gates on it.
 const REQUIRED_MARGIN: f32 = 2.0;
