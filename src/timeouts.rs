@@ -23,19 +23,27 @@ use std::time::Duration;
 
 /// `run`: boot → first SSH banner. The printed "up to N min" line is
 /// derived from this, so the message can't lie about the real budget.
-/// (`install` uses [`INSTALL_SSH_DEADLINE_SECS`] instead.)
+/// (`install` uses [`DEFAULT_INSTALL_SSH_DEADLINE_SECS`] instead.)
 pub const BOOT_SSH_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// Default for `--install-timeout-secs` (`install`, `run --win-iso`):
 /// how long a *still-progressing* unattended install may take to report
 /// ready. Generous on purpose — a slow host applies the image for hours,
 /// and a parked guest is caught separately by [`IDLE_BAIL_SECS`].
-pub const INSTALL_SSH_DEADLINE_SECS: u64 = 6 * 60 * 60;
+pub const DEFAULT_INSTALL_SSH_DEADLINE_SECS: u64 = 6 * 60 * 60;
 
 /// Default for `--screenshots-every-secs`: the install time-lapse and
 /// `run`'s boot time-lapse cadence (also what `run --win-iso` uses for
 /// its install-chain time-lapse, which has no flag of its own).
-pub const SCREENSHOTS_EVERY_SECS: u64 = 60;
+/// Disk PNG writes; 0 disables saving (classification still runs on its
+/// own cadence below).
+pub const DEFAULT_SCREENSHOTS_EVERY_SECS: u64 = 60;
+
+/// Default for `--classify-every-secs`: the in-memory screen-classification
+/// cadence (screendump + CNN, no disk write). Faster than the disk
+/// time-lapse so phase changes and error screens surface in the log
+/// within seconds while PNGs stay minute-scale. 0 disables it.
+pub const DEFAULT_CLASSIFY_EVERY_SECS: u64 = 10;
 
 /// Internal snapshot tag for the landed state (`qemu-img snapshot -c`).
 pub const GOLDEN_TAG: &str = "golden";
@@ -133,7 +141,7 @@ pub const IDLE_WARN_SECS: u64 = 60;
 /// Stall watchdog bail: frozen disk I/O + no banner this long = parked at
 /// an input screen (recovery, EULA). Fails fast with evidence instead of
 /// polling SSH against a guest that has stopped moving — this is what lets
-/// [`INSTALL_SSH_DEADLINE_SECS`] stay generous.
+/// [`DEFAULT_INSTALL_SSH_DEADLINE_SECS`] stay generous.
 pub const IDLE_BAIL_SECS: u64 = 120;
 
 /// Cadence of the "... still waiting for SSH (Ns elapsed)" boot narration.

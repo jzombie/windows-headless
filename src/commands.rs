@@ -475,6 +475,10 @@ pub struct RunArgs {
     /// Screendump cadence during the boot wait in seconds (0 = disabled);
     /// frames land in `<vm-dir>/screenshots/`.
     pub screenshots_every_secs: u64,
+    /// In-memory screen-classification cadence in seconds (0 = disabled):
+    /// screendump + CNN with no disk write, narrating phase changes and
+    /// error screens in the log between saved frames.
+    pub classify_every_secs: u64,
 }
 
 /// Install params for the `run --win-iso` chain (missing disk): everything
@@ -486,6 +490,7 @@ fn run_chain_install_params(a: &RunArgs, iso: PathBuf) -> InstallParams {
         usb_image: None,
         win_iso: Some(iso),
         screenshots_every_secs: a.screenshots_every_secs,
+        classify_every_secs: a.classify_every_secs,
         username: a.username.clone(),
         password: a.password.clone(),
         recovery: false,
@@ -795,16 +800,33 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             shots_dir.display()
         );
     }
+    if a.classify_every_secs > 0 {
+        eprintln!(
+            "Classifying the boot screen every {}s (in memory, no file)",
+            a.classify_every_secs
+        );
+    }
     // VNC coordinates for failure reports (None for gtk/cocoa/none — the
     // frame + serial line still say what happened).
     let vnc = a
         .display
         .is_vnc()
         .then(|| vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg()));
-    let mut ticker = tokio::time::interval(timeouts::BOOT_STATUS_TICK);
+    // Tick on the fastest active cadence: boot narration, PNG saves,
+    // and in-memory classification each gate on their own interval
+    // inside the loop, so a fast cadence on one layer is never
+    // throttled by a slower layer.
+    let mut tick_interval = timeouts::BOOT_STATUS_TICK;
+    if a.screenshots_every_secs > 0 {
+        tick_interval = tick_interval.min(Duration::from_secs(a.screenshots_every_secs));
+    }
+    if a.classify_every_secs > 0 {
+        tick_interval = tick_interval.min(Duration::from_secs(a.classify_every_secs));
+    }
+    let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so the first status line comes
-    // after 30s of actual waiting, not at launch.
+    // after a full interval of actual waiting, not at launch.
     ticker.tick().await;
     // Stall sensor: serial-silent deaths would otherwise poll SSH blindly.
     let mut idle = BlockIdle::new();
@@ -817,9 +839,14 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // Boot time-lapse bookkeeping: cadence is honored inside the ticker
     // loop (first frame after a full interval, matching `install`), so it
     // stops the moment the wait ends — no background task leaking into the
-    // interactive session.
+    // interactive session. The in-memory classification runs on its own
+    // faster cadence between saved frames; the "... still waiting"
+    // narration stays on BOOT_STATUS_TICK regardless of tick rate.
     let mut last_shot = Some(start);
+    let mut last_status_line = start;
+    let mut last_classify = Some(start);
     let mut shot_n = 0u64;
+    let mut status_n = 0u64;
     tokio::select! {
         r = vm.wait_for_ssh(timeouts::BOOT_SSH_DEADLINE) => {
             // Time's up: the serial is silent through a Windows boot, so
@@ -852,22 +879,61 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                 idle.poll(&mon).await?;
                 // Boot time-lapse: periodic frames so a slow boot narrates
                 // itself visually (the serial has nothing to say while
-                // Windows boots) — same cadence idea as install's.
-                if a.screenshots_every_secs > 0
+                // Windows boots) — same cadence idea as install's. A save
+                // tick doubles as the status line, so it never
+                // double-captures with the classification below.
+                let save_due = a.screenshots_every_secs > 0
                     && last_shot.is_none_or(|t| {
                         t.elapsed() >= Duration::from_secs(a.screenshots_every_secs)
+                    });
+                if save_due {
+                    if let Some((p, s)) = take_screenshot(&mon, &shots_dir).await {
+                        shot_n += 1;
+                        status_n += 1;
+                        last_shot = Some(std::time::Instant::now());
+                        let warn = if matches!(
+                            s,
+                            ScreenState::ErrorScreen
+                                | ScreenState::ErrorShell
+                                | ScreenState::ErrorRecovery
+                        ) {
+                            "WARNING: "
+                        } else {
+                            ""
+                        };
+                        eprintln!(
+                            "{warn}boot frame {shot_n}: {} ({s})",
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                    }
+                } else if a.classify_every_secs > 0
+                    && last_classify.is_none_or(|t| {
+                        t.elapsed() >= Duration::from_secs(a.classify_every_secs)
                     })
-                    && let Some((p, s)) = take_screenshot(&mon, &shots_dir).await
+                    && let Some(s) = classify_only(&mon, &shots_dir).await
                 {
-                    shot_n += 1;
-                    last_shot = Some(std::time::Instant::now());
-                    eprintln!(
-                        "boot frame {shot_n}: {} ({s})",
-                        p.file_name().unwrap_or_default().to_string_lossy()
-                    );
+                    status_n += 1;
+                    last_classify = Some(std::time::Instant::now());
+                    let warn = if matches!(
+                        s,
+                        ScreenState::ErrorScreen
+                            | ScreenState::ErrorShell
+                            | ScreenState::ErrorRecovery
+                    ) {
+                        "WARNING: "
+                    } else {
+                        ""
+                    };
+                    eprintln!("{warn}boot status {status_n}: ({s})");
                 }
-                // Narrate the boot: last serial line says what the guest
-                // is doing (recovery, Boot Manager, Setup pass...).
+                // Narrate the boot on the slow pulse only: last serial line
+                // says what the guest is doing (recovery, Boot Manager,
+                // Setup pass...). The ticker may run faster for
+                // classification; this line must not turn into spam.
+                if last_status_line.elapsed() < timeouts::BOOT_STATUS_TICK {
+                    continue;
+                }
+                last_status_line = std::time::Instant::now();
                 let doing = last_serial_line(&vm.builder.serial_log);
                 if doing.is_empty() {
                     eprintln!(
@@ -1337,6 +1403,7 @@ pub struct InstallParams {
     pub usb_image: Option<PathBuf>,
     pub win_iso: Option<PathBuf>,
     pub screenshots_every_secs: u64,
+    pub classify_every_secs: u64,
     pub username: String,
     pub password: String,
     pub recovery: bool,
@@ -1602,17 +1669,26 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     eprintln!(
         "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
     );
-    let screenshots = if p.screenshots_every_secs > 0 {
+    let screenshots = if p.screenshots_every_secs > 0 || p.classify_every_secs > 0 {
         let dir = screenshots_dir(&vm_dir);
-        eprintln!(
-            "Saving an installer screenshot every {}s until then → {}",
-            p.screenshots_every_secs,
-            dir.display()
-        );
+        if p.screenshots_every_secs > 0 {
+            eprintln!(
+                "Saving an installer screenshot every {}s until then → {}",
+                p.screenshots_every_secs,
+                dir.display()
+            );
+        }
+        if p.classify_every_secs > 0 {
+            eprintln!(
+                "Classifying the installer screen every {}s (in memory, no file)",
+                p.classify_every_secs
+            );
+        }
         Some(spawn_screenshots(
             std::sync::Arc::clone(&mon),
             dir,
             Duration::from_secs(p.screenshots_every_secs),
+            Duration::from_secs(p.classify_every_secs),
         ))
     } else {
         None
@@ -2704,7 +2780,8 @@ enum ScreenState {
     /// too — color uniformity alone cannot tell the two apart (live
     /// 2026-10-04: the main installer screen was 99% #005A9E and the old
     /// 80% rule announced it as a "BSOD/recovery-like error"). Any
-    /// text-bearing screen — setup, BSOD, recovery — is [`ScreenState::Content`].
+    /// text-bearing screen — setup, BSOD, recovery — maps to its own
+    /// phase state, never this.
     FlatField,
     /// Error UI needing input: modal failure dialogs and bugcheck screens.
     /// One variant on purpose — the operational response is identical, and
@@ -2718,8 +2795,19 @@ enum ScreenState {
     /// by the micro-CNN in [`crate::screen_cnn`] — see its docs for the
     /// class map. Recovery always needs input, so it is never content.
     ErrorRecovery,
-    /// Anything else.
-    Content,
+    /// Windows Setup / installer progress screens (language select,
+    /// progress bars, spinner). Routine forward motion.
+    InstallerStep,
+    /// First-boot OOBE transitionals ("Just a moment", logo splash,
+    /// "Welcome"): post-install, pre-logon. Progress, never errors.
+    OobeStep,
+    /// Firmware boot art: TianoCore splash, boot logos. Transient screens
+    /// between firmware handoff and the OS.
+    FirmwareBoot,
+    /// Lock screen / idle gradient. The guest is up but waiting; never an
+    /// error in this flow (no desktop ever appears, so this bucket also
+    /// covers miscellaneous idle gradients).
+    Lockscreen,
 }
 
 impl std::fmt::Display for ScreenState {
@@ -2730,7 +2818,12 @@ impl std::fmt::Display for ScreenState {
             ScreenState::ErrorScreen => "screen shows an ERROR (needs input)",
             ScreenState::ErrorShell => "screen shows the UEFI SHELL (no bootable device)",
             ScreenState::ErrorRecovery => "screen shows RECOVERY (Windows recovery, needs input)",
-            ScreenState::Content => "screen shows content",
+            ScreenState::InstallerStep => "screen shows Windows Setup / installer progress",
+            ScreenState::OobeStep => "screen shows first-boot OOBE (post-install, pre-logon)",
+            ScreenState::FirmwareBoot => {
+                "screen shows firmware boot art (TianoCore splash / boot logo)"
+            }
+            ScreenState::Lockscreen => "screen shows lock screen / idle (guest up, waiting)",
         })
     }
 }
@@ -2748,7 +2841,10 @@ fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
         C::Dark => ScreenState::Dark,
         C::FlatField => ScreenState::FlatField,
         C::ErrorShell => ScreenState::ErrorShell,
-        C::InstallerStep | C::Lockscreen | C::FirmwareBoot | C::OobeStep => ScreenState::Content,
+        C::InstallerStep => ScreenState::InstallerStep,
+        C::Lockscreen => ScreenState::Lockscreen,
+        C::FirmwareBoot => ScreenState::FirmwareBoot,
+        C::OobeStep => ScreenState::OobeStep,
         C::ErrorRecovery => ScreenState::ErrorRecovery,
         C::ErrorScreen => ScreenState::ErrorScreen,
     }
@@ -2799,28 +2895,36 @@ async fn boot_failure_report(
     format_failure_report(frame, &serial, boot_count(serial_log), vnc)
 }
 
-/// One screendump frame: `screendump` to PPM, converted in-crate to PNG
-/// (README-displayable; tens to low hundreds of KB depending on screen
-/// content vs 1.4 MB raw), PPM deleted. Frames land as
-/// `<screenshots_dir>/screenshot-<epoch>.png`, each paired with the
-/// [`ScreenState`] verdict from [`classify_screen`] so callers can
-/// announce *what* the screen shows, not just where the file is.
-/// Best-effort (logs, never fails): the monitor may be busy mid-command
-/// and a missed frame is not worth failing an install over.
-/// Returns the PNG path + state on success so callers can announce it.
-async fn take_screenshot(
+/// One screendump frame, classified in memory with nothing written to
+/// disk: `screendump` to a temp PPM, parsed, classified, PPM deleted.
+/// The fast cadence behind `--classify-every-secs` — phase changes and
+/// error screens surface in the log within seconds while PNGs stay
+/// minute-scale. Best-effort (logs, never fails): returns `None` when the
+/// monitor is busy mid-command.
+async fn classify_only(mon: &crate::ipc::Monitor, screenshots_dir: &Path) -> Option<ScreenState> {
+    let (w, _, rgb) = capture_frame(mon, screenshots_dir).await?;
+    // Single frame straight from the model: no history, no motion
+    // rules. What the CNN says is what gets reported.
+    Some(classify_screen(&rgb, w))
+}
+
+/// Raw frame capture shared by [`classify_only`] and [`take_screenshot`]:
+/// screendump to a temp PPM inside the screenshots dir, parsed to RGB,
+/// PPM deleted. The PPM lives beside the PNGs (never /tmp —
+/// world-writable-sticky, symlink squatting, cross-VM collisions) under a
+/// `frame-` prefix that never collides with `screenshot-*.png`.
+async fn capture_frame(
     mon: &crate::ipc::Monitor,
     screenshots_dir: &Path,
-) -> Option<(PathBuf, ScreenState)> {
+) -> Option<(u32, u32, Vec<u8>)> {
     if std::fs::create_dir_all(screenshots_dir).is_err() {
         return None;
     }
-    let stem = screenshots_dir.join(format!(
-        "{SCREENSHOT_PREFIX}{}",
+    let ppm = screenshots_dir.join(format!(
+        "frame-{}-{}.ppm",
+        std::process::id(),
         crate::provenance::now_epoch()
     ));
-    let ppm = stem.with_extension("ppm");
-    let png_path = stem.with_extension("png");
     // Quote the path: HMP splits unquoted args on whitespace and the cache
     // path routinely contains spaces (observed live: screendump "succeeded"
     // but the file never appeared, failing the PNG step with ENOENT).
@@ -2835,19 +2939,45 @@ async fn take_screenshot(
         .map_err(anyhow::Error::from)
         .and_then(|d| {
             let (w, h, rgb) = parse_ppm_p6(&d)?;
-            // Single frame straight from the model: no history, no motion
-            // rules. What the CNN says is what gets reported.
-            let state = classify_screen(&rgb, w);
-            write_png(&png_path, w, h, &rgb)?;
-            Ok((png_path, state))
+            Ok((w, h, rgb))
         });
-    // Always clean up the raw PPM: success deletes it anyway, and a failed
-    // conversion must not leak multi-MB dumps on every cadence tick.
+    // Always clean up the raw PPM: a failed conversion must not leak
+    // multi-MB dumps on every cadence tick.
     let _ = std::fs::remove_file(&ppm);
     match result {
         Ok(ok) => Some(ok),
         Err(e) => {
-            eprintln!("warning: ppm->png failed ({e:#})");
+            eprintln!("warning: ppm parse failed ({e:#})");
+            None
+        }
+    }
+}
+
+/// One screendump frame: `screendump` to PPM, converted in-crate to PNG
+/// (README-displayable; tens to low hundreds of KB depending on screen
+/// content vs 1.4 MB raw), PPM deleted. Frames land as
+/// `<screenshots_dir>/screenshot-<epoch>.png`, each paired with the
+/// [`ScreenState`] verdict from [`classify_screen`] so callers can
+/// announce *what* the screen shows, not just where the file is.
+/// Best-effort (logs, never fails): the monitor may be busy mid-command
+/// and a missed frame is not worth failing an install over.
+/// Returns the PNG path + state on success so callers can announce it.
+async fn take_screenshot(
+    mon: &crate::ipc::Monitor,
+    screenshots_dir: &Path,
+) -> Option<(PathBuf, ScreenState)> {
+    let (w, h, rgb) = capture_frame(mon, screenshots_dir).await?;
+    // Single frame straight from the model: no history, no motion
+    // rules. What the CNN says is what gets reported.
+    let state = classify_screen(&rgb, w);
+    let png_path = screenshots_dir.join(format!(
+        "{SCREENSHOT_PREFIX}{}.png",
+        crate::provenance::now_epoch()
+    ));
+    match write_png(&png_path, w, h, &rgb) {
+        Ok(()) => Some((png_path, state)),
+        Err(e) => {
+            eprintln!("warning: png write failed ({e:#})");
             None
         }
     }
@@ -2959,44 +3089,121 @@ fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
 fn spawn_screenshots(
     mon: std::sync::Arc<crate::ipc::Monitor>,
     screenshots_dir: PathBuf,
-    every: Duration,
+    save_every: Duration,
+    classify_every: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // First frame immediately (proves the display is alive early),
-        // then on cadence. Numbered, basename-only (the dir was announced
-        // once above), so the log reads as progress toward the SSH answer.
-        let mut n = 0u64;
-        let announce = |n: u64, p: PathBuf, s: ScreenState| {
-            // A failure screen must not read as routine "content": flag it
-            // loudly the moment it appears.
-            let warn = if matches!(
-                s,
-                ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
-            ) {
-                "WARNING: "
-            } else {
-                ""
-            };
-            eprintln!(
-                "{warn}installer screenshot {n}: {} ({s})",
-                p.file_name().unwrap_or_default().to_string_lossy()
-            );
+        // Two cadences, one ticker: the fast in-memory classification
+        // narrates phase changes within seconds while PNGs land on the
+        // slow cadence. First frame immediately (proves the display is
+        // alive early), then on cadence. Numbered, basename-only (the dir
+        // was announced once above), so the log reads as progress toward
+        // the SSH answer.
+        let Some(mut watcher) =
+            InstallerWatcher::new(mon, screenshots_dir, save_every, classify_every)
+        else {
+            return;
         };
-        if let Some((p, s)) = take_screenshot(&mon, &screenshots_dir).await {
-            n += 1;
-            announce(n, p, s);
-        }
-        let mut ticker = tokio::time::interval(every);
+        let tick_every = watcher.tick_every();
+        watcher.poll().await; // immediate first frame
+        let mut ticker = tokio::time::interval(tick_every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate tick
         loop {
             ticker.tick().await;
-            if let Some((p, s)) = take_screenshot(&mon, &screenshots_dir).await {
-                n += 1;
-                announce(n, p, s);
-            }
+            watcher.poll().await;
         }
     })
+}
+
+/// One install-wait screen poll: fast in-memory classification narrates
+/// phase changes within seconds, slow PNG saves keep the minute-scale
+/// time-lapse. A save tick serves both layers from a single screendump,
+/// so no tick ever double-captures. Owns the counters and the last-save
+/// timestamp, so the spawn body and any future caller share one path.
+struct InstallerWatcher {
+    mon: std::sync::Arc<crate::ipc::Monitor>,
+    dir: PathBuf,
+    save_every: Duration,
+    classify_every: Duration,
+    shot_n: u64,
+    status_n: u64,
+    last_save: Option<std::time::Instant>,
+}
+
+impl InstallerWatcher {
+    /// `None` when both cadences are off: nothing to watch.
+    fn new(
+        mon: std::sync::Arc<crate::ipc::Monitor>,
+        dir: PathBuf,
+        save_every: Duration,
+        classify_every: Duration,
+    ) -> Option<Self> {
+        if save_every.is_zero() && classify_every.is_zero() {
+            return None;
+        }
+        Some(Self {
+            mon,
+            dir,
+            save_every,
+            classify_every,
+            shot_n: 0,
+            status_n: 0,
+            // `None` = save due immediately: the first poll writes a PNG
+            // when saving is on instead of special-casing startup.
+            last_save: None,
+        })
+    }
+
+    /// Tick on the faster of the two cadences (zero = that layer off).
+    fn tick_every(&self) -> Duration {
+        match (self.save_every.is_zero(), self.classify_every.is_zero()) {
+            (true, false) => self.classify_every,
+            (false, true) => self.save_every,
+            (false, false) => self.save_every.min(self.classify_every),
+            (true, true) => unreachable!("new() rejects both zero"),
+        }
+    }
+
+    /// A failure screen must not read as routine progress: flag it loudly
+    /// the moment it appears.
+    fn warn(s: ScreenState) -> &'static str {
+        if matches!(
+            s,
+            ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
+        ) {
+            "WARNING: "
+        } else {
+            ""
+        }
+    }
+
+    async fn poll(&mut self) {
+        // Slow cadence owns the PNG: one screendump serves both the file
+        // and the status line.
+        let save_due = !self.save_every.is_zero()
+            && self
+                .last_save
+                .is_none_or(|t| t.elapsed() >= self.save_every);
+        if save_due {
+            if let Some((p, s)) = take_screenshot(&self.mon, &self.dir).await {
+                self.shot_n += 1;
+                self.status_n += 1;
+                self.last_save = Some(std::time::Instant::now());
+                eprintln!(
+                    "{}installer screenshot {}: {} ({s})",
+                    Self::warn(s),
+                    self.shot_n,
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+        } else if !self.classify_every.is_zero()
+            && let Some(s) = classify_only(&self.mon, &self.dir).await
+        {
+            self.status_n += 1;
+            eprintln!("{}installer status {}: ({s})", Self::warn(s), self.status_n);
+        }
+    }
 }
 
 /// One banner read ([`timeouts::SSH_BANNER_CONNECT_BUDGET`] +
@@ -3593,10 +3800,13 @@ mod tests {
             "error-recovery" => ScreenState::ErrorRecovery,
             "error-bluescreen" => ScreenState::ErrorScreen,
             "error-modal" => ScreenState::ErrorScreen,
-            "oobe-step" => ScreenState::Content,
-            // installer-step, firmware-boot, lockscreen: progress or idle,
-            // never errors.
-            _ => ScreenState::Content,
+            "oobe-step" => ScreenState::OobeStep,
+            "installer-step" => ScreenState::InstallerStep,
+            "firmware-boot" => ScreenState::FirmwareBoot,
+            "lockscreen" => ScreenState::Lockscreen,
+            // Unknown future class dirs: fail loudly below via the
+            // unreachable arm instead of silently passing as progress.
+            _ => panic!("test map missing class dir: {class}"),
         };
         let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
         let mut checked = 0;
@@ -3674,9 +3884,11 @@ mod tests {
             win_iso: None,
             install_timeout_secs: 60,
             screenshots_every_secs: 10,
+            classify_every_secs: 5,
         };
         let p = run_chain_install_params(&args, PathBuf::from("w.iso"));
         assert_eq!(p.screenshots_every_secs, 10);
+        assert_eq!(p.classify_every_secs, 5);
         assert_eq!(p.install_timeout_secs, 60);
         assert_eq!(p.memory_mb, 4096);
         assert_eq!(p.cpus, 4);
