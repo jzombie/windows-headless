@@ -24,7 +24,7 @@
 //! a bad corpus or recipe fails loudly instead of baking silent weights.
 
 use windows_headless::screen_cnn::{
-    DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOLED, POOL, POOL_FEATURES,
+    DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL, POOL_FEATURES, POOLED,
     ScreenClass, downsample_to_32x32_rgb, load_rgb_8bit,
 };
 
@@ -118,14 +118,7 @@ fn augment(
             .iter()
             .map(|&v| ((v as f32) * factor).clamp(0.0, 255.0) as u8)
             .collect();
-        push_frame(
-            out,
-            format!("{name}[x{factor}]"),
-            &shifted,
-            w,
-            h,
-            label,
-        );
+        push_frame(out, format!("{name}[x{factor}]"), &shifted, w, h, label);
     }
     for (fx, fy) in [(0.85f32, 1.0f32), (1.0, 0.85), (1.15, 1.0), (1.0, 1.15)] {
         let (scaled, w2, h2) = rescale(rgb, w, h, fx, fy);
@@ -145,7 +138,14 @@ fn augment(
                 ]
             })
             .collect();
-        push_frame(out, format!("{name}[alter-tint{dr},{dg},{db}]"), &tinted, w, h, label);
+        push_frame(
+            out,
+            format!("{name}[alter-tint{dr},{dg},{db}]"),
+            &tinted,
+            w,
+            h,
+            label,
+        );
     }
 }
 
@@ -247,9 +247,8 @@ fn forward(rgb: &Frame, conv_w: &[f32], conv_b: &[f32], out: &mut Caches) -> [f3
                                 continue;
                             }
                             sum += out.chw[ic * GRID_PIXELS + nr as usize * GRID + nc as usize]
-                                * conv_w[oc * FILTER_WEIGHTS + ic * KERNEL * KERNEL
-                                    + kr * KERNEL
-                                    + kc];
+                                * conv_w
+                                    [oc * FILTER_WEIGHTS + ic * KERNEL * KERNEL + kr * KERNEL + kc];
                         }
                     }
                 }
@@ -263,7 +262,8 @@ fn forward(rgb: &Frame, conv_w: &[f32], conv_b: &[f32], out: &mut Caches) -> [f3
                 let mut m = f32::NEG_INFINITY;
                 for kr in 0..POOL {
                     for kc in 0..POOL {
-                        let v = out.conv[ch * GRID_PIXELS + (r * POOL + kr) * GRID + (c * POOL + kc)];
+                        let v =
+                            out.conv[ch * GRID_PIXELS + (r * POOL + kr) * GRID + (c * POOL + kc)];
                         if v > m {
                             m = v;
                         }
@@ -416,9 +416,8 @@ fn main() {
                         let mut m = f32::NEG_INFINITY;
                         for kr in 0..POOL {
                             for kc in 0..POOL {
-                                let v = caches.conv[ch * GRID_PIXELS
-                                    + (r * POOL + kr) * GRID
-                                    + (c * POOL + kc)];
+                                let v = caches.conv
+                                    [ch * GRID_PIXELS + (r * POOL + kr) * GRID + (c * POOL + kc)];
                                 if v > m {
                                     m = v;
                                     best = (kr, kc);
@@ -426,8 +425,9 @@ fn main() {
                             }
                         }
                         if m > 0.0 {
-                            dconv[ch * GRID_PIXELS + (r * POOL + best.0) * GRID + (c * POOL + best.1)] =
-                                dpool[ch * POOL_FEATURES + r * POOLED + c];
+                            dconv[ch * GRID_PIXELS
+                                + (r * POOL + best.0) * GRID
+                                + (c * POOL + best.1)] = dpool[ch * POOL_FEATURES + r * POOLED + c];
                         }
                     }
                 }
@@ -455,9 +455,8 @@ fn main() {
                                     g_conv_w[oc * FILTER_WEIGHTS
                                         + ic * KERNEL * KERNEL
                                         + kr * KERNEL
-                                        + kc] += d
-                                        * caches.chw[ic * GRID_PIXELS + nr as usize * GRID
-                                            + nc as usize];
+                                        + kc] += d * caches.chw
+                                        [ic * GRID_PIXELS + nr as usize * GRID + nc as usize];
                                 }
                             }
                         }
@@ -477,7 +476,7 @@ fn main() {
         for (w, g) in dense_b.iter_mut().zip(g_dense_b.iter()) {
             *w -= LEARNING_RATE * g;
         }
-        if epoch % 200 == 0 || epoch + 1 == EPOCHS {
+        if epoch % 50 == 0 || epoch + 1 == EPOCHS {
             let per_class: Vec<String> = (0..N_CLASSES)
                 .map(|c| format!("{c}:{}", class_correct[c]))
                 .collect();
@@ -531,12 +530,16 @@ fn main() {
                 for name in names {
                     let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
                     let small = downsample_to_32x32_rgb(&rgb, w as usize, h as usize);
-                    let got = predict_label(&small, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+                    let got =
+                        predict_label(&small, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
                     hold_total += 1;
                     if got == label as usize {
                         hold_hits += 1;
                     } else {
-                        println!("HOLDOUT MISS {dir}/{name}: want {} got {got}", label as usize);
+                        println!(
+                            "HOLDOUT MISS {dir}/{name}: want {} got {got}",
+                            label as usize
+                        );
                     }
                 }
             }
