@@ -61,6 +61,11 @@ const AUG_SEED: u64 = 0x0A09;
 const INIT_SEED: u64 = 0xC0FFEE;
 /// Pixels per CNN input channel.
 const GRID_PIXELS: usize = GRID * GRID;
+/// Focal focusing parameter: easy frames fade as (1-p)^GAMMA, so the
+/// gradient serves the struggling frames instead of the decided majority.
+/// 2.0 is the literature default; the per-item HOLDOUT losses say whether
+/// the hard six move under it.
+const GAMMA: f32 = 2.0;
 /// Weights per convolution filter (all input channels, incl. Y-coord).
 const FILTER_WEIGHTS: usize = INPUT_CHANNELS * KERNEL * KERNEL;
 
@@ -371,7 +376,14 @@ impl GradAccum {
 /// parts. Shared by `frame_stats` and `train_frame` so eval and training
 /// can never disagree on the loss.
 fn logit_loss(logits: &[f32; N_CLASSES], label: usize, max: f32, denom: f32) -> f32 {
-    -(((logits[label] - max).exp() / denom).max(1e-12).ln())
+    // Focal loss: down-weight easy frames so the gradient serves the
+    // struggling ones. Same helper feeds training and eval, so TRAIN and
+    // HOLDOUT losses stay directly comparable. Both clamps are load-bearing:
+    // float rounding can push p_target a hair above 1.0, and powf on a
+    // negative base is NaN, which would poison every weight downstream.
+    let p_target = ((logits[label] - max).exp() / denom).clamp(1e-12, 1.0);
+    let one_minus = (1.0 - p_target).max(0.0);
+    -one_minus.powf(GAMMA) * p_target.ln()
 }
 
 /// One batch frame's forward statistics: predicted class, margin over the
@@ -473,8 +485,16 @@ fn train_frame(
         acc.min_margin = acc.min_margin.min(logits[pred] - second);
     }
     let mut dlogit = [0.0f32; N_CLASSES];
+    // Exact focal gradient: dL/dz = [(1-p)^g - g*p*(1-p)^(g-1)*ln(p)] (p - y).
+    // Verified by hand against the quotient-rule expansion; easy frames
+    // (p~1) scale to ~0, hard frames keep ~full weight. Clamps mirror
+    // logit_loss: a rounded-up p_target would NaN the powf base.
+    let p_target = probs[label].clamp(1e-12, 1.0);
+    let one_minus = (1.0 - p_target).max(0.0);
+    let focal_scale =
+        one_minus.powf(GAMMA) - GAMMA * p_target * one_minus.powf(GAMMA - 1.0) * p_target.ln();
     for o in 0..N_CLASSES {
-        dlogit[o] = probs[o] - if o == label { 1.0 } else { 0.0 };
+        dlogit[o] = focal_scale * (probs[o] - if o == label { 1.0 } else { 0.0 });
         dlogit[o] /= n;
     }
     backward(streams, pool, dlogit, net, caches, acc);
