@@ -131,6 +131,22 @@ fn augment(
         let (scaled, w2, h2) = rescale(rgb, w, h, fx, fy);
         push_frame(out, format!("{name}[{fx}x{fy}]"), &scaled, w2, h2, label);
     }
+    // White-balance alterations (firmware tint variance): small independent
+    // per-channel shifts, labeled as alterations. Not brightness (that is
+    // covered above): this moves hues slightly without changing layout.
+    for (dr, dg, db) in [(6i16, -4, -4), (-4, -4, 8)] {
+        let tinted: Vec<u8> = rgb
+            .chunks_exact(3)
+            .flat_map(|p| {
+                [
+                    (p[0] as i16 + dr).clamp(0, 255) as u8,
+                    (p[1] as i16 + dg).clamp(0, 255) as u8,
+                    (p[2] as i16 + db).clamp(0, 255) as u8,
+                ]
+            })
+            .collect();
+        push_frame(out, format!("{name}[alter-tint{dr},{dg},{db}]"), &tinted, w, h, label);
+    }
 }
 
 fn flat_frame(w: usize, h: usize, c: [u8; 3]) -> Vec<u8> {
@@ -339,6 +355,32 @@ fn forward(rgb: &Frame, conv_w: &[f32], conv_b: &[f32], out: &mut Caches) -> [f3
     out.pool
 }
 
+/// Argmax class for one frame under explicit weights (shared by the final
+/// corpus verdict and the holdout report).
+fn predict_label(
+    rgb: &Frame,
+    conv_w: &[f32],
+    conv_b: &[f32],
+    dense_w: &[f32],
+    dense_b: &[f32],
+    caches: &mut Caches,
+) -> usize {
+    let pool = forward(rgb, conv_w, conv_b, caches);
+    let mut best = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for o in 0..N_CLASSES {
+        let mut s = dense_b[o];
+        for i in 0..DENSE_INPUTS {
+            s += pool[i] * dense_w[o * DENSE_INPUTS + i];
+        }
+        if s > best_val {
+            best_val = s;
+            best = o;
+        }
+    }
+    best
+}
+
 fn main() {
     let data = corpus();
     println!("corpus: {} frames", data.len());
@@ -535,27 +577,48 @@ fn main() {
     // Final verdict on the corpus (report raw, no augmentation leniency).
     let mut fails = 0;
     for (rgb, label, name) in &data {
-        let pool = forward(rgb, &conv_w, &conv_b, &mut caches);
-        let mut best = 0;
-        let mut best_val = f32::NEG_INFINITY;
-        for o in 0..N_CLASSES {
-            let mut s = dense_b[o];
-            for i in 0..DENSE_INPUTS {
-                s += pool[i] * dense_w[o * DENSE_INPUTS + i];
-            }
-            if s > best_val {
-                best_val = s;
-                best = o;
-            }
-        }
-        if best != *label {
+        if predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches) != *label {
             fails += 1;
-            println!("MISCLASSIFIED {name}: want {label} got {best}");
+            println!("MISCLASSIFIED {name}: want {label}");
         }
     }
     if fails > 0 {
         eprintln!("trainer FAILED: {fails} misclassifications, not writing weights");
         std::process::exit(1);
+    }
+    // Holdout verdict: frames the model never trained on (near-duplicates
+    // from the same runs live in tests/fixtures-holdout/). Informational:
+    // reported, never gating.
+    {
+        let root = format!("{}/tests/fixtures-holdout", env!("CARGO_MANIFEST_DIR"));
+        let mut hold_total = 0;
+        let mut hold_hits = 0;
+        if std::path::Path::new(&root).is_dir() {
+            for (dir, label) in CLASS_DIRS {
+                let dir_path = format!("{root}/{dir}");
+                if !std::path::Path::new(&dir_path).is_dir() {
+                    continue;
+                }
+                let mut names: Vec<_> = std::fs::read_dir(&dir_path)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".png"))
+                    .collect();
+                names.sort();
+                for name in names {
+                    let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
+                    let small = downsample_to_32x32_rgb(&rgb, w as usize, h as usize);
+                    let got = predict_label(&small, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+                    hold_total += 1;
+                    if got == label as usize {
+                        hold_hits += 1;
+                    } else {
+                        println!("HOLDOUT MISS {dir}/{name}: want {} got {got}", label as usize);
+                    }
+                }
+            }
+        }
+        println!("holdout: {hold_hits}/{hold_total} (eval only, never trained)");
     }
     let out_path = format!("{}/artifacts/weights.bin", env!("CARGO_MANIFEST_DIR"));
     let mut bytes = Vec::with_capacity(N_WEIGHTS * 4);

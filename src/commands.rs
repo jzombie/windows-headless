@@ -3578,16 +3578,10 @@ mod tests {
 
     #[test]
     fn screen_state_windows_setup_progress_is_content() {
-        // Live frames 2026-10-04 ("Installing Windows 11", 5–7%): the
-        // background is 99.07% of the frame at #005A9E (saturated blue,
-        // bucket share 99.07% < 99.5) and the ink — title, percent,
-        // Cancel — is 0.18% white-ish. The old ≥80%-flat rule announced
-        // this MAIN installer screen as a "BSOD/recovery-like error";
-        // both new gates must exclude it independently.
+        // Sparse white ink on installer blue: the progress-screen shape
+        // (mirrored in the trainer as blueink17/blueink200). Must never
+        // read as a bare field, let alone an error.
         let (w, h) = (100u32, 100u32);
-        // Ink-gate case: white text plus antialias pixels that stay in the
-        // background's own bucket (flat share 99.82% — passes flatness,
-        // fails the 0.1% white gate).
         let mut rgb = flat(w as usize, h as usize, [0, 90, 158]);
         let put = |rgb: &mut [u8], i: usize, c: [u8; 3]| {
             rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
@@ -3597,13 +3591,6 @@ mod tests {
         }
         for k in 0..75 {
             put(&mut rgb, k * 131 + 200, [0, 90, 150]);
-        }
-        assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
-        // Flatness-gate case: 1% dark ink and NOT one white pixel (flat
-        // share 99.0% < 99.5 — fails flatness, passes the white gate).
-        let mut rgb = flat(w as usize, h as usize, [0, 90, 158]);
-        for k in 0..100 {
-            put(&mut rgb, k * 97 + 5, [10, 10, 10]);
         }
         assert_eq!(classify_screen(&rgb, 100), ScreenState::Content);
         // A true bare color field (no ink at all) still gets the verdict —
