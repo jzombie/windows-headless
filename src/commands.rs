@@ -2743,7 +2743,7 @@ fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
         C::Dark => ScreenState::Dark,
         C::FlatField => ScreenState::FlatField,
         C::ErrorShell => ScreenState::ErrorShell,
-        C::InstallerStep | C::Lockscreen | C::FirmwareBoot => ScreenState::Content,
+        C::InstallerStep | C::Lockscreen | C::FirmwareBoot | C::OobeStep => ScreenState::Content,
         C::ErrorRecovery => ScreenState::ErrorRecovery,
         C::ErrorScreen => ScreenState::ErrorScreen,
     }
@@ -3579,6 +3579,7 @@ mod tests {
             "error-recovery" => ScreenState::ErrorRecovery,
             "error-bluescreen" => ScreenState::ErrorScreen,
             "error-modal" => ScreenState::ErrorScreen,
+            "oobe-step" => ScreenState::Content,
             // installer-step, firmware-boot, lockscreen: progress or idle,
             // never errors.
             _ => ScreenState::Content,

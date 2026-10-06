@@ -158,7 +158,7 @@ fn augment(
 /// Holdout convention: files ending in `.holdout.png` train nothing and are
 /// evaluated only (unseen layouts, synthetic-to-real transfer). The class
 /// directory still supplies the expected label, so no list is maintained.
-const CLASS_DIRS: [(&str, ScreenClass); 9] = [
+const CLASS_DIRS: [(&str, ScreenClass); 10] = [
     ("dark", ScreenClass::Dark),
     ("flat-field", ScreenClass::FlatField),
     ("error-shell", ScreenClass::ErrorShell),
@@ -167,6 +167,7 @@ const CLASS_DIRS: [(&str, ScreenClass); 9] = [
     ("error-modal", ScreenClass::ErrorScreen),
     ("lockscreen", ScreenClass::Lockscreen),
     ("firmware-boot", ScreenClass::FirmwareBoot),
+    ("oobe-step", ScreenClass::OobeStep),
     ("error-bluescreen", ScreenClass::ErrorScreen),
 ];
 

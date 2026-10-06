@@ -49,7 +49,7 @@ pub const N_WEIGHTS: usize =
     N_FILTERS * 3 * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_INPUTS + N_CLASSES;
 
 /// Number of screen classes (dense outputs).
-pub const N_CLASSES: usize = 8;
+pub const N_CLASSES: usize = 9;
 
 /// Decoded weights (f32), parsed once on first use.
 static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
@@ -83,6 +83,9 @@ pub enum ScreenClass {
     /// One class on purpose — the operational response is identical, and
     /// neither has enough captures to stand alone.
     ErrorScreen,
+    /// First-boot OOBE transitionals ("Just a moment", logo splash,
+    /// "Welcome"): post-install, pre-logon. Progress, never errors.
+    OobeStep,
     /// Anything else: lock screen, gradients. (No desktop ever appears in
     /// this flow, so the lock screen stands in as the class name for the
     /// remaining miscellaneous bucket.)
@@ -224,7 +227,8 @@ pub fn predict_32x32_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
         4 => ScreenClass::ErrorRecovery,
         5 => ScreenClass::ErrorScreen,
         6 => ScreenClass::Lockscreen,
-        _ => ScreenClass::FirmwareBoot,
+        7 => ScreenClass::FirmwareBoot,
+        _ => ScreenClass::OobeStep,
     }
 }
 
