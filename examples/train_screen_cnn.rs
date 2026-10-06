@@ -37,8 +37,10 @@ const EPOCHS: usize = 10_000;
 const LEARNING_RATE: f32 = 0.004;
 /// Holdout evals without improvement before stopping. If the corpus holds an
 /// unlearnable pair, a fixed-accuracy gate never fires; patience
-/// banks the best model instead of grinding plateaus.
-const PATIENCE_EPOCHS: usize = 20;
+/// banks the best model instead of grinding plateaus. Generous on purpose:
+/// whole classes (dark, flat-field) pop after epoch 100, and cutting the
+/// run at dozens of epochs executes it before the easy wins land.
+const PATIENCE_EPOCHS: usize = 200;
 /// Required logit gap (winner minus runner-up) on every training frame.
 const REQUIRED_MARGIN: f32 = 2.0;
 /// Pixels per CNN input channel.
