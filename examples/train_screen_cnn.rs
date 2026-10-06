@@ -502,9 +502,10 @@ fn main() {
     // Final verdict on the corpus (report raw, no augmentation leniency).
     let mut fails = 0;
     for (rgb, label, name) in &data {
-        if predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches) != *label {
+        let got = predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+        if got != *label {
             fails += 1;
-            println!("MISCLASSIFIED {name}: want {label}");
+            println!("MISCLASSIFIED {name}: want {label} got {got}");
         }
     }
     // Weights always land: a human decides merge, not the gate. The gate
