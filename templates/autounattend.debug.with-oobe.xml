@@ -184,39 +184,4 @@
       </RunSynchronous>
     </component>
   </settings>
-  <settings pass="oobeSystem">
-    <component name="Microsoft-Windows-International-Core" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
-      <InputLocale>{locale}</InputLocale>
-      <SystemLocale>{locale}</SystemLocale>
-      <UILanguage>{locale}</UILanguage>
-      <UserLocale>{locale}</UserLocale>
-    </component>
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
-      <UserAccounts>
-        <LocalAccounts>
-          <LocalAccount wcm:action="add">
-            <Name>{user}</Name>
-            <Group>Administrators</Group>
-            <DisplayName>Headless Admin</DisplayName>
-            <Password>
-              <Value>{pass}</Value>
-              <PlainText>true</PlainText>
-            </Password>
-          </LocalAccount>
-        </LocalAccounts>
-      </UserAccounts>
-      <OOBE>
-        <HideEULAPage>true</HideEULAPage>
-        <HideLocalAccountScreen>true</HideLocalAccountScreen>
-        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
-        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
-        <NetworkLocation>Work</NetworkLocation>
-        <ProtectYourPC>3</ProtectYourPC>
-        <SkipMachineOOBE>true</SkipMachineOOBE>
-        <SkipUserOOBE>true</SkipUserOOBE>
-      </OOBE>{auto_logon_xml}
-      <TimeZone>{tz}</TimeZone>
-    </component>
-  </settings>
 </unattend>
