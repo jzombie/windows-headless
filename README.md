@@ -5,10 +5,11 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 **STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. macOS users: see [Gatekeeper requirement](#macos-gatekeeper-requirement).**
 
 > Prerequisite: A recent Rust toolchain (`cargo`, 1.85+; any stable via
-> [rustup](https://rustup.rs)). Everything else (QEMU, wimlib, virtio
-> drivers, OpenSSH) is fetched automatically, so a vanilla host with
-> just Rust is enough. No prebuilt binaries yet: every command below
-> builds from source first.
+> [rustup](https://rustup.rs)). Everything else ([QEMU, wimlib, virtio
+> drivers](https://github.com/jzombie/lab-qemu-portable/releases),
+> [OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases)) is fetched
+> automatically, so a vanilla host with just Rust is enough. No prebuilt
+> binaries yet: every command below builds from source first.
 >
 > **Highly recommended:** Run your first install with all defaults (no overridden
 > `--memory`, `--cpus`, `--username`, `--password`, etc.). A green
@@ -49,8 +50,9 @@ to content (spinner/percent).
 Firmware reboots are counted from the serial log (OVMF `BdsDxe: starting`
 handoffs): `guest rebooted (firmware boot #N seen on serial)` lines print
 while waiting for SSH, and failure reports carry `guest boots seen`.
-Installer screenshots that catch a modal failure dialog print a
-`WARNING:` line as soon as it appears.
+Installer screenshots that catch a modal failure dialog on two screenshots in
+a row print a single `WARNING:` line (one per episode, not every frame, since
+slow firmware screens can trip the red-icon heuristic once).
 
 ## Where things live
 
@@ -65,8 +67,11 @@ user cache dir. Layout:
   wimlib-portable/<tag>/... # wimlib-imagex used to build installer media
   iso/                      # downloaded virtio-win.iso + OpenSSH zips (+ .sha256)
   media/winusb.dmg          # built installer image (+ .json provenance sidecar)
-  vms/win11/                # the VM: disk.qcow2, VARS.fd, qemu.pid,
-                            # install.log (QEMU output), screenshots/*.png
+  vms/win11/                # the VM: disk.qcow2 (+ .golden sidecar),
+                            # VARS.fd, qemu.pid, install.log (QEMU output),
+                            # screenshots/*.png; live snapshot files when saved:
+                            # golden-live.state, VARS.fd.golden-live,
+                            # disk-live-overlay.qcow2, disk.qcow2.golden-live
 ```
 
 Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
@@ -87,34 +92,70 @@ Everything else is inbox Windows:
   installer screenshots). No virtio-gpu, QXL, or vendor GPU driver: expect
   software rendering only.
 
+> There is no automated driver upgrade path. To pick up newer drivers, rebuild
+the installer and reinstall from scratch with the latest media.
+
 Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
 
 > Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
 
 ## Snapshots
 
-Every boot starts clean: `build` and `install` snapshot the landed state
-once the shell is proven, and `run` rewinds to it before booting, so a
-dirty stop (Ctrl-C kill) can never park the next boot at Recovery. Take a
-new snapshot any time with `snapshot` on a running guest (proves the
-shell, halts cleanly, snapshots, stops).
+Golden rewind is the default. The first golden snapshot is automatic: `build`
+(and likewise `run --win-iso`, which installs when the disk is missing) proves
+the shell, then saves that disk state. Every `run` afterward rewinds to it
+first, so a dirty stop (Ctrl-C) can't leave the next boot in Recovery.
 
-`--live` (experimental) trades the rewind for a migrated RAM snapshot:
-`snapshot --live` pivots an overlay and migrates guest state to a file
-with the guest still running; `run --live` streams it back with no boot.
-Which wins depends on hardware: on Apple Silicon (fast CPU, external
-USB drive holding the cache) the plain rewind takes **~19 s** spawn-to-SSH
-while live resume takes **~23 s** (the 2-3 GB state stream plus Windows'
-post-resume settle outweigh the skipped boot), but on older, slower hosts
-live resume is much faster. Skipping a slow firmware + Windows boot beats
-streaming gigabytes. Time both on your own hardware (`run` vs `run --live`)
-and use what wins.
+```sh
+# Terminal 1: `run` blocks, so boot and leave it running.
+cargo run -- run
+```
 
-Live costs more regardless: multi-GB state files beside the disk, a brief
-guest stun during the save, and more moving parts (overlay, VARS backup,
-migration stream. Any missing piece refuses loudly rather than booting
-a half-state). Default to the rewind unless you have timed live faster
-on your own hardware.
+```sh
+# Terminal 2: re-take golden from the running guest (proves shell,
+# shuts down cleanly, snapshots). The next `run` resumes the new state.
+cargo run -- snapshot
+```
+
+Live resume (experimental) also saves RAM, so `run --live` restores the
+running guest with no boot.
+
+```sh
+# Terminal 1: boot and leave it running.
+cargo run -- run
+```
+
+```sh
+# Terminal 2: save live state (brief guest stun; guest keeps running).
+cargo run -- snapshot --live
+```
+
+```sh
+# Stop the guest first (Ctrl-C terminal 1, or `stop`), then resume with no boot.
+# A missing piece (overlay, VARS backup, migration stream) fails loudly
+# rather than booting a half-state.
+cargo run -- run --live
+```
+
+Golden and live coexist (separate sidecars) and `run` selects by flag, so you
+can alternate between them. Plain `run` rewinds to golden and drops any
+orphaned live overlay out loud; `run --live` skips the rewind and requires
+every live piece or refuses. A new install voids both. Re-taking either
+overwrites that type only; run one `snapshot` at a time (the [QMP](https://www.qemu.org/docs/master/interop/qmp-spec.html) control
+channel to the running VM allows a single client).
+
+Storage: golden is a single named snapshot inside `disk.qcow2` (re-taking it
+replaces it, so nothing accumulates). Live state is separate files beside the
+disk that are consumed or dropped on resume, never merged. See
+[Where things live](#where-things-live) for the exact filenames.
+
+Rewind is CPU-bound (full firmware + Windows boot); live is I/O-bound (2–3 GB
+stream + settle). On Apple Silicon with the cache on external USB, rewind wins:
+~19s spawn-to-SSH vs ~23s live, since the boot is fast and the USB stream is
+slow. On an older Intel i7 with an internal SSD the balance flips: the boot is
+much slower while the 2–3 GB stream off SSD is fast, so live wins. Live also
+costs multi-GB sidecars. Time `run` vs `run --live` on your hardware; default
+to the rewind unless live is faster.
 
 ## Tested
 
@@ -149,9 +190,9 @@ The provisioning pipeline downloads third-party binaries. Hash verification is e
 
 | Artifact | Source | Hash Enforced? | Security Guarantee |
 |---|---|---|---|
-| **`qemu-portable`** & **`wimlib-portable`** | Auto-download ([qemu](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.1-48) · [wimlib](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
-| **`virtio-win.iso`** | Auto-download ([drivers](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20260925)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
-| **OpenSSH Archive** | Auto-download ([releases](https://github.com/PowerShell/Win32-OpenSSH/releases/tag/10.0.0.0p2-Preview)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **`qemu-portable`** & **`wimlib-portable`** | Auto-download ([releases](https://github.com/jzombie/lab-qemu-portable/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **`virtio-win.iso`** | Auto-download ([releases](https://github.com/jzombie/lab-qemu-portable/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
+| **OpenSSH Archive** | Auto-download ([releases](https://github.com/PowerShell/Win32-OpenSSH/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
 | **Windows 11 ISO** | User-supplied | **NO (Opt-in)** | Microsoft URLs rotate. Validated via TLS and ISO9660 magic bytes only, unless pinned explicitly via `--win-iso-sha256`. |
 
 *Security Note:* For all auto-downloaded components, the trust root is the source code (`src/pins.rs`). The tool will immediately abort if a downloaded payload does not match its hardcoded hash. If you choose to override default downloads using custom URLs (such as `--virtio-iso-url`), those payloads rely solely on TLS unless you explicitly provide their matching hash flags.
