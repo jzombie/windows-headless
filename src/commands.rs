@@ -2687,8 +2687,9 @@ fn screenshots_dir(vm_dir: &Path) -> PathBuf {
 
 /// Coarse verdict on what the guest screen shows — the one-line answer
 /// boot failures print so they are readable without VNC. Deliberately
-/// heuristic (no OCR): four buckets — nothing on screen, a bare color
-/// field with no UI, a modal failure dialog (red error icon), and
+/// heuristic (no OCR): five buckets — nothing on screen, a bare color
+/// field with no UI, a modal failure dialog (red error icon), the UEFI
+/// shell prompt (yellow text: no bootable device), and
 /// anything else (desktop, OVMF text, gradients, installer progress).
 /// The classifier never claims "error" on color shape alone: the main
 /// Windows Setup screen is itself a flat saturated blue, and a false
@@ -2713,6 +2714,10 @@ enum ScreenState {
     /// OOBE failure dialog that sits there until someone clicks OK — the
     /// failure mode where screenshots keep flowing but nothing progresses.
     ErrorDialog,
+    /// The UEFI shell prompt is up (yellow shell text on black): no
+    /// bootable device was found, so this boot is going nowhere. A shell
+    /// is never routine progress — it is the boot having failed.
+    UefiShell,
     /// Anything else.
     Content,
 }
@@ -2723,6 +2728,7 @@ impl std::fmt::Display for ScreenState {
             ScreenState::Dark => "screen is black (no visible output)",
             ScreenState::FlatField => "screen shows a solid color field (no UI visible)",
             ScreenState::ErrorDialog => "screen shows a MODAL ERROR DIALOG (failure dialog up)",
+            ScreenState::UefiShell => "screen shows the UEFI SHELL (no bootable device)",
             ScreenState::Content => "screen shows content",
         })
     }
@@ -2824,6 +2830,21 @@ fn classify_screen(rgb: &[u8]) -> ScreenState {
     if red >= 50 && best_run >= 6 {
         return ScreenState::ErrorDialog;
     }
+    // UEFI shell prompt: yellow shell text on black ("Mapping table",
+    // "BLK0:", "Shell>"). Same quantitative looseness as the red gate
+    // (>= 50 sampled yellow pixels); separation is wide in practice
+    // (observed: shell 239, next-highest frame 13 from the Microsoft logo
+    // squares), so no blob-shape requirement on top.
+    let yellow = rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .step_by(4)
+        .filter(|px| px[0] >= 170 && px[1] >= 170 && px[2] <= 100)
+        .count();
+    if yellow >= 50 {
+        return ScreenState::UefiShell;
+    }
     ScreenState::Content
 }
 
@@ -2887,9 +2908,10 @@ fn scene_cut(prev: &[u8], cur: &[u8]) -> bool {
 /// previous one — progress/firmware screens can look flat but animate
 /// (spinner, percent), so they demote to plain content. A genuinely dead
 /// frame doesn't move and keeps its verdict; [`ScreenState::ErrorDialog`]
-/// is never demoted (a spinning loader under a modal dialog still means
-/// the dialog is up). First frame has no predecessor and is reported as
-/// classified.
+/// and [`ScreenState::UefiShell`] are never demoted (a spinning loader
+/// under a modal dialog still means the dialog is up, and a shell with a
+/// blinking cursor is still a shell). First frame has no predecessor and
+/// is reported as classified.
 fn effective_state(raw: ScreenState, moved: bool) -> ScreenState {
     match raw {
         ScreenState::Dark | ScreenState::FlatField if moved => ScreenState::Content,
@@ -3115,7 +3137,7 @@ fn spawn_screenshots(
         // then on cadence. Numbered, basename-only (the dir was announced
         // once above), so the log reads as progress toward the SSH answer.
         let mut n = 0u64;
-        // Consecutive ErrorDialog frames: a single-frame red verdict can be a
+        // Consecutive failure frames: a single-frame red verdict can be a
         // slow firmware screen tripping the icon heuristic (observed: repeated
         // WARNINGs on a BIOS screen inside slow nested virt), so only a
         // verdict that survives two screenshots in a row earns one WARNING.
@@ -3123,15 +3145,20 @@ fn spawn_screenshots(
         // every frame.
         let mut error_streak = 0u32;
         let mut announce = |n: u64, p: PathBuf, s: ScreenState| {
-            if matches!(s, ScreenState::ErrorDialog) {
+            if matches!(
+                s,
+                ScreenState::ErrorDialog | ScreenState::UefiShell
+            ) {
                 error_streak += 1;
             } else {
                 error_streak = 0;
             }
-            // A modal failure dialog must not read as routine "content":
-            // flag it loudly so a 3-hour no-progress stall is obvious in
-            // the output the moment the dialog is confirmed.
-            let warn = if matches!(s, ScreenState::ErrorDialog) && error_streak == 2 {
+            // A modal failure dialog or a shell prompt must not read as
+            // routine "content": flag it loudly so a 3-hour no-progress
+            // stall is obvious in the output the moment it is confirmed.
+            let warn = if matches!(s, ScreenState::ErrorDialog | ScreenState::UefiShell)
+                && error_streak == 2
+            {
                 "WARNING: "
             } else {
                 ""
@@ -3872,6 +3899,10 @@ mod tests {
             classify_screen(&fixture_rgb("lock-screen.png")),
             ScreenState::Content
         );
+        assert_eq!(
+            classify_screen(&fixture_rgb("uefi-shell.png")),
+            ScreenState::UefiShell
+        );
     }
 
     /// Test-only PNG decode (our [`write_png`] emits palette PNGs for flat
@@ -3978,6 +4009,10 @@ mod tests {
         assert_eq!(
             effective_state(ScreenState::ErrorDialog, true),
             ScreenState::ErrorDialog
+        );
+        assert_eq!(
+            effective_state(ScreenState::UefiShell, true),
+            ScreenState::UefiShell
         );
         // Sub-50-sample jitter and a resolution change behave as documented.
         let mut c = a.clone();
