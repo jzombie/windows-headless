@@ -418,7 +418,8 @@ fn main() {
             // harder so the majority cannot drown them.
             let mut dlogit = [0.0f32; N_CLASSES];
             for o in 0..N_CLASSES {
-                dlogit[o] = class_weights[*label] * (probs[o] - if o == *label { 1.0 } else { 0.0 });
+                dlogit[o] =
+                    class_weights[*label] * (probs[o] - if o == *label { 1.0 } else { 0.0 });
                 dlogit[o] /= n;
             }
             // Dense grads + pool error.
@@ -570,8 +571,7 @@ fn main() {
                     } else {
                         println!(
                             "HOLDOUT MISS {dir}/{name}: want {label:?}({}) got {:?}({got})",
-                            label as usize,
-                            BY_INDEX[got]
+                            label as usize, BY_INDEX[got]
                         );
                     }
                 }
