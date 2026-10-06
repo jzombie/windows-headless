@@ -24,8 +24,8 @@
 //! a bad corpus or recipe fails loudly instead of baking silent weights.
 
 use windows_headless::screen_cnn::{
-    DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL, POOL_FEATURES, POOLED,
-    ScreenClass, downsample_to_64x64_rgb, load_rgb_8bit,
+    BY_INDEX, DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL, POOL_FEATURES,
+    POOLED, ScreenClass, downsample_to_64x64_rgb, load_rgb_8bit,
 };
 
 const EPOCHS: usize = 10_000;
@@ -339,8 +339,24 @@ fn main() {
         assert!(*count > 0, "class {c} has no training frames");
         class_weights[c] = n / (N_CLASSES as f32 * *count as f32);
     }
-    println!("class counts: {class_counts:?}");
-    println!("class weights: {class_weights:?}");
+    println!(
+        "class counts: {}",
+        BY_INDEX
+            .iter()
+            .enumerate()
+            .map(|(c, v)| format!("{v:?}:{}", class_counts[c]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "class weights: {}",
+        BY_INDEX
+            .iter()
+            .enumerate()
+            .map(|(c, v)| format!("{v:?}:{:.2}", class_weights[c]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let mut caches = Caches {
         chw: [0.0; 3 * GRID * GRID],
         conv: [0.0; N_FILTERS * GRID * GRID],
@@ -482,8 +498,10 @@ fn main() {
             *w -= LEARNING_RATE * g;
         }
         if epoch % 10 == 0 || epoch + 1 == EPOCHS {
-            let per_class: Vec<String> = (0..N_CLASSES)
-                .map(|c| format!("{c}:{}", class_correct[c]))
+            let per_class: Vec<String> = BY_INDEX
+                .iter()
+                .enumerate()
+                .map(|(c, v)| format!("{v:?}:{}", class_correct[c]))
                 .collect();
             println!(
                 "epoch {epoch}: loss {:.4} acc {correct}/{} min_margin {:.2} per_class [{}]",
@@ -505,7 +523,10 @@ fn main() {
         let got = predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
         if got != *label {
             fails += 1;
-            println!("MISCLASSIFIED {name}: want {label} got {got}");
+            println!(
+                "MISCLASSIFIED {name}: want {:?}({label}) got {:?}({got})",
+                BY_INDEX[*label], BY_INDEX[got]
+            );
         }
     }
     // Weights always land: a human decides merge, not the gate. The gate
@@ -546,8 +567,9 @@ fn main() {
                         hold_hits += 1;
                     } else {
                         println!(
-                            "HOLDOUT MISS {dir}/{name}: want {} got {got}",
-                            label as usize
+                            "HOLDOUT MISS {dir}/{name}: want {label:?}({}) got {:?}({got})",
+                            label as usize,
+                            BY_INDEX[got]
                         );
                     }
                 }

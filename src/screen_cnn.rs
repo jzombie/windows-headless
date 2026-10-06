@@ -102,7 +102,9 @@ pub enum ScreenClass {
 /// Logit index to class. The single source of truth for index order:
 /// [`predict_64x64_rgb`] returns through this table, and the roundtrip
 /// test below fails the build if the enum order ever drifts from it again.
-const BY_INDEX: [ScreenClass; N_CLASSES] = [
+/// Public so the trainer's stats lines print variant names (`{:?}`), not
+/// bare indices no one can cross-correlate mid-run.
+pub const BY_INDEX: [ScreenClass; N_CLASSES] = [
     ScreenClass::Dark,
     ScreenClass::FlatField,
     ScreenClass::ErrorShell,
