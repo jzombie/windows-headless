@@ -659,7 +659,7 @@ fn main() {
         // One labeled line per epoch: TRAIN is the sampled batch, BASE
         // the raw captures, HOLDOUT the unseen set patience judges.
         println!(
-            "epoch {epoch}: HOLDOUT {hold_hits}/{hold_total} | BASE {base_correct}/{} margin {base_margin:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS}",
+            "epoch {epoch}: HOLDOUT {hold_hits}/{hold_total} | BASE {base_correct}/{} margin {base_margin:.2} | STALE {stale_evals}/{PATIENCE_EPOCHS} | BEST {best_hold}/{best_hold_total}@e{best_epoch}",
             files.len()
         );
         if base_correct == files.len() && base_margin >= REQUIRED_MARGIN {
