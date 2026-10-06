@@ -1,8 +1,8 @@
 //! Micro-CNN screen classifier: a compiled static forward-pass engine with
-//! zero dependencies (`std` only). Architecture: 64x64 RGB in, Conv2D
-//! (8 filters 3x3, pad 1) + ReLU, MaxPool 8x8, dense + argmax over nine
-//! screen classes. About 4,841 parameters (~19 KB), a few milliseconds per
-//! frame in release.
+//! zero dependencies (`std` only). Architecture: 128x128 RGB in, Conv2D
+//! (16 filters 3x3, pad 1) + ReLU, MaxPool 8x8, dense + argmax over nine
+//! screen classes. About 37,321 parameters (~149 KB), tens of milliseconds
+//! per frame in release.
 //!
 //! The CNN is the whole classifier: every frame goes through it, no pixel
 //! gates in front. Class count and label order are fixed by [`ScreenClass`]
@@ -22,16 +22,16 @@ use std::sync::LazyLock;
 
 /// Input frame edge length: every screendump is resampled to this square
 /// before inference, so any source resolution feeds the same descriptor.
-pub const GRID: usize = 64;
-/// Convolution filters in the single conv layer. Eight leaves room for
+pub const GRID: usize = 128;
+/// Convolution filters in the single conv layer. Sixteen leaves room for
 /// near-duplicate layouts (installer progress vs requirements block) to
 /// own separate filters: fewer than the frames could memorize.
-pub const N_FILTERS: usize = 8;
+pub const N_FILTERS: usize = 16;
 /// Convolution kernel edge length (square, odd, stride 1, pad 1).
 pub const KERNEL: usize = 3;
 /// Max-pool window edge length (square, stride equals window). Eight
-/// collapses each filter to an 8x8 thumbnail: position within fine cells
-/// survives, exact pixels do not.
+/// collapses each filter to a GRID/8 thumbnail: position within fine
+/// cells survives, exact pixels do not.
 pub const POOL: usize = 8;
 /// Pooled feature edge length per filter (`GRID / POOL`).
 pub const POOLED: usize = GRID / POOL;
@@ -100,7 +100,7 @@ pub enum ScreenClass {
 }
 
 /// Logit index to class. The single source of truth for index order:
-/// [`predict_64x64_rgb`] returns through this table, and the roundtrip
+/// [`predict_grid_rgb`] returns through this table, and the roundtrip
 /// test below fails the build if the enum order ever drifts from it again.
 /// Public so the trainer's stats lines print variant names (`{:?}`), not
 /// bare indices no one can cross-correlate mid-run.
@@ -122,7 +122,7 @@ pub const BY_INDEX: [ScreenClass; N_CLASSES] = [
 /// brightest source pixel in its cell (per channel) rather than the nearest
 /// neighbor: thin white text and spinner arcs on black survive the shrink
 /// instead of sampling out of existence.
-pub fn downsample_to_64x64_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 * GRID * GRID] {
+pub fn downsample_to_grid_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 * GRID * GRID] {
     assert_eq!(src.len(), src_w * src_h * 3, "downsample size mismatch");
     let mut out = [0u8; 3 * GRID * GRID];
     for y in 0..GRID {
@@ -151,7 +151,7 @@ pub fn downsample_to_64x64_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3
 
 /// Micro-CNN forward pass over a GRID x GRID RGB frame. Pure function of the
 /// input and the baked weights: deterministic bit-for-bit.
-pub fn predict_64x64_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
+pub fn predict_grid_rgb(rgb: &[u8; 3 * GRID * GRID]) -> ScreenClass {
     const GRID2: usize = GRID * GRID;
     const KERNEL2: usize = KERNEL * KERNEL;
     let w = &WEIGHTS[..];
@@ -246,8 +246,8 @@ pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
         width as usize * height * 3,
         "predict_full size mismatch"
     );
-    let small = downsample_to_64x64_rgb(rgb, width as usize, height);
-    predict_64x64_rgb(&small)
+    let small = downsample_to_grid_rgb(rgb, width as usize, height);
+    predict_grid_rgb(&small)
 }
 
 /// Load an 8-bit PNG from disk and expand any color type to raw RGB.
@@ -307,14 +307,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn downsample_keeps_corners_at_64x64_grid() {
-        // 128x128 with distinct quadrants: brightest-pixel reduction must land
-        // each quadrant's color in the matching output corner.
-        let mut src = vec![0u8; 128 * 128 * 3];
-        for y in 0..128 {
-            for x in 0..128 {
-                let i = (y * 128 + x) * 3;
-                let c = match (y >= 64, x >= 64) {
+    fn downsample_keeps_corners_at_grid() {
+        // 2*GRID with distinct quadrants: brightest-pixel reduction must
+        // land each quadrant's color in the matching output corner.
+        const SRC: usize = 2 * GRID;
+        let mut src = vec![0u8; SRC * SRC * 3];
+        for y in 0..SRC {
+            for x in 0..SRC {
+                let i = (y * SRC + x) * 3;
+                let c = match (y >= GRID, x >= GRID) {
                     (false, false) => [200, 0, 0],
                     (false, true) => [0, 200, 0],
                     (true, false) => [0, 0, 200],
@@ -323,15 +324,15 @@ mod tests {
                 src[i..i + 3].copy_from_slice(&c);
             }
         }
-        let small = downsample_to_64x64_rgb(&src, 128, 128);
+        let small = downsample_to_grid_rgb(&src, SRC, SRC);
         let at = |x: usize, y: usize| {
-            let i = (y * 64 + x) * 3;
+            let i = (y * GRID + x) * 3;
             [small[i], small[i + 1], small[i + 2]]
         };
         assert_eq!(at(0, 0), [200, 0, 0]);
-        assert_eq!(at(63, 0), [0, 200, 0]);
-        assert_eq!(at(0, 63), [0, 0, 200]);
-        assert_eq!(at(63, 63), [200, 200, 200]);
+        assert_eq!(at(GRID - 1, 0), [0, 200, 0]);
+        assert_eq!(at(0, GRID - 1), [0, 0, 200]);
+        assert_eq!(at(GRID - 1, GRID - 1), [200, 200, 200]);
     }
 
     #[test]

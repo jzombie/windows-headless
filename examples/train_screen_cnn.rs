@@ -25,15 +25,15 @@
 
 use windows_headless::screen_cnn::{
     BY_INDEX, DENSE_INPUTS, GRID, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL, POOL_FEATURES,
-    POOLED, ScreenClass, downsample_to_64x64_rgb, load_rgb_8bit,
+    POOLED, ScreenClass, downsample_to_grid_rgb, load_rgb_8bit,
 };
 
 const EPOCHS: usize = 10_000;
-/// Full-batch gradient descent step size. Scales with 1/DENSE_INPUTS: 512
-/// pooled features move together per step at 8 filters (was 64 features
-/// with 0.5 at GRID 32 / 4 filters), so the rate drops to hold the output
-/// swing equal.
-const LEARNING_RATE: f32 = 0.06;
+/// Full-batch gradient descent step size. Scales with 1/DENSE_INPUTS:
+/// 4096 pooled features move together per step at GRID 128 / 16 filters
+/// (was 64 features with 0.5 at GRID 32 / 4 filters), so the rate drops
+/// to hold the output swing equal.
+const LEARNING_RATE: f32 = 0.008;
 /// Required logit gap (winner minus runner-up) on every training frame.
 const REQUIRED_MARGIN: f32 = 2.0;
 /// Pixels per CNN input channel.
@@ -67,91 +67,45 @@ impl Lcg {
 // ---------------------------------------------------------------------------
 
 type Frame = [u8; 3 * GRID * GRID];
+/// One labeled base capture: downsampled frame, class index, source name.
+/// Bases are the sampling pool, never trained on directly: every training
+/// frame is a fresh stochastic view drawn per epoch.
+type Base = (Frame, usize, String);
+/// Corpus: per-file base captures plus the same frames grouped by class
+/// for balanced per-epoch sampling.
+type Corpus = (Vec<Base>, [Vec<Frame>; N_CLASSES]);
 
-fn push_frame(
-    out: &mut Vec<(Frame, usize, String)>,
-    name: String,
-    rgb: &[u8],
-    w: usize,
-    h: usize,
-    label: ScreenClass,
-) {
-    out.push((downsample_to_64x64_rgb(rgb, w, h), label as usize, name));
-}
-
-/// Nearest-neighbor rescale of full-resolution RGB by fractional factors.
-fn rescale(rgb: &[u8], w: usize, h: usize, fx: f32, fy: f32) -> (Vec<u8>, usize, usize) {
-    let w2 = ((w as f32) * fx).round().max(1.0) as usize;
-    let h2 = ((h as f32) * fy).round().max(1.0) as usize;
-    let mut out = vec![0u8; w2 * h2 * 3];
-    for y in 0..h2 {
-        for x in 0..w2 {
-            let sx = ((x as f32) / fx) as usize;
-            let sy = ((y as f32) / fy) as usize;
-            let s = (sy.min(h - 1) * w + sx.min(w - 1)) * 3;
-            let d = (y * w2 + x) * 3;
-            out[d..d + 3].copy_from_slice(&rgb[s..s + 3]);
+/// Fresh stochastic view of a real capture, drawn at GRID resolution:
+/// random horizontal flip, continuous brightness and tint, and a small
+/// edge-clamped rescale (DPI/aspect drift). Same alteration family as the
+/// old fixed set, but redrawn every epoch so no epoch ever repeats. No
+/// new shapes ever: every view derives from a real capture.
+fn stochastic_view(rng: &mut Lcg, base: &Frame) -> Frame {
+    let flip = rng.next_unit() < 0.5;
+    let bright = 0.85 + rng.next_unit() as f32 * 0.30;
+    let shifts = [
+        (rng.next_unit() * 16.0 - 8.0) as f32,
+        (rng.next_unit() * 16.0 - 8.0) as f32,
+        (rng.next_unit() * 16.0 - 8.0) as f32,
+    ];
+    let fx = 0.85 + rng.next_unit() as f32 * 0.30;
+    let fy = 0.85 + rng.next_unit() as f32 * 0.30;
+    let mut out = [0u8; 3 * GRID * GRID];
+    for y in 0..GRID {
+        // Edge-clamped nearest neighbor: zoom-outs reuse edge pixels
+        // rather than inventing borders. Flip reads the mirrored column.
+        let sy = ((y as f64 / f64::from(fy)) as usize).min(GRID - 1);
+        for x in 0..GRID {
+            let sx = ((x as f64 / f64::from(fx)) as usize).min(GRID - 1);
+            let sx = if flip { GRID - 1 - sx } else { sx };
+            let s = (sy * GRID + sx) * 3;
+            let d = (y * GRID + x) * 3;
+            for c in 0..3 {
+                out[d + c] = (f32::from(base[s + c]) * bright + shifts[c]).clamp(0.0, 255.0) as u8;
+            }
         }
     }
-    (out, w2, h2)
-}
-
-fn augment(
-    out: &mut Vec<(Frame, usize, String)>,
-    name: String,
-    rgb: &[u8],
-    w: usize,
-    h: usize,
-    label: ScreenClass,
-) {
-    // Original, horizontal flip, dimmer, brighter, and non-uniform rescales
-    // (DPI/aspect drift of +-15%).
-    push_frame(out, name.clone(), rgb, w, h, label);
-    let mut flip = vec![0u8; rgb.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let s = (y * w + x) * 3;
-            let d = (y * w + (w - 1 - x)) * 3;
-            flip[d..d + 3].copy_from_slice(&rgb[s..s + 3]);
-        }
-    }
-    push_frame(out, format!("{name}[flip]"), &flip, w, h, label);
-    for factor in [0.85f32, 1.15] {
-        let shifted: Vec<u8> = rgb
-            .iter()
-            .map(|&v| ((v as f32) * factor).clamp(0.0, 255.0) as u8)
-            .collect();
-        push_frame(out, format!("{name}[x{factor}]"), &shifted, w, h, label);
-    }
-    for (fx, fy) in [(0.85f32, 1.0f32), (1.0, 0.85), (1.15, 1.0), (1.0, 1.15)] {
-        let (scaled, w2, h2) = rescale(rgb, w, h, fx, fy);
-        push_frame(out, format!("{name}[{fx}x{fy}]"), &scaled, w2, h2, label);
-    }
-    // White-balance alterations (firmware tint variance): small independent
-    // per-channel shifts, labeled as alterations. Not brightness (that is
-    // covered above): this moves hues slightly without changing layout.
-    for (dr, dg, db) in [(6i16, -4, -4), (-4, -4, 8)] {
-        let tinted: Vec<u8> = rgb
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .flat_map(|p| {
-                [
-                    (p[0] as i16 + dr).clamp(0, 255) as u8,
-                    (p[1] as i16 + dg).clamp(0, 255) as u8,
-                    (p[2] as i16 + db).clamp(0, 255) as u8,
-                ]
-            })
-            .collect();
-        push_frame(
-            out,
-            format!("{name}[alter-tint{dr},{dg},{db}]"),
-            &tinted,
-            w,
-            h,
-            label,
-        );
-    }
+    out
 }
 
 /// Directory name under each Windows-version directory in
@@ -176,8 +130,12 @@ const CLASS_DIRS: [(&str, ScreenClass); 10] = [
     ("error-bluescreen", ScreenClass::ErrorScreen),
 ];
 
-fn corpus() -> Vec<(Frame, usize, String)> {
-    let mut out = Vec::new();
+fn corpus() -> Corpus {
+    // One base frame per capture, plus the same frames grouped by class
+    // for balanced sampling. Bases are never trained on directly: every
+    // training frame is a fresh stochastic view drawn per epoch.
+    let mut files: Vec<Base> = Vec::new();
+    let mut bases: [Vec<Frame>; N_CLASSES] = Default::default();
     let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
     // Two levels: Windows version (build + language + edition, unattributed,
     // keeps captures identifiable over time) then class directory (the label).
@@ -200,25 +158,20 @@ fn corpus() -> Vec<(Frame, usize, String)> {
             names.sort();
             for name in names {
                 let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
-                augment(
-                    &mut out,
-                    format!("{version}/{dir}/{name}"),
-                    &rgb,
-                    w as usize,
-                    h as usize,
-                    label,
-                );
+                let base = downsample_to_grid_rgb(&rgb, w as usize, h as usize);
+                bases[label as usize].push(base);
+                files.push((base, label as usize, format!("{version}/{dir}/{name}")));
             }
         }
     }
-    // No synthetic frames: every training sample is a real capture (plus
-    // mechanical alterations: flip, brightness, rescale, tint). Shapes no
-    // real frame produces are not taught.
-    out
+    // No synthetic frames: every training view derives from a real
+    // capture (flip, brightness, rescale, tint). Shapes no real frame
+    // produces are not taught.
+    (files, bases)
 }
 
 // ---------------------------------------------------------------------------
-// forward pass with caches (mirrors screen_cnn::predict_64x64_rgb exactly)
+// forward pass with caches (mirrors screen_cnn::predict_grid_rgb exactly)
 // ---------------------------------------------------------------------------
 
 struct Caches {
@@ -290,26 +243,30 @@ fn predict_label(
     dense_w: &[f32],
     dense_b: &[f32],
     caches: &mut Caches,
-) -> usize {
+) -> (usize, f32) {
     let pool = forward(rgb, conv_w, conv_b, caches);
     let mut best = 0;
     let mut best_val = f32::NEG_INFINITY;
+    let mut second = f32::NEG_INFINITY;
     for o in 0..N_CLASSES {
         let mut s = dense_b[o];
         for i in 0..DENSE_INPUTS {
             s += pool[i] * dense_w[o * DENSE_INPUTS + i];
         }
         if s > best_val {
+            second = best_val;
             best_val = s;
             best = o;
+        } else if s > second {
+            second = s;
         }
     }
-    best
+    (best, best_val - second)
 }
 
 fn main() {
-    let data = corpus();
-    println!("corpus: {} frames", data.len());
+    let (files, bases) = corpus();
+    println!("base captures: {} files", files.len());
     let mut rng = Lcg(0xC0FFEE);
     // He init scaled by each layer's fan-in.
     const CONV_FAN_IN: f32 = FILTER_WEIGHTS as f32;
@@ -324,45 +281,57 @@ fn main() {
     for v in dense_w.iter_mut() {
         *v = (rng.next_unit() as f32 * 2.0 - 1.0) * (6.0 / DENSE_FAN_IN).sqrt();
     }
-
-    let n = data.len() as f32;
-    // Class-weighted loss: minority classes (one shell capture) count as
-    // much as majority ones (ten installer blues), so the majority cannot
-    // drown them. Weights rebalance the gradient, not the data: no frame
-    // is duplicated.
-    let mut class_counts = [0usize; N_CLASSES];
-    for (_, label, _) in &data {
-        class_counts[*label] += 1;
+    // Fully dynamic sampling: no fixed variants repeat across epochs.
+    // Every epoch draws VIEWS_PER_CLASS fresh stochastic views per class
+    // from its own base captures (never other classes' frames, never new
+    // shapes). Smaller than the old fixed batch, so epochs run faster;
+    // every epoch sees all-new views, so variety is total. The sampling
+    // RNG is epoch-seeded, so the same epoch always draws the same views
+    // across runs.
+    const VIEWS_PER_CLASS: usize = 32;
+    const BATCH: usize = VIEWS_PER_CLASS * N_CLASSES;
+    let n = BATCH as f32;
+    let mut file_counts = [0usize; N_CLASSES];
+    for (_, label, _) in &files {
+        file_counts[*label] += 1;
     }
-    let mut class_weights = [0.0f32; N_CLASSES];
-    for (c, count) in class_counts.iter().enumerate() {
-        assert!(*count > 0, "class {c} has no training frames");
-        class_weights[c] = n / (N_CLASSES as f32 * *count as f32);
+    for (c, count) in file_counts.iter().enumerate() {
+        assert!(
+            *count > 0,
+            "class {:?} has no training captures",
+            BY_INDEX[c]
+        );
     }
     println!(
-        "class counts: {}",
+        "base files: {}",
         BY_INDEX
             .iter()
             .enumerate()
-            .map(|(c, v)| format!("{v:?}:{}", class_counts[c]))
+            .map(|(c, v)| format!("{v:?}:{}", file_counts[c]))
             .collect::<Vec<_>>()
             .join(" ")
     );
-    println!(
-        "class weights: {}",
-        BY_INDEX
-            .iter()
-            .enumerate()
-            .map(|(c, v)| format!("{v:?}:{:.2}", class_weights[c]))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    println!("views/class/epoch: {VIEWS_PER_CLASS} (batch {BATCH})");
+    // Reused every epoch: `clear` keeps the allocation, so per-epoch
+    // allocator traffic is zero (views carry no names; the verdict names
+    // files, never batch frames).
+    let mut batch: Vec<(Frame, usize)> = Vec::with_capacity(BATCH);
     let mut caches = Caches {
         chw: [0.0; 3 * GRID * GRID],
         conv: [0.0; N_FILTERS * GRID * GRID],
         pool: [0.0; DENSE_INPUTS],
     };
     for epoch in 0..EPOCHS {
+        // Fresh batch every epoch: cycle each class's own base captures
+        // with new stochastic draws. Epoch-seeded, so the same epoch
+        // always draws the same views across runs.
+        let mut aug_rng = Lcg(0x0A09u64 ^ (epoch as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        batch.clear();
+        for (c, pool) in bases.iter().enumerate() {
+            for k in 0..VIEWS_PER_CLASS {
+                batch.push((stochastic_view(&mut aug_rng, &pool[k % pool.len()]), c));
+            }
+        }
         let mut g_conv_w = [0.0f32; N_FILTERS * FILTER_WEIGHTS];
         let mut g_conv_b = [0.0f32; N_FILTERS];
         let mut g_dense_w = [0.0f32; N_CLASSES * DENSE_INPUTS];
@@ -372,7 +341,7 @@ fn main() {
         let mut class_correct = [0usize; N_CLASSES];
         let mut class_seen = [0usize; N_CLASSES];
         let mut min_margin = f32::INFINITY;
-        for (rgb, label, _name) in &data {
+        for (rgb, label) in &batch {
             let pool = forward(rgb, &conv_w, &conv_b, &mut caches);
             let mut logits = [0.0f32; N_CLASSES];
             for o in 0..N_CLASSES {
@@ -392,7 +361,7 @@ fn main() {
             for p in probs.iter_mut() {
                 *p /= denom;
             }
-            loss += class_weights[*label] * -(probs[*label].max(1e-12).ln());
+            loss += -(probs[*label].max(1e-12).ln());
             class_seen[*label] += 1;
             let pred = probs
                 .iter()
@@ -409,17 +378,17 @@ fn main() {
                         second = v;
                     }
                 }
-                min_margin = min_margin.min(logits[pred] - second);
+                let margin = logits[pred] - second;
+                min_margin = min_margin.min(margin);
             } else {
                 min_margin = min_margin.min(-1.0);
             }
-            // Backprop: dL/dlogit = w_class * (p - y) / N. The class weight
-            // is the oversampling: minority frames push proportionally
-            // harder so the majority cannot drown them.
+            // Backprop: dL/dlogit = (p - y) / N. Unweighted: every class
+            // draws the same view count per epoch, so the balance lives in
+            // the sampling and the stats line reports exactly what trains.
             let mut dlogit = [0.0f32; N_CLASSES];
             for o in 0..N_CLASSES {
-                dlogit[o] =
-                    class_weights[*label] * (probs[o] - if o == *label { 1.0 } else { 0.0 });
+                dlogit[o] = probs[o] - if o == *label { 1.0 } else { 0.0 };
                 dlogit[o] /= n;
             }
             // Dense grads + pool error.
@@ -500,30 +469,53 @@ fn main() {
         for (w, g) in dense_b.iter_mut().zip(g_dense_b.iter()) {
             *w -= LEARNING_RATE * g;
         }
-        if epoch % 10 == 0 || epoch + 1 == EPOCHS {
+
+        // TODO: Leave commented-out or just log every epoch?
+        // if epoch % 10 == 0 || epoch + 1 == EPOCHS {
+        {
             let per_class: Vec<String> = BY_INDEX
                 .iter()
                 .enumerate()
                 .map(|(c, v)| format!("{v:?}:{}", class_correct[c]))
                 .collect();
             println!(
-                "epoch {epoch}: loss {:.4} acc {correct}/{} min_margin {:.2} per_class [{}]",
+                "epoch {epoch}: loss {:.4} acc {correct}/{BATCH} min_margin {:.2} per_class [{}]",
                 loss / n,
-                data.len(),
                 min_margin,
                 per_class.join(" ")
             );
         }
-        if correct == data.len() && min_margin >= REQUIRED_MARGIN {
+        // Gate: deterministic eval over the raw base captures (never
+        // trained on directly), so redrawn views can never move the
+        // goalposts. Post-update weights: this judges what ships.
+        let mut base_correct = 0;
+        let mut base_margin = f32::INFINITY;
+        for (rgb, label, _) in &files {
+            let (got, margin) =
+                predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+            if got == *label {
+                base_correct += 1;
+                base_margin = base_margin.min(margin);
+            } else {
+                base_margin = base_margin.min(-1.0);
+            }
+        }
+        if epoch % 10 == 0 || epoch + 1 == EPOCHS {
+            println!(
+                "epoch {epoch}: base {base_correct}/{} base_margin {base_margin:.2}",
+                files.len()
+            );
+        }
+        if base_correct == files.len() && base_margin >= REQUIRED_MARGIN {
             println!("converged at epoch {epoch}");
             break;
         }
     }
 
-    // Final verdict on the corpus (report raw, no augmentation leniency).
+    // Final verdict on the raw base captures (no augmentation leniency).
     let mut fails = 0;
-    for (rgb, label, name) in &data {
-        let got = predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+    for (rgb, label, name) in &files {
+        let (got, _) = predict_label(rgb, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
         if got != *label {
             fails += 1;
             println!(
@@ -562,8 +554,8 @@ fn main() {
                 names.sort();
                 for name in names {
                     let (rgb, w, h) = load_rgb_8bit(&format!("{dir_path}/{name}"));
-                    let small = downsample_to_64x64_rgb(&rgb, w as usize, h as usize);
-                    let got =
+                    let small = downsample_to_grid_rgb(&rgb, w as usize, h as usize);
+                    let (got, _) =
                         predict_label(&small, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
                     hold_total += 1;
                     if got == label as usize {

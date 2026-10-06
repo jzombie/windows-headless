@@ -2829,7 +2829,7 @@ impl std::fmt::Display for ScreenState {
 }
 
 /// Classify raw RGB (as parsed by [`parse_ppm_p6`]). Every frame goes
-/// through the micro-CNN ([`crate::screen_cnn`]): downsample to 64x64,
+/// through the micro-CNN ([`crate::screen_cnn`]): downsample to GRID,
 /// forward pass, argmax. Single frame, no history, no pixel gates.
 fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
     use crate::screen_cnn::ScreenClass as C;
