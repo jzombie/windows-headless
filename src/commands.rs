@@ -448,6 +448,49 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
 // run
 // ---------------------------------------------------------------------------
 
+/// Cadence policy: answers "how often", owns no state, no I/O, no ticker.
+/// The loops tick on [`SamplingProfile::tick`] and gate each layer on its
+/// own due-check — one scheduler, three rates, zero alternate capture
+/// paths.
+pub struct SamplingProfile {
+    /// Disk PNG cadence (zero = off).
+    pub save_every: Duration,
+    /// In-memory CNN cadence (zero = off).
+    pub classify_every: Duration,
+    /// Status-line narration cadence.
+    pub narrate_every: Duration,
+}
+
+impl SamplingProfile {
+    /// TCG classify default: pegged software emulation earns 3x spacing.
+    pub const TCG_CLASSIFY_SECS: u64 = 30;
+
+    /// Resolve after accelerator detection finalizes (post any KVM→TCG
+    /// fallback): explicit flag wins, else accel default. Same predicate
+    /// `cpu_model()` uses — no new detection, later call.
+    pub fn resolve(save_secs: u64, classify: Option<u64>, accel: &str) -> Self {
+        let classify_secs = classify.unwrap_or(if accel == "tcg" {
+            Self::TCG_CLASSIFY_SECS
+        } else {
+            timeouts::DEFAULT_CLASSIFY_EVERY_SECS
+        });
+        Self {
+            save_every: Duration::from_secs(save_secs),
+            classify_every: Duration::from_secs(classify_secs),
+            narrate_every: Duration::from_secs(timeouts::DEFAULT_BOOT_NARRATION_SECS),
+        }
+    }
+
+    /// Single tick authority: min over active cadences (zero = that layer
+    /// off). `None` when everything is off: nothing to schedule.
+    pub fn tick(&self) -> Option<Duration> {
+        [self.save_every, self.classify_every, self.narrate_every]
+            .into_iter()
+            .filter(|d| !d.is_zero())
+            .min()
+    }
+}
+
 pub struct RunArgs {
     pub disk: Option<String>,
     pub ssh_port: u16,
@@ -475,10 +518,10 @@ pub struct RunArgs {
     /// Screendump cadence during the boot wait in seconds (0 = disabled);
     /// frames land in `<vm-dir>/screenshots/`.
     pub screenshots_every_secs: u64,
-    /// In-memory screen-classification cadence in seconds (0 = disabled):
-    /// screendump + CNN with no disk write, narrating phase changes and
-    /// error screens in the log between saved frames.
-    pub classify_every_secs: u64,
+    /// In-memory screen-classification cadence in seconds: `Some(0)` =
+    /// disabled, `None` = profile default from the accelerator (10s
+    /// hardware, 30s TCG). Screendump + CNN with no disk write.
+    pub classify_every_secs: Option<u64>,
 }
 
 /// Install params for the `run --win-iso` chain (missing disk): everything
@@ -793,17 +836,25 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // One shots dir for the whole wait: periodic boot frames land here and
     // every failure path captures its final frame into it too.
     let shots_dir = screenshots_dir(&vm.builder.workdir);
-    if a.screenshots_every_secs > 0 {
+    let disk = vm.builder.workdir.join(crate::paths::DISK_IMAGE);
+    // Cadence policy resolves after accelerator detection: an explicit
+    // flag wins, else TCG earns 3x spacing on classification.
+    let profile = SamplingProfile::resolve(
+        a.screenshots_every_secs,
+        a.classify_every_secs,
+        auto_detect_platform().1,
+    );
+    if !profile.save_every.is_zero() {
         eprintln!(
             "Saving a boot screenshot every {}s → {}",
-            a.screenshots_every_secs,
+            profile.save_every.as_secs(),
             shots_dir.display()
         );
     }
-    if a.classify_every_secs > 0 {
+    if !profile.classify_every.is_zero() {
         eprintln!(
             "Classifying the boot screen every {}s (in memory, no file)",
-            a.classify_every_secs
+            profile.classify_every.as_secs()
         );
     }
     // VNC coordinates for failure reports (None for gtk/cocoa/none — the
@@ -812,41 +863,30 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         .display
         .is_vnc()
         .then(|| vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg()));
-    // Tick on the fastest active cadence: boot narration, PNG saves,
-    // and in-memory classification each gate on their own interval
-    // inside the loop, so a fast cadence on one layer is never
-    // throttled by a slower layer.
-    let mut tick_interval = timeouts::BOOT_STATUS_TICK;
-    if a.screenshots_every_secs > 0 {
-        tick_interval = tick_interval.min(Duration::from_secs(a.screenshots_every_secs));
-    }
-    if a.classify_every_secs > 0 {
-        tick_interval = tick_interval.min(Duration::from_secs(a.classify_every_secs));
-    }
+    // Single tick authority: the profile's interval drives; save,
+    // classify, and narration each gate on their own due-check inside.
+    // All-zero cadences still need the SSH wait + stall watchdog, so fall
+    // back to the SSH poll interval (sampling simply never fires).
+    let tick_interval = profile.tick().unwrap_or(timeouts::SSH_POLL_INTERVAL);
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so the first status line comes
     // after a full interval of actual waiting, not at launch.
     ticker.tick().await;
-    // Stall sensor: serial-silent deaths would otherwise poll SSH blindly.
-    let mut idle = BlockIdle::new();
+    // Stall sensor + screen state, reunited per tick: serial-silent deaths
+    // would otherwise poll SSH blindly.
+    let mon = std::sync::Arc::new(mon);
+    let mut activity = ActivityMonitor::new();
+    let mut sampler = ScreenSampler::new(std::sync::Arc::clone(&mon), shots_dir.clone());
     // Reboot awareness below the screenshot layer: OVMF's per-boot handoff
     // line in the serial file, so "the guest bounced" is announced even
     // while the screen looks like nothing happened. Baseline 0 (the stale
     // file was removed pre-spawn) — never a post-spawn read, which races
     // OVMF's first line.
     let mut boots_seen = 0u64;
-    // Boot time-lapse bookkeeping: cadence is honored inside the ticker
-    // loop (first frame after a full interval, matching `install`), so it
-    // stops the moment the wait ends — no background task leaking into the
-    // interactive session. The in-memory classification runs on its own
-    // faster cadence between saved frames; the "... still waiting"
-    // narration stays on BOOT_STATUS_TICK regardless of tick rate.
-    let mut last_shot = Some(start);
-    let mut last_status_line = start;
-    let mut last_classify = Some(start);
-    let mut shot_n = 0u64;
-    let mut status_n = 0u64;
+    // Narration due-check state: the "... still waiting" pulse on the
+    // profile's rhythm, never a second ticker.
+    let mut last_narrate = start;
     tokio::select! {
         r = vm.wait_for_ssh(timeouts::BOOT_SSH_DEADLINE) => {
             // Time's up: the serial is silent through a Windows boot, so
@@ -874,66 +914,22 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     eprintln!("{note}");
                 }
                 boots_seen = boots;
-                // Stall watchdog: frozen disk I/O + no banner = parked.
+                // Activity first: frozen disk I/O + no banner = parked.
                 // Bail propagates out of the select arm below.
-                idle.poll(&mon).await?;
-                // Boot time-lapse: periodic frames so a slow boot narrates
-                // itself visually (the serial has nothing to say while
-                // Windows boots) — same cadence idea as install's. A save
-                // tick doubles as the status line, so it never
-                // double-captures with the classification below.
-                let save_due = a.screenshots_every_secs > 0
-                    && last_shot.is_none_or(|t| {
-                        t.elapsed() >= Duration::from_secs(a.screenshots_every_secs)
-                    });
-                if save_due {
-                    if let Some((p, s)) = take_screenshot(&mon, &shots_dir).await {
-                        shot_n += 1;
-                        status_n += 1;
-                        last_shot = Some(std::time::Instant::now());
-                        let warn = if matches!(
-                            s,
-                            ScreenState::ErrorScreen
-                                | ScreenState::ErrorShell
-                                | ScreenState::ErrorRecovery
-                        ) {
-                            "WARNING: "
-                        } else {
-                            ""
-                        };
-                        eprintln!(
-                            "{warn}boot frame {shot_n}: {} ({s})",
-                            p.file_name().unwrap_or_default().to_string_lossy()
-                        );
-                    }
-                } else if a.classify_every_secs > 0
-                    && last_classify.is_none_or(|t| {
-                        t.elapsed() >= Duration::from_secs(a.classify_every_secs)
-                    })
-                    && let Some(s) = classify_only(&mon, &shots_dir).await
-                {
-                    status_n += 1;
-                    last_classify = Some(std::time::Instant::now());
-                    let warn = if matches!(
-                        s,
-                        ScreenState::ErrorScreen
-                            | ScreenState::ErrorShell
-                            | ScreenState::ErrorRecovery
-                    ) {
-                        "WARNING: "
-                    } else {
-                        ""
-                    };
-                    eprintln!("{warn}boot status {status_n}: ({s})");
-                }
-                // Narrate the boot on the slow pulse only: last serial line
-                // says what the guest is doing (recovery, Boot Manager,
+                activity.sample(&mon, Some(disk.as_path())).await;
+                activity.check_stall()?;
+                // One sampler tick, then the reporter line. Save and
+                // classify gate inside; narration gates below.
+                sampler.poll(&profile).await;
+                report_sample("boot", &sampler, &activity);
+                // Narrate the boot on the profile pulse only: last serial
+                // line says what the guest is doing (recovery, Boot Manager,
                 // Setup pass...). The ticker may run faster for
                 // classification; this line must not turn into spam.
-                if last_status_line.elapsed() < timeouts::BOOT_STATUS_TICK {
+                if last_narrate.elapsed() < profile.narrate_every {
                     continue;
                 }
-                last_status_line = std::time::Instant::now();
+                last_narrate = std::time::Instant::now();
                 let doing = last_serial_line(&vm.builder.serial_log);
                 if doing.is_empty() {
                     eprintln!(
@@ -1282,10 +1278,12 @@ async fn finish_install_capture(session: &mut InstallSession) {
         h.abort();
     }
     // Final frame after victory: the desktop as proven, not mid-install.
-    if let Some((p, s)) = take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await {
+    if let Some((p, s, m)) = take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await
+    {
         eprintln!(
-            "final frame: {} ({s})",
-            p.file_name().unwrap_or_default().to_string_lossy()
+            "final frame: {} ({})",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+            describe(s, m)
         );
     }
 }
@@ -1403,7 +1401,7 @@ pub struct InstallParams {
     pub usb_image: Option<PathBuf>,
     pub win_iso: Option<PathBuf>,
     pub screenshots_every_secs: u64,
-    pub classify_every_secs: u64,
+    pub classify_every_secs: Option<u64>,
     pub username: String,
     pub password: String,
     pub recovery: bool,
@@ -1669,27 +1667,36 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     eprintln!(
         "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
     );
-    let screenshots = if p.screenshots_every_secs > 0 || p.classify_every_secs > 0 {
+    // Cadence policy resolves after accel detection (same `accel` the
+    // install argv above used — post any KVM→TCG fallback): an explicit
+    // flag wins, else TCG earns 3x spacing on classification.
+    let profile = SamplingProfile::resolve(
+        p.screenshots_every_secs,
+        p.classify_every_secs,
+        accel,
+    );
+    let screenshots = if !profile.save_every.is_zero() || !profile.classify_every.is_zero() {
         let dir = screenshots_dir(&vm_dir);
-        if p.screenshots_every_secs > 0 {
+        if !profile.save_every.is_zero() {
             eprintln!(
                 "Saving an installer screenshot every {}s until then → {}",
-                p.screenshots_every_secs,
+                profile.save_every.as_secs(),
                 dir.display()
             );
         }
-        if p.classify_every_secs > 0 {
+        if !profile.classify_every.is_zero() {
             eprintln!(
                 "Classifying the installer screen every {}s (in memory, no file)",
-                p.classify_every_secs
+                profile.classify_every.as_secs()
             );
         }
-        Some(spawn_screenshots(
+        spawn_sampler(
             std::sync::Arc::clone(&mon),
             dir,
-            Duration::from_secs(p.screenshots_every_secs),
-            Duration::from_secs(p.classify_every_secs),
-        ))
+            vm_dir.join(crate::paths::DISK_IMAGE),
+            profile,
+            "installer",
+        )
     } else {
         None
     };
@@ -2686,25 +2693,41 @@ fn check_boot_failure(serial_log: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stall sensor for serial-silent deaths (WinRE screens, EULA prompts —
-/// anything GUI-only that the patterns file structurally cannot see).
-/// Samples QMP blockstats: a booting guest does disk I/O constantly, so
-/// completely frozen counters + no SSH banner means parked at an input
-/// screen. Warns at [`timeouts::IDLE_WARN_SECS`], bails at
-/// [`timeouts::IDLE_BAIL_SECS`] with the evidence.
-/// Thread-safe by construction: all state lives in the struct.
-struct BlockIdle {
+/// Guest-activity ledger: the sole consumer of `info blockstats` plus
+/// host-side disk-size samples. Answers "is the guest doing anything" so
+/// the warning policy can tell a slow install (moving) from a parked one
+/// (flat). Sample on every tick; judge on horizons — qcow2 grows stepwise,
+/// so per-second diffs false-report static.
+struct ActivityMonitor {
     last_total: u64,
     last_change: std::time::Instant,
     warned: bool,
+    disk_start: Option<u64>,
+    disk_last: u64,
+    disk_last_change: std::time::Instant,
+    last_sample: Option<std::time::Instant>,
+    /// I/O bytes/s, exponential average over [`Self::EMA_WINDOW_SECS`].
+    pub(crate) io_ema_bps: f64,
+    /// Disk-growth bytes/s, same window.
+    pub(crate) growth_ema_bps: f64,
 }
 
-impl BlockIdle {
+impl ActivityMonitor {
+    /// EMA window in seconds: bursts read as rates, not spikes.
+    const EMA_WINDOW_SECS: f64 = 300.0;
+
     fn new() -> Self {
+        let now = std::time::Instant::now();
         Self {
             last_total: 0,
-            last_change: std::time::Instant::now(),
+            last_change: now,
             warned: false,
+            disk_start: None,
+            disk_last: 0,
+            disk_last_change: now,
+            last_sample: None,
+            io_ema_bps: 0.0,
+            growth_ema_bps: 0.0,
         }
     }
 
@@ -2725,24 +2748,93 @@ impl BlockIdle {
         found.then_some(total)
     }
 
-    /// Feed one sample. Returns a message when a threshold trips
-    /// (warn-once, then bail); `Err` on bail so callers `?` straight out.
-    async fn poll(&mut self, mon: &crate::ipc::Monitor) -> Result<()> {
-        let text = mon.command("info blockstats").await.unwrap_or_default();
-        let Some(total) = Self::parse_total(&text) else {
-            return Ok(());
-        };
-        if total != self.last_total {
-            self.last_total = total;
-            self.last_change = std::time::Instant::now();
-            self.warned = false;
-            return Ok(());
+    /// One EMA step, pure: `prev` toward `inst` over `dt_secs` in a
+    /// `window_secs` horizon. Unit-testable without clocks.
+    fn ema_step(prev: f64, inst: f64, dt_secs: f64, window_secs: f64) -> f64 {
+        if dt_secs <= 0.0 {
+            return prev;
         }
-        let idle = self.last_change.elapsed().as_secs();
+        let alpha = (dt_secs / window_secs).min(1.0);
+        prev + alpha * (inst - prev)
+    }
+
+    /// Feed one tick: monitor counters plus host-side disk size. Every
+    /// part best-effort — an unreachable monitor or stat failure skips
+    /// that signal, never the wait. `None` disk skips growth tracking
+    /// (blockstats still feed the stall watchdog).
+    async fn sample(&mut self, mon: &crate::ipc::Monitor, disk: Option<&Path>) {
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_sample
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        self.last_sample = Some(now);
+        let text = mon.command("info blockstats").await.unwrap_or_default();
+        if let Some(total) = Self::parse_total(&text) {
+            // Unconditional on movement: a flat interval feeds inst 0.0 so
+            // the average decays toward zero instead of freezing at its
+            // last active rate for hours on an idle guest.
+            if dt > 0.0 {
+                let inst = total.saturating_sub(self.last_total) as f64 / dt;
+                self.io_ema_bps = Self::ema_step(self.io_ema_bps, inst, dt, Self::EMA_WINDOW_SECS);
+            }
+            if total != self.last_total {
+                self.last_total = total;
+                self.last_change = now;
+                self.warned = false;
+            }
+        }
+        if let Some(disk) = disk
+            && let Ok(size) = std::fs::metadata(disk).map(|m| m.len())
+        {
+            if self.disk_start.is_none() {
+                // First sample arms the baseline without tripping motion:
+                // a pre-existing disk is not growth.
+                self.disk_start = Some(size);
+                self.disk_last = size;
+                self.disk_last_change = now;
+            } else if dt > 0.0 {
+                let inst = size.saturating_sub(self.disk_last) as f64 / dt;
+                self.growth_ema_bps =
+                    Self::ema_step(self.growth_ema_bps, inst, dt, Self::EMA_WINDOW_SECS);
+                // Growth timer advances only on real growth; the average
+                // still decays through the zero inst above.
+                if size != self.disk_last {
+                    self.disk_last_change = now;
+                }
+                self.disk_last = size;
+            }
+        }
+    }
+
+    /// Seconds since block I/O last moved.
+    fn idle_secs(&self) -> u64 {
+        self.last_change.elapsed().as_secs()
+    }
+
+    /// Seconds since the disk image last grew.
+    fn disk_idle_secs(&self) -> u64 {
+        self.disk_last_change.elapsed().as_secs()
+    }
+
+    /// Bytes the disk image grew since the first sample (saturating).
+    fn growth_since_start(&self) -> u64 {
+        self.disk_start
+            .map(|s| self.disk_last.saturating_sub(s))
+            .unwrap_or(0)
+    }
+
+    /// Moving right now: any I/O inside the warn horizon.
+    fn is_moving(&self) -> bool {
+        self.idle_secs() < timeouts::IDLE_WARN_SECS
+    }
+
+    /// Stall watchdog (moved from `BlockIdle`, semantics intact):
+    /// warn-once, then bail. `Err` on bail so callers `?` straight out.
+    fn check_stall(&mut self) -> Result<()> {
+        let idle = self.idle_secs();
         if idle >= timeouts::IDLE_BAIL_SECS {
-            // Cause only; `cmd_run`'s failure arm appends frame + serial +
-            // VNC via [`boot_failure_report`] (install keeps its announced
-            // time-lapse frames as the evidence).
+            // Cause only; failure arms append frame + serial + VNC.
             anyhow::bail!(
                 "guest appears stuck: no disk I/O for {idle}s and no SSH — likely parked at an input screen (recovery, EULA)"
             );
@@ -2831,13 +2923,17 @@ impl std::fmt::Display for ScreenState {
 /// Classify raw RGB (as parsed by [`parse_ppm_p6`]). Every frame goes
 /// through the micro-CNN ([`crate::screen_cnn`]): downsample to GRID,
 /// forward pass, argmax. Single frame, no history, no pixel gates.
-fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
+/// Returns the state plus the calibrated probability margin
+/// (`top - second`): wording hedges below
+/// [`crate::screen_cnn::UNCERTAIN_PROB_MARGIN`], never gating.
+fn classify_screen(rgb: &[u8], width: u32) -> (ScreenState, f32) {
     use crate::screen_cnn::ScreenClass as C;
     // Degenerate empty frame: nothing captured = nothing to see.
     if rgb.is_empty() {
-        return ScreenState::Dark;
+        return (ScreenState::Dark, 1.0);
     }
-    match crate::screen_cnn::predict_full(rgb, width) {
+    let (class, _, prob_margin) = crate::screen_cnn::predict_full_margin(rgb, width);
+    let state = match class {
         C::Dark => ScreenState::Dark,
         C::FlatField => ScreenState::FlatField,
         C::ErrorShell => ScreenState::ErrorShell,
@@ -2847,6 +2943,23 @@ fn classify_screen(rgb: &[u8], width: u32) -> ScreenState {
         C::OobeStep => ScreenState::OobeStep,
         C::ErrorRecovery => ScreenState::ErrorRecovery,
         C::ErrorScreen => ScreenState::ErrorScreen,
+    };
+    (state, prob_margin)
+}
+
+/// Log-line wording for a classified frame: the [`ScreenState`] message,
+/// hedged when an error read is uncertain. Uncertainty never gates —
+/// the activity conjunction alone decides WARNINGs.
+fn describe(state: ScreenState, prob_margin: f32) -> String {
+    let base = state.to_string();
+    let is_error = matches!(
+        state,
+        ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
+    );
+    if is_error && prob_margin < crate::screen_cnn::UNCERTAIN_PROB_MARGIN {
+        format!("{base} (uncertain — may need input)")
+    } else {
+        base
     }
 }
 
@@ -2857,12 +2970,14 @@ fn vnc_password_command() -> String {
 }
 
 /// Evidence block for a failed boot wait: final frame (path + screen
-/// classification), last serial line, VNC coordinates. Pure formatter so
-/// the layout is unit-testable; [`boot_failure_report`] gathers the parts.
+/// classification), last serial line, activity evidence, VNC coordinates.
+/// Pure formatter so the layout is unit-testable; [`boot_failure_report`]
+/// gathers the parts.
 fn format_failure_report(
     frame: Option<(PathBuf, ScreenState)>,
     serial: &str,
     boots: u64,
+    activity: Option<(u64, u64)>,
     vnc: &Option<String>,
 ) -> String {
     let mut out = match frame {
@@ -2873,6 +2988,12 @@ fn format_failure_report(
         out.push_str(&format!("\n  last serial: {serial}"));
     }
     out.push_str(&format!("\n  guest boots seen: {boots}"));
+    if let Some((idle_secs, growth)) = activity {
+        out.push_str(&format!(
+            "\n  guest activity: no I/O for {idle_secs}s, disk +{}",
+            fmt_bytes(growth)
+        ));
+    }
     if let Some(u) = vnc {
         out.push_str(&format!("\n  vnc: {u} (password {PROVEN_VNC_PASSWORD})"));
     }
@@ -2881,34 +3002,29 @@ fn format_failure_report(
 
 /// Gather the evidence for [`format_failure_report`]: one final frame off
 /// the live monitor (the serial is silent through a Windows boot, so the
-/// screen is the primary witness), the last meaningful serial line, and
-/// the caller's VNC coordinates. Every part is best-effort — a missing
-/// piece is stated, never invented.
+/// screen is the primary witness), the last meaningful serial line, one
+/// activity sample, and the caller's VNC coordinates. Every part is
+/// best-effort — a missing piece is stated, never invented.
 async fn boot_failure_report(
     mon: &crate::ipc::Monitor,
     serial_log: &str,
     shots_dir: &Path,
     vnc: &Option<String>,
 ) -> String {
-    let frame = take_screenshot(mon, shots_dir).await;
+    let frame = take_screenshot(mon, shots_dir)
+        .await
+        .map(|(p, s, _)| (p, s));
     let serial = last_serial_line(serial_log);
-    format_failure_report(frame, &serial, boot_count(serial_log), vnc)
+    let mut activity_mon = ActivityMonitor::new();
+    let disk = shots_dir
+        .parent()
+        .map(|d| d.join(crate::paths::DISK_IMAGE));
+    activity_mon.sample(mon, disk.as_deref()).await;
+    let activity = Some((activity_mon.idle_secs(), activity_mon.growth_since_start()));
+    format_failure_report(frame, &serial, boot_count(serial_log), activity, vnc)
 }
 
-/// One screendump frame, classified in memory with nothing written to
-/// disk: `screendump` to a temp PPM, parsed, classified, PPM deleted.
-/// The fast cadence behind `--classify-every-secs` — phase changes and
-/// error screens surface in the log within seconds while PNGs stay
-/// minute-scale. Best-effort (logs, never fails): returns `None` when the
-/// monitor is busy mid-command.
-async fn classify_only(mon: &crate::ipc::Monitor, screenshots_dir: &Path) -> Option<ScreenState> {
-    let (w, _, rgb) = capture_frame(mon, screenshots_dir).await?;
-    // Single frame straight from the model: no history, no motion
-    // rules. What the CNN says is what gets reported.
-    Some(classify_screen(&rgb, w))
-}
-
-/// Raw frame capture shared by [`classify_only`] and [`take_screenshot`]:
+/// Raw frame capture shared by the sampler and [`take_screenshot`]:
 /// screendump to a temp PPM inside the screenshots dir, parsed to RGB,
 /// PPM deleted. The PPM lives beside the PNGs (never /tmp —
 /// world-writable-sticky, symlink squatting, cross-VM collisions) under a
@@ -2961,21 +3077,22 @@ async fn capture_frame(
 /// announce *what* the screen shows, not just where the file is.
 /// Best-effort (logs, never fails): the monitor may be busy mid-command
 /// and a missed frame is not worth failing an install over.
-/// Returns the PNG path + state on success so callers can announce it.
+/// Returns the PNG path + state + margin on success so callers can
+/// announce it.
 async fn take_screenshot(
     mon: &crate::ipc::Monitor,
     screenshots_dir: &Path,
-) -> Option<(PathBuf, ScreenState)> {
+) -> Option<(PathBuf, ScreenState, f32)> {
     let (w, h, rgb) = capture_frame(mon, screenshots_dir).await?;
     // Single frame straight from the model: no history, no motion
     // rules. What the CNN says is what gets reported.
-    let state = classify_screen(&rgb, w);
+    let (state, margin) = classify_screen(&rgb, w);
     let png_path = screenshots_dir.join(format!(
         "{SCREENSHOT_PREFIX}{}.png",
         crate::provenance::now_epoch()
     ));
     match write_png(&png_path, w, h, &rgb) {
-        Ok(()) => Some((png_path, state)),
+        Ok(()) => Some((png_path, state, margin)),
         Err(e) => {
             eprintln!("warning: png write failed ({e:#})");
             None
@@ -3084,126 +3201,276 @@ fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Background time-lapse: one frame every `every` until aborted.
-/// Returns the join handle; callers `.abort()` it when the wait ends.
-fn spawn_screenshots(
+/// Background time-lapse: ticks on the profile until aborted. Returns the
+/// join handle (`None` when every cadence is off); callers `.abort()` it
+/// when the wait ends.
+fn spawn_sampler(
     mon: std::sync::Arc<crate::ipc::Monitor>,
     screenshots_dir: PathBuf,
-    save_every: Duration,
-    classify_every: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Two cadences, one ticker: the fast in-memory classification
-        // narrates phase changes within seconds while PNGs land on the
-        // slow cadence. First frame immediately (proves the display is
-        // alive early), then on cadence. Numbered, basename-only (the dir
-        // was announced once above), so the log reads as progress toward
-        // the SSH answer.
-        let Some(mut watcher) =
-            InstallerWatcher::new(mon, screenshots_dir, save_every, classify_every)
-        else {
-            return;
-        };
-        let tick_every = watcher.tick_every();
-        watcher.poll().await; // immediate first frame
-        let mut ticker = tokio::time::interval(tick_every);
+    disk: PathBuf,
+    profile: SamplingProfile,
+    label: &'static str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let tick = profile.tick()?;
+    Some(tokio::spawn(async move {
+        // First frame immediately (proves the display is alive early),
+        // then on cadence. Numbered, basename-only (the dir was announced
+        // once above), so the log reads as progress toward the SSH answer.
+        let mut sampler = ScreenSampler::new(mon, screenshots_dir);
+        let mut activity = ActivityMonitor::new();
+        sampler.poll(&profile).await;
+        report_sample(label, &sampler, &activity);
+        let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate tick
         loop {
             ticker.tick().await;
-            watcher.poll().await;
+            activity.sample(&sampler.mon, Some(disk.as_path())).await;
+            if let Err(e) = activity.check_stall() {
+                eprintln!("{e:#}");
+                return;
+            }
+            sampler.poll(&profile).await;
+            report_sample(label, &sampler, &activity);
         }
-    })
+    }))
 }
 
-/// One install-wait screen poll: fast in-memory classification narrates
-/// phase changes within seconds, slow PNG saves keep the minute-scale
-/// time-lapse. A save tick serves both layers from a single screendump,
-/// so no tick ever double-captures. Owns the counters and the last-save
-/// timestamp, so the spawn body and any future caller share one path.
-struct InstallerWatcher {
+/// What one sampler tick produced. The reporter announces; the sampler
+/// never prints.
+#[derive(Clone)]
+enum SampleOutcome {
+    /// PNG saved (doubles as the status line): path, state, prob margin.
+    Saved(PathBuf, ScreenState, f32),
+    /// In-memory classification only.
+    Classified(ScreenState, f32),
+    /// Nothing due, or the capture failed best-effort.
+    Skipped,
+}
+
+/// What the guest looks like now. Owns the screendump, the frame buffer,
+/// classification, and motion diff. Answers, never announces, never
+/// policies: the loop ticks on the profile and reports via
+/// [`report_sample`].
+struct ScreenSampler {
     mon: std::sync::Arc<crate::ipc::Monitor>,
     dir: PathBuf,
-    save_every: Duration,
-    classify_every: Duration,
     shot_n: u64,
     status_n: u64,
     last_save: Option<std::time::Instant>,
+    last_classify: Option<std::time::Instant>,
+    /// Previous tick's grid frame + geometry, for the motion diff.
+    prev_grid: Option<(Vec<u8>, u32, u32)>,
+    last_state: Option<(ScreenState, f32)>,
+    last_outcome: SampleOutcome,
+    state_since: std::time::Instant,
+    static_since: std::time::Instant,
 }
 
-impl InstallerWatcher {
-    /// `None` when both cadences are off: nothing to watch.
-    fn new(
-        mon: std::sync::Arc<crate::ipc::Monitor>,
-        dir: PathBuf,
-        save_every: Duration,
-        classify_every: Duration,
-    ) -> Option<Self> {
-        if save_every.is_zero() && classify_every.is_zero() {
-            return None;
-        }
-        Some(Self {
+impl ScreenSampler {
+    /// Mean abs diff per pixel (0–255 scale) below which the screen counts
+    /// as static. Sits above VNC compression noise and cursor blink (verify
+    /// against a real parked capture); progress spinners clear it by 10x.
+    const MOTION_NOISE_FLOOR: f32 = 1.5;
+
+    fn new(mon: std::sync::Arc<crate::ipc::Monitor>, dir: PathBuf) -> Self {
+        let now = std::time::Instant::now();
+        Self {
             mon,
             dir,
-            save_every,
-            classify_every,
             shot_n: 0,
             status_n: 0,
-            // `None` = save due immediately: the first poll writes a PNG
-            // when saving is on instead of special-casing startup.
+            // `None` = due immediately: the first poll captures instead of
+            // special-casing startup.
             last_save: None,
-        })
-    }
-
-    /// Tick on the faster of the two cadences (zero = that layer off).
-    fn tick_every(&self) -> Duration {
-        match (self.save_every.is_zero(), self.classify_every.is_zero()) {
-            (true, false) => self.classify_every,
-            (false, true) => self.save_every,
-            (false, false) => self.save_every.min(self.classify_every),
-            (true, true) => unreachable!("new() rejects both zero"),
+            last_classify: None,
+            prev_grid: None,
+            last_state: None,
+            last_outcome: SampleOutcome::Skipped,
+            state_since: now,
+            static_since: now,
         }
     }
 
-    /// A failure screen must not read as routine progress: flag it loudly
-    /// the moment it appears.
-    fn warn(s: ScreenState) -> &'static str {
-        if matches!(
-            s,
-            ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
-        ) {
-            "WARNING: "
-        } else {
-            ""
-        }
-    }
-
-    async fn poll(&mut self) {
-        // Slow cadence owns the PNG: one screendump serves both the file
-        // and the status line.
-        let save_due = !self.save_every.is_zero()
+    /// One tick: at most one screendump, serving save or classify,
+    /// whichever the profile says is due. No tick ever double-captures.
+    async fn poll(&mut self, profile: &SamplingProfile) {
+        let save_due = !profile.save_every.is_zero()
             && self
                 .last_save
-                .is_none_or(|t| t.elapsed() >= self.save_every);
+                .is_none_or(|t| t.elapsed() >= profile.save_every);
         if save_due {
-            if let Some((p, s)) = take_screenshot(&self.mon, &self.dir).await {
-                self.shot_n += 1;
-                self.status_n += 1;
-                self.last_save = Some(std::time::Instant::now());
-                eprintln!(
-                    "{}installer screenshot {}: {} ({s})",
-                    Self::warn(s),
-                    self.shot_n,
-                    p.file_name().unwrap_or_default().to_string_lossy()
-                );
+            let Some((w, h, rgb)) = capture_frame(&self.mon, &self.dir).await else {
+                self.last_outcome = SampleOutcome::Skipped;
+                return;
+            };
+            let (state, margin) = classify_screen(&rgb, w);
+            self.observe_frame(&rgb, w, h, state);
+            let png_path = self.dir.join(format!(
+                "{SCREENSHOT_PREFIX}{}.png",
+                crate::provenance::now_epoch()
+            ));
+            match write_png(&png_path, w, h, &rgb) {
+                Ok(()) => {
+                    self.shot_n += 1;
+                    self.status_n += 1;
+                    self.last_save = Some(std::time::Instant::now());
+                    self.last_classify = Some(std::time::Instant::now());
+                    self.last_state = Some((state, margin));
+                    self.last_outcome = SampleOutcome::Saved(png_path, state, margin);
+                }
+                Err(e) => {
+                    eprintln!("warning: png write failed ({e:#})");
+                    self.last_outcome = SampleOutcome::Skipped;
+                }
             }
-        } else if !self.classify_every.is_zero()
-            && let Some(s) = classify_only(&self.mon, &self.dir).await
+            return;
+        }
+        let classify_due = !profile.classify_every.is_zero()
+            && self
+                .last_classify
+                .is_none_or(|t| t.elapsed() >= profile.classify_every);
+        if classify_due
+            && let Some((w, h, rgb)) = capture_frame(&self.mon, &self.dir).await
         {
+            let (state, margin) = classify_screen(&rgb, w);
+            self.observe_frame(&rgb, w, h, state);
             self.status_n += 1;
-            eprintln!("{}installer status {}: ({s})", Self::warn(s), self.status_n);
+            self.last_classify = Some(std::time::Instant::now());
+            self.last_state = Some((state, margin));
+            self.last_outcome = SampleOutcome::Classified(state, margin);
+            return;
+        }
+        self.last_outcome = SampleOutcome::Skipped;
+    }
+
+    /// Fold one captured frame into motion + phase tracking. New geometry
+    /// (driver handoff) or first frame: no baseline, so no claim — the
+    /// buffer adopts the new geometry and the static timer holds.
+    fn observe_frame(&mut self, rgb: &[u8], w: u32, h: u32, state: ScreenState) {
+        let grid = crate::screen_cnn::downsample_to_grid_rgb(rgb, w as usize, h as usize);
+        let moved = match &self.prev_grid {
+            Some((prev, pw, ph)) if *pw == w && *ph == h => {
+                mean_abs_diff(prev, &grid) >= Self::MOTION_NOISE_FLOOR
+            }
+            _ => false,
+        };
+        // Hold the static timer across geometry changes and failed
+        // captures (no frame = no evidence either way).
+        if moved {
+            self.static_since = std::time::Instant::now();
+        }
+        self.prev_grid = Some((grid.to_vec(), w, h));
+        if self.last_state.map(|(s, _)| s) != Some(state) {
+            self.state_since = std::time::Instant::now();
         }
     }
+
+    /// Seconds in the current screen state.
+    fn phase_secs(&self) -> u64 {
+        self.state_since.elapsed().as_secs()
+    }
+
+    /// Seconds since pixels last moved beyond the noise floor.
+    fn static_secs(&self) -> u64 {
+        self.static_since.elapsed().as_secs()
+    }
+}
+
+/// Mean absolute per-pixel difference between two same-length grid
+/// frames (0–255 scale). Length mismatch (shouldn't happen: the sampler
+/// checks geometry first) reads as maximum motion, never a panic.
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 255.0;
+    }
+    let sum: u64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x.abs_diff(y) as u64)
+        .sum();
+    sum as f32 / a.len() as f32
+}
+
+/// Compact durations: 95s under two minutes, 4m12s above.
+fn fmt_secs(s: u64) -> String {
+    if s < 120 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
+/// Compact byte counts: 512B, 12MB, 1.2GB (one decimal under 10 units).
+fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < 4 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if v < 10.0 && u > 0 {
+        format!("{v:.1}{}", UNITS[u])
+    } else {
+        format!("{v:.0}{}", UNITS[u])
+    }
+}
+
+/// One scrollback-safe status line per tick: the whole instrument panel.
+/// Nothing prints for [`SampleOutcome::Skipped`].
+fn report_sample(label: &str, sampler: &ScreenSampler, activity: &ActivityMonitor) {
+    let (noun, n, state, margin, file) = match &sampler.last_outcome {
+        SampleOutcome::Saved(p, s, m) => (
+            "screenshot",
+            sampler.shot_n,
+            *s,
+            *m,
+            p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        ),
+        SampleOutcome::Classified(s, m) => ("status", sampler.status_n, *s, *m, String::new()),
+        SampleOutcome::Skipped => return,
+    };
+    // Error reads warn only under the activity conjunction (flat guest);
+    // a moving guest with an error read is a transient misread or live
+    // recovery, and logs as observation, never alarm.
+    let warn = if is_error_state(state) && !activity.is_moving() {
+        "WARNING: "
+    } else {
+        ""
+    };
+    let file_part = if file.is_empty() {
+        String::new()
+    } else {
+        format!("{file} ")
+    };
+    // Disk growth reads with its own age: a disk that stopped growing
+    // long ago while I/O still trickles is a different shape than both
+    // moving together.
+    let disk_part = if activity.disk_idle_secs() >= timeouts::IDLE_WARN_SECS {
+        format!(
+            "disk +{} (static {})",
+            fmt_bytes(activity.growth_since_start()),
+            fmt_secs(activity.disk_idle_secs())
+        )
+    } else {
+        format!("disk +{}", fmt_bytes(activity.growth_since_start()))
+    };
+    eprintln!(
+        "{warn}{label} {noun} {n}: {file_part}{} (phase {}, static {}, io {}/s avg, {disk_part}, io-idle {})",
+        describe(state, margin),
+        fmt_secs(sampler.phase_secs()),
+        fmt_secs(sampler.static_secs()),
+        fmt_bytes(activity.io_ema_bps as u64),
+        fmt_secs(activity.idle_secs()),
+    );
+}
+
+fn is_error_state(s: ScreenState) -> bool {
+    matches!(
+        s,
+        ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
+    )
 }
 
 /// One banner read ([`timeouts::SSH_BANNER_CONNECT_BUDGET`] +
@@ -3267,7 +3534,13 @@ async fn wait_install_ready(
     use crate::unattend::DEFAULT_PASSWORD;
     let start = std::time::Instant::now();
     // Phase 1: first banner.
-    let mut idle = BlockIdle::new();
+    let mut activity = ActivityMonitor::new();
+    // Disk beside the screenshots dir feeds growth tracking (`shots_dir`
+    // is `<vm>/screenshots`, so its parent is the VM dir).
+    let disk = scope
+        .shots_dir
+        .parent()
+        .map(|d| d.join(crate::paths::DISK_IMAGE));
     // Reboot awareness while Setup applies (no SSH yet — serial is the
     // only below-screenshot voice): count OVMF firmware handoffs.
     let mut boots_seen = boot_count(&scope.serial_log);
@@ -3294,7 +3567,8 @@ async fn wait_install_ready(
         }
         boots_seen = boots;
         // Stall watchdog: frozen disk I/O + no banner = parked.
-        idle.poll(&scope.mon).await?;
+        activity.sample(&scope.mon, disk.as_deref()).await;
+        activity.check_stall()?;
         tokio::time::sleep(timeouts::SSH_POLL_INTERVAL).await;
     };
     // Phase 2: ask the guest until it reports done. Banner loss between
@@ -3636,8 +3910,38 @@ mod tests {
     fn blockstats_parse_totals() {
         let sample = "drive-tgt: rd_bytes=1048576 wr_bytes=524288 rd_operations=12\n\
                       drive-usb: rd_bytes=100 wr_bytes=0\n";
-        assert_eq!(BlockIdle::parse_total(sample), Some(1048576 + 524288 + 100));
-        assert_eq!(BlockIdle::parse_total(""), None);
+        assert_eq!(
+            ActivityMonitor::parse_total(sample),
+            Some(1048576 + 524288 + 100)
+        );
+        assert_eq!(ActivityMonitor::parse_total(""), None);
+    }
+
+    #[test]
+    fn activity_math_without_qemu() {
+        // Pure derivations on hand-built state: no monitor, no sleeps.
+        let now = std::time::Instant::now();
+        let mut m = ActivityMonitor {
+            last_total: 1000,
+            last_change: now - Duration::from_secs(61),
+            warned: false,
+            disk_start: Some(100),
+            disk_last: 150,
+            disk_last_change: now - Duration::from_secs(61),
+            last_sample: Some(now),
+            io_ema_bps: 0.0,
+            growth_ema_bps: 0.0,
+        };
+        assert_eq!(m.idle_secs(), 61);
+        assert_eq!(m.disk_idle_secs(), 61);
+        assert_eq!(m.growth_since_start(), 50);
+        assert!(!m.is_moving());
+        // EMA: half-window step moves halfway to the instant rate.
+        assert_eq!(ActivityMonitor::ema_step(0.0, 100.0, 150.0, 300.0), 50.0);
+        assert_eq!(ActivityMonitor::ema_step(50.0, 100.0, 0.0, 300.0), 50.0);
+        // Fresh activity resets the idle clock.
+        m.last_change = std::time::Instant::now();
+        assert!(m.is_moving());
     }
 
     #[test]
@@ -3752,11 +4056,22 @@ mod tests {
     #[test]
     fn screen_state_black_means_nothing_visible() {
         assert_eq!(
-            classify_screen(&flat(64, 64, [0, 0, 0]), 64),
+            classify_screen(&flat(64, 64, [0, 0, 0]), 64).0,
             ScreenState::Dark
         );
         // Degenerate empty frame: nothing captured = nothing to see.
-        assert_eq!(classify_screen(&[], 0), ScreenState::Dark);
+        assert_eq!(classify_screen(&[], 0).0, ScreenState::Dark);
+    }
+
+    #[test]
+    fn uncertain_errors_hedge_confident_ones_do_not() {
+        let hedged = describe(ScreenState::ErrorScreen, 0.05);
+        assert!(hedged.contains("uncertain"), "{hedged}");
+        let firm = describe(ScreenState::ErrorScreen, 0.95);
+        assert!(!firm.contains("uncertain"), "{firm}");
+        // Progress states never hedge: only error reads carry doubt.
+        let progress = describe(ScreenState::InstallerStep, 0.0);
+        assert!(!progress.contains("uncertain"), "{progress}");
     }
 
     #[test]
@@ -3816,6 +4131,11 @@ mod tests {
             .collect();
         versions.sort();
         for version in versions {
+            // Skip Finder noise (.DS_Store) and anything else that is
+            // not a version directory.
+            if !std::path::Path::new(&format!("{root}/{version}")).is_dir() {
+                continue;
+            }
             let mut classes: Vec<_> = std::fs::read_dir(format!("{root}/{version}"))
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -3851,7 +4171,7 @@ mod tests {
     fn classify_fixture(name: &str) -> ScreenState {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
         let (rgb, w, _) = crate::screen_cnn::load_rgb_8bit(&path);
-        classify_screen(&rgb, w)
+        classify_screen(&rgb, w).0
     }
 
     #[test]
@@ -3884,11 +4204,11 @@ mod tests {
             win_iso: None,
             install_timeout_secs: 60,
             screenshots_every_secs: 10,
-            classify_every_secs: 5,
+            classify_every_secs: Some(5),
         };
         let p = run_chain_install_params(&args, PathBuf::from("w.iso"));
         assert_eq!(p.screenshots_every_secs, 10);
-        assert_eq!(p.classify_every_secs, 5);
+        assert_eq!(p.classify_every_secs, Some(5));
         assert_eq!(p.install_timeout_secs, 60);
         assert_eq!(p.memory_mb, 4096);
         assert_eq!(p.cpus, 4);
@@ -3904,6 +4224,7 @@ mod tests {
             )),
             "BdsDxe: starting Boot0003",
             3,
+            Some((95, 12_582_912)),
             &Some("vnc://127.0.0.1:5910".to_string()),
         );
         assert!(report.contains("solid color field"), "{report}");
@@ -3917,11 +4238,12 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("vnc: vnc://127.0.0.1:5910"), "{report}");
+        assert!(report.contains("no I/O for 95s"), "{report}");
     }
 
     #[test]
     fn failure_report_states_missing_parts() {
-        let report = format_failure_report(None, "", 0, &None);
+        let report = format_failure_report(None, "", 0, None, &None);
         assert!(
             report.contains("no screenshot could be captured"),
             "{report}"

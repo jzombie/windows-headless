@@ -101,11 +101,12 @@ enum Cmd {
         #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS)]
         screenshots_every_secs: u64,
         /// Screen-classification cadence during the boot wait in seconds
-        /// (0 = disabled). Screendump + CNN with no disk write: phase
-        /// changes and error screens surface in the log within seconds
-        /// while PNGs stay minute-scale.
-        #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_CLASSIFY_EVERY_SECS)]
-        classify_every_secs: u64,
+        /// (0 = disabled, omit = accel default: 10s hardware, 30s TCG).
+        /// Screendump + CNN with no disk write: phase changes and error
+        /// screens surface in the log within seconds while PNGs stay
+        /// minute-scale.
+        #[arg(long)]
+        classify_every_secs: Option<u64>,
         /// Resume the experimental live snapshot (migrated RAM, no boot):
         /// instant when it works. Default off — golden rewind always works.
         /// Take one first with `snapshot --live` on a running guest.
@@ -129,12 +130,12 @@ enum Cmd {
         /// `<vm-dir>/screenshots/` — a time-lapse of the install.
         #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS)]
         screenshots_every_secs: u64,
-        /// Screen-classification cadence in seconds (0 = disabled).
-        /// Screendump + CNN with no disk write: phase changes and error
-        /// screens surface in the log within seconds while PNGs stay
-        /// minute-scale.
-        #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_CLASSIFY_EVERY_SECS)]
-        classify_every_secs: u64,
+        /// Screen-classification cadence in seconds (0 = disabled, omit =
+        /// accel default: 10s hardware, 30s TCG). Screendump + CNN with no
+        /// disk write: phase changes and error screens surface in the log
+        /// within seconds while PNGs stay minute-scale.
+        #[arg(long)]
+        classify_every_secs: Option<u64>,
         /// Guest username (must match the media's answer file; used for
         /// the readiness probe login and the ready line).
         #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
@@ -492,7 +493,7 @@ async fn async_main() -> Result<()> {
                     win_iso: None,
                     screenshots_every_secs:
                         windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS,
-                    classify_every_secs: windows_headless::timeouts::DEFAULT_CLASSIFY_EVERY_SECS,
+                    classify_every_secs: None,
                     username,
                     password,
                     recovery: false,
@@ -761,7 +762,8 @@ mod tests {
     #[test]
     fn run_boot_screenshot_cadence_defaults_on() {
         // Boot time-lapse on by default (readable boot, no VNC); 0 opts out.
-        // Classification runs on its own faster cadence by default.
+        // Classification omitted by default: the profile resolves it from
+        // the accelerator after detection.
         let cli = Cli::try_parse_from(["wh", "run"]).unwrap();
         let Cmd::Run {
             screenshots_every_secs,
@@ -772,7 +774,7 @@ mod tests {
             panic!("expected run");
         };
         assert_eq!(screenshots_every_secs, 60);
-        assert_eq!(classify_every_secs, 10);
+        assert_eq!(classify_every_secs, None);
         let cli = Cli::try_parse_from(["wh", "run", "--screenshots-every-secs", "0"]).unwrap();
         let Cmd::Run {
             screenshots_every_secs,

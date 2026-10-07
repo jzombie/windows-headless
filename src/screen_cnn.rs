@@ -202,10 +202,31 @@ pub fn downsample_to_grid_rgb(src: &[u8], src_w: usize, src_h: usize) -> [u8; 3 
 /// plus its center-half crop. Shared conv filters run each stream, the
 /// pooled thumbnails concatenate, one dense layer decides. Pure function
 /// of the inputs and the baked weights: deterministic bit-for-bit.
+/// Thin wrapper over [`predict_two_stream_margin`]: one forward trunk,
+/// never two.
 pub fn predict_two_stream(
     full: &[u8; 3 * GRID * GRID],
     crop: &[u8; 3 * GRID * GRID],
 ) -> ScreenClass {
+    predict_two_stream_margin(full, crop).0
+}
+
+/// Calibrated uncertainty threshold for runtime wording (probability
+/// units, NOT the trainer's logit-gap margin): below `top - second`
+/// reads `(uncertain)`. 0.20 means the winner must lead by twenty points
+/// of probability — a coin-flip call hedges, a 90/5 call does not.
+pub const UNCERTAIN_PROB_MARGIN: f32 = 0.20;
+
+/// Two-stream predict with calibrated confidence: class, top softmax
+/// probability, and probability margin (`top - second`). Callers use the
+/// margin for hedged wording only — never for stopping or gating.
+pub fn predict_two_stream_margin(
+    full: &[u8; 3 * GRID * GRID],
+    crop: &[u8; 3 * GRID * GRID],
+) -> (ScreenClass, f32, f32) {
+    // Full forward mirror of predict_two_stream (same weights, same
+    // order): the margin needs logits, and factoring the shared trunk out
+    // is a refactor for another day — duplication beats a wrong shortcut.
     const GRID2: usize = GRID * GRID;
     const KERNEL2: usize = KERNEL * KERNEL;
     let w = &WEIGHTS[..];
@@ -217,11 +238,6 @@ pub fn predict_two_stream(
 
     let mut pool_out = [0.0f32; DENSE_TOTAL];
     for (s, rgb) in [full, crop].iter().enumerate() {
-        // 1. Normalize u8 [0, 255] to f32 [0, 1], CHW layout, plus the
-        // static Y-coordinate plane. Ranges are global, not per-stream:
-        // the full view spans [-1, 1] while the center-half crop spans
-        // [-0.5, 0.5], so shared filters see consistent coordinates for
-        // the same physical screen region in both streams.
         let (y_min, y_max) = if s == 0 {
             (-1.0f32, 1.0f32)
         } else {
@@ -239,6 +255,8 @@ pub fn predict_two_stream(
                 chw[3 * GRID2 + r * GRID + c] = y_coord;
             }
         }
+
+        // 2. Conv2D + ReLU (pad 1 keeps GRID x GRID).
 
         // 2. Conv2D + ReLU (pad 1 keeps GRID x GRID).
         let mut conv_out = [0.0f32; N_FILTERS * GRID * GRID];
@@ -300,20 +318,34 @@ pub fn predict_two_stream(
         }
         logits[o] = sum;
     }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut denom = 0.0f32;
+    for &v in &logits {
+        denom += (v - max).exp();
+    }
     let mut best = 0;
-    let mut best_val = logits[0];
-    for (i, &v) in logits.iter().enumerate().skip(1) {
-        if v > best_val {
-            best_val = v;
-            best = i;
+    let mut best_p = 0.0f32;
+    let mut second_p = 0.0f32;
+    for (o, &v) in logits.iter().enumerate() {
+        let p = (v - max).exp() / denom;
+        if p > best_p {
+            second_p = best_p;
+            best_p = p;
+            best = o;
+        } else if p > second_p {
+            second_p = p;
         }
     }
-    BY_INDEX[best]
+    (BY_INDEX[best], best_p, best_p - second_p)
 }
 
 /// Classify a full-resolution RGB frame: full view plus center-half crop,
-/// then the two-stream predict.
+/// then the two-stream predict. Empty or zero-width input is Dark at full
+/// confidence (nothing captured = nothing to see), never a panic.
 pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
+    if rgb.is_empty() || width == 0 {
+        return ScreenClass::Dark;
+    }
     let height = rgb.len() / 3 / width as usize;
     assert_eq!(
         rgb.len(),
@@ -325,6 +357,25 @@ pub fn predict_full(rgb: &[u8], width: u32) -> ScreenClass {
     let (x0, y0, x1, y1) = crop_region(w, height);
     let crop = downsample_region_to_grid_rgb(rgb, w, height, x0, y0, x1, y1);
     predict_two_stream(&full, &crop)
+}
+
+/// Margin sibling of [`predict_full`]: class plus calibrated confidence.
+/// Callers use the margin for hedged wording only. Same empty-input guard.
+pub fn predict_full_margin(rgb: &[u8], width: u32) -> (ScreenClass, f32, f32) {
+    if rgb.is_empty() || width == 0 {
+        return (ScreenClass::Dark, 1.0, 1.0);
+    }
+    let height = rgb.len() / 3 / width as usize;
+    assert_eq!(
+        rgb.len(),
+        width as usize * height * 3,
+        "predict_full_margin size mismatch"
+    );
+    let w = width as usize;
+    let full = downsample_to_grid_rgb(rgb, w, height);
+    let (x0, y0, x1, y1) = crop_region(w, height);
+    let crop = downsample_region_to_grid_rgb(rgb, w, height, x0, y0, x1, y1);
+    predict_two_stream_margin(&full, &crop)
 }
 
 /// Load an 8-bit PNG from disk and expand any color type to raw RGB.

@@ -144,8 +144,11 @@ pub const IDLE_WARN_SECS: u64 = 60;
 /// [`DEFAULT_INSTALL_SSH_DEADLINE_SECS`] stay generous.
 pub const IDLE_BAIL_SECS: u64 = 120;
 
-/// Cadence of the "... still waiting for SSH (Ns elapsed)" boot narration.
-pub const BOOT_STATUS_TICK: Duration = Duration::from_secs(30);
+/// Default narration cadence in seconds: the "... still waiting for SSH
+/// (Ns elapsed)" pulse. Owned by `SamplingProfile` like the other
+/// cadences; explicit flags never touch it (it names log rhythm, not a
+/// wait budget).
+pub const DEFAULT_BOOT_NARRATION_SECS: u64 = 30;
 
 /// Cadence of the "still installing: … — Ns elapsed, N reboot(s) so far"
 /// heartbeat during the readiness wait. Probes run every

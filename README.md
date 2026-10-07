@@ -20,11 +20,13 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
 # (macOS first run: prefix with WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP=1)
-cargo run -- run --win-iso ~/Downloads/Win11.iso
+# --release throughout: debug-build screen classification runs an order of
+# magnitude slower and stretches every status tick.
+cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
 
 # ...or in two steps: build once, boot any time.
-cargo run -- build --win-iso ~/Downloads/Win11.iso
-cargo run -- run
+cargo run --release -- build --win-iso <PATH_TO_WIN_ISO>
+cargo run --release -- run
 ```
 
 Sizing is Docker-style: `--memory 8g --cpus 8 --disk-size 128g`
@@ -36,13 +38,20 @@ Sizing applies to installs too, so `run --win-iso` honors the same flags.
 Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
 `demo2026`); a screenshot lands in `<cache>/vms/win11/screenshots/` every
 60 seconds until SSH answers (`--screenshots-every-secs`, `0` disables).
+Between saves, a tiny on-device CNN classifies the screen in memory every
+10s on hardware accel (30s on TCG; `--classify-every-secs`, `0` disables),
+so phase changes and error screens surface in the log within seconds.
 Dead boots end with a diagnosis block: latest frame path, screen state, last
 serial line, and firmware reboot count, so dead boots are readable without
-VNC. Screen states: `black` (no output), `solid color field` (no UI),
-`modal error dialog`, `UEFI shell` (no bootable device found), or `content`
-(everything else, including the installer and spinners). A modal dialog or
-shell prompt prints a single `WARNING:` line instead of reading as routine
-progress.
+VNC. Screen states: installer progress, first-boot OOBE, firmware boot art,
+lock/idle, plus error states (modal error dialog, UEFI shell with no
+bootable device found, Windows recovery).
+Error states print a `WARNING:` line only when the guest is also flat
+(no disk I/O, no disk growth) — a moving guest with an error read logs as
+observation, never alarm.
+The classifier is eyes into the installer's progress, not ground truth:
+it misreads, and warnings fire on the activity conjunction, never on a
+single frame.
 
 ## Where things live
 
@@ -98,13 +107,13 @@ first, so a dirty stop (Ctrl-C) can't leave the next boot in Recovery.
 
 ```sh
 # Terminal 1: `run` blocks, so boot and leave it running.
-cargo run -- run
+cargo run --release -- run
 ```
 
 ```sh
 # Terminal 2: re-take golden from the running guest (proves shell,
 # shuts down cleanly, snapshots). The next `run` resumes the new state.
-cargo run -- snapshot
+cargo run --release -- snapshot
 ```
 
 Live resume (experimental) also saves RAM, so `run --live` restores the
@@ -112,19 +121,19 @@ running guest with no boot.
 
 ```sh
 # Terminal 1: boot and leave it running.
-cargo run -- run
+cargo run --release -- run
 ```
 
 ```sh
 # Terminal 2: save live state (brief guest stun; guest keeps running).
-cargo run -- snapshot --live
+cargo run --release -- snapshot --live
 ```
 
 ```sh
 # Stop the guest first (Ctrl-C terminal 1, or `stop`), then resume with no boot.
 # A missing piece (overlay, VARS backup, migration stream) fails loudly
 # rather than booting a half-state.
-cargo run -- run --live
+cargo run --release -- run --live
 ```
 
 Golden and live coexist (separate sidecars) and `run` selects by flag, so you
@@ -149,7 +158,7 @@ to the rewind unless live is faster.
 
 ## Tested
 
-Proven installs, logged automatically by `install` to [tested-isos.jsonl](./tested-isos.jsonl) (`*` = built from a dirty tree). Regenerate with `cargo run -- report --readme README.md`.
+Proven installs, logged automatically by `install` to [tested-isos.jsonl](./tested-isos.jsonl) (`*` = built from a dirty tree). Regenerate with `cargo run --release -- report --readme README.md`.
 
 <!-- TESTED-BEGIN -->
 | Date | ISO | Arch | Accel | Host | QEMU | wimlib | virtio | Commit | Result |
@@ -189,7 +198,7 @@ The provisioning pipeline downloads third-party binaries. Hash verification is e
 
 *Security Note:* For all auto-downloaded components, the trust root is the source code (`src/pins.rs`). The tool will immediately abort if a downloaded payload does not match its hardcoded hash. If you choose to override default downloads using custom URLs (such as `--virtio-iso-url`), those payloads rely solely on TLS unless you explicitly provide their matching hash flags.
 
-Run `cargo run --bin windows-headless -- verify-pins` to check every pin without installing anything. It covers all platforms (macos-arm64, linux-x86_64, linux-aarch64) from any single runner: release metadata is platform-independent, so one CI job verifies every arch.
+Run `cargo run --release --bin windows-headless -- verify-pins` to check every pin without installing anything. It covers all platforms (macos-arm64, linux-x86_64, linux-aarch64) from any single runner: release metadata is platform-independent, so one CI job verifies every arch.
 
 ### macOS Gatekeeper Requirement
 
