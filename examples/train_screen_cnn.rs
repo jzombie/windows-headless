@@ -66,6 +66,14 @@ const GRID_PIXELS: usize = GRID * GRID;
 /// 2.0 is the literature default; the per-item HOLDOUT losses say whether
 /// the hard six move under it.
 const GAMMA: f32 = 2.0;
+/// Floor under the focal scale: every frame keeps at least this fraction
+/// of its plain cross-entropy gradient. Pure focal zeroes solved classes
+/// out, and the run falls into an OobeStep/ErrorScreen limit cycle with
+/// the entire step driven by whichever class collapsed last. The floor
+/// anchors decided boundaries while the focal term still boosts the hard
+/// frames. Same blend in `logit_loss` so reported losses match the
+/// optimized objective.
+const FOCAL_FLOOR: f32 = 0.2;
 /// Weights per convolution filter (all input channels, incl. Y-coord).
 const FILTER_WEIGHTS: usize = INPUT_CHANNELS * KERNEL * KERNEL;
 
@@ -376,14 +384,17 @@ impl GradAccum {
 /// parts. Shared by `frame_stats` and `train_frame` so eval and training
 /// can never disagree on the loss.
 fn logit_loss(logits: &[f32; N_CLASSES], label: usize, max: f32, denom: f32) -> f32 {
-    // Focal loss: down-weight easy frames so the gradient serves the
-    // struggling ones. Same helper feeds training and eval, so TRAIN and
-    // HOLDOUT losses stay directly comparable. Both clamps are load-bearing:
-    // float rounding can push p_target a hair above 1.0, and powf on a
-    // negative base is NaN, which would poison every weight downstream.
+    // Focal loss with the easy-floor blend (mirrors train_frame's
+    // gradient): solved frames contribute FOCAL_FLOOR of plain CE, hard
+    // frames up to the full focal term. Same helper feeds training and
+    // eval, so TRAIN and HOLDOUT losses stay directly comparable. Both
+    // clamps are load-bearing: float rounding can push p_target a hair
+    // above 1.0, and powf on a negative base is NaN, which would poison
+    // every weight downstream.
     let p_target = ((logits[label] - max).exp() / denom).clamp(1e-12, 1.0);
     let one_minus = (1.0 - p_target).max(0.0);
-    -one_minus.powf(GAMMA) * p_target.ln()
+    let ce = -p_target.ln();
+    FOCAL_FLOOR * ce + (1.0 - FOCAL_FLOOR) * (-one_minus.powf(GAMMA) * p_target.ln())
 }
 
 /// One batch frame's forward statistics: predicted class, margin over the
@@ -493,8 +504,9 @@ fn train_frame(
     let one_minus = (1.0 - p_target).max(0.0);
     let focal_scale =
         one_minus.powf(GAMMA) - GAMMA * p_target * one_minus.powf(GAMMA - 1.0) * p_target.ln();
+    let scale = FOCAL_FLOOR + (1.0 - FOCAL_FLOOR) * focal_scale;
     for o in 0..N_CLASSES {
-        dlogit[o] = focal_scale * (probs[o] - if o == label { 1.0 } else { 0.0 });
+        dlogit[o] = scale * (probs[o] - if o == label { 1.0 } else { 0.0 });
         dlogit[o] /= n;
     }
     backward(streams, pool, dlogit, net, caches, acc);
