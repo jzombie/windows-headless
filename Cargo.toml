@@ -34,6 +34,7 @@ edition = "2024"
 description = "Minimal-dependency headless Windows 11 VM provisioning and automation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jzombie/windows-headless"
+default-run = "windows-headless"
 
 [dependencies]
 tokio.workspace = true
