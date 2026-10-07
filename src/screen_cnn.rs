@@ -75,7 +75,7 @@ static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
     assert_eq!(
         WEIGHT_BYTES.len(),
         N_WEIGHTS * 4,
-        "artifacts/weights.bin corrupt: want {} bytes, have {} (regenerate with `cargo run --release --example train_screen_cnn`)",
+        "artifacts/weights.bin corrupt: want {} bytes, have {} (regenerate with `cargo run --release --bin train-screen-cnn`)",
         N_WEIGHTS * 4,
         WEIGHT_BYTES.len()
     );

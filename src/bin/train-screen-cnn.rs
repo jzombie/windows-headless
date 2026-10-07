@@ -24,7 +24,7 @@
 //! checkpoint ships, and the run stops after `PATIENCE_EPOCHS` stale
 //! epochs. Margin is reported, never gating.
 //!
-//! Regenerate: `cargo run --release --example train_screen_cnn` (release
+//! Regenerate: `cargo run --release --bin train-screen-cnn` (release
 //! matters: thousands of sampled views per epoch over hundreds of
 //! epochs).
 
