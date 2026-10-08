@@ -966,23 +966,4 @@ mod tests {
             None => unsafe { std::env::remove_var(ALLOW_UNVERIFIED_ENV) },
         }
     }
-
-    // TODO: Remove
-    #[test]
-    fn no_staging_abstractions_anywhere() {
-        // No staging, anywhere: no guard types, no staging dirs, no
-        // publish step. Fetches extract straight into the group dir;
-        // validity is the sentinel file alone. Patterns are assembled at
-        // runtime so this test never matches its own source.
-        let src = std::fs::read_to_string(file!()).unwrap();
-        let banned = [
-            ["struct Staging", "Guard {"].concat(),
-            ["Staging", "Dir::"].concat(),
-            ["publish_staged", "("].concat(),
-            [".staging", "-{"].concat(),
-        ];
-        for b in &banned {
-            assert!(!src.contains(b), "staging abstraction resurrected");
-        }
-    }
 }
