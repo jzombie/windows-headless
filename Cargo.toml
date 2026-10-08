@@ -11,7 +11,7 @@ tempfile = "3.27"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 clap = { version = "4.6", features = ["derive"] }
-cache-manager = "0.5"
+cache-manager = "0.6.0"
 tar = "0.4"
 flate2 = "1.1"
 liblzma = "0.4"
@@ -65,3 +65,8 @@ crossterm.workspace = true
 [features]
 default = ["downloader"]
 downloader = ["reqwest", "cache-manager", "tar", "flate2", "liblzma", "cache-manager/os-cache-dir"]
+
+[patch.crates-io]
+# Local normalize-on-ingest work (cache-owned permission normalization);
+# remove once published upstream.
+cache-manager = { path = "../rust-cache-manager" }

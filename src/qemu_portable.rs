@@ -56,11 +56,6 @@ Or strip it yourself:
 /// = fail closed. Mirrored by the `--allow-unverified` CLI flags.
 pub const ALLOW_UNVERIFIED_ENV: &str = "WINDOWS_HEADLESS_ALLOW_UNVERIFIED";
 
-/// Monotonic suffix making staging dir names unique per attempt (not just per
-/// pid): guard cleanup is async fire-and-forget, so a same-process retry must
-/// never reuse a name whose deletion is still in flight.
-static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Sole quarantine authorization boundary: true iff the operator explicitly
 /// consented. Checked by `ensure()`/`ensure_wimlib()` BEFORE any download.
 /// Both call sites are macOS-only; allowed-dead elsewhere so the truth-table
@@ -83,58 +78,6 @@ fn unverified_allowed(explicit: bool) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     matches!(v.as_str(), "1" | "true" | "yes" | "on")
-}
-
-/// Owns a staging dir; removes it on drop unless committed. The removal is
-/// offloaded off the async worker: a QEMU tree is thousands of files and a
-/// synchronous `remove_dir_all` in `Drop` would stall the executor.
-/// `Drop` probes `Handle::try_current()` first — `spawn_blocking` panics
-/// outside a live reactor (notably runtime teardown under SIGINT/SIGTERM),
-/// and a panic in `Drop` aborts the process — falling back to a detached
-/// `std::thread` when no reactor is available. Fire-and-forget either way:
-/// safe because staging names are unique per attempt, so an in-flight
-/// deletion can never collide with a retry.
-struct StagingGuard {
-    path: Option<PathBuf>,
-}
-
-impl StagingGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn path(&self) -> &Path {
-        self.path.as_ref().expect("guard used after commit")
-    }
-
-    /// Consume without deleting (call after the atomic rename succeeds).
-    /// If `dest` already existed (lost rename race), call `discard()` instead.
-    fn commit(mut self) {
-        self.path = None;
-    }
-
-    /// Disarm by doing nothing: dropping `self` runs the `Drop` cleanup.
-    /// (No manual deletion here — that would duplicate the `Drop` path and rot.)
-    fn discard(self) {}
-}
-
-impl Drop for StagingGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            // `spawn_blocking` panics outside a live reactor (e.g. runtime
-            // teardown under SIGINT/SIGTERM) — and a panic in `Drop` aborts the
-            // process. Probe first; fall back to a detached OS thread.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn_blocking(move || {
-                    let _ = std::fs::remove_dir_all(&p);
-                });
-            } else {
-                std::thread::spawn(move || {
-                    let _ = std::fs::remove_dir_all(&p);
-                });
-            }
-        }
-    }
 }
 
 /// Apply the quarantine strip to an already-authorized tree. No auth check, no
@@ -253,42 +196,6 @@ async fn verify_archive_against_sums(
                  Set {ALLOW_UNVERIFIED_ENV}=1 or pass --allow-unverified to proceed anyway (not recommended)",
                 crate::paths::SHA256SUMS_FILE
             );
-        }
-    }
-}
-
-/// Publish a staged tree: atomic rename staging → dest. If `dest` already
-/// holds a sentinel-verified tree (a concurrent process won the race), discard
-/// staging and use the winner's tree. A `dest` WITHOUT the sentinel is never
-/// a good tree, so it is removed before rename — never a verified one.
-fn publish_staged(
-    staging: StagingGuard,
-    dest: &Path,
-    sentinel: &Path,
-    inner: &str,
-) -> Result<PathBuf> {
-    if sentinel.is_file() {
-        // Winner already published (or a previous good run); our staging is spare.
-        staging.discard();
-        return Ok(dest.join(inner));
-    }
-    // dest is either absent, empty (created by ensure_dir), or stale without a
-    // sentinel — none of which is a usable tree. Clear it for the rename.
-    if dest.exists() {
-        let _ = std::fs::remove_dir_all(dest);
-    }
-    match std::fs::rename(staging.path(), dest) {
-        Ok(()) => {
-            staging.commit();
-            Ok(dest.join(inner))
-        }
-        Err(e) => {
-            // Lost the race between our check and rename: re-check the winner.
-            if sentinel.is_file() {
-                staging.discard();
-                return Ok(dest.join(inner));
-            }
-            anyhow::bail!("rename staging to {} failed: {e:#}", dest.display());
         }
     }
 }
@@ -587,32 +494,45 @@ pub async fn ensure(
     )
     .await?;
 
-    // Stage → strip → publish. The full payload (extract + permissions +
-    // quarantine strip) completes inside the staging boundary; the atomic
-    // rename is what makes the tree public. Guard cleanup covers `?`
-    // early-returns and panics.
+    // No staging: extract straight into the group dir. Safe because the
+    // sentinel check above guarantees no good tree lives here — `dest` is
+    // absent or stale — and a killed fetch leaves a sentinel-less tree the
+    // next run simply refetches. Validity = sentinel presence, nothing else.
+    // (Concurrent double-fetch can interleave in one dir; single-user CLI,
+    // and any interleaving still ends sentinel-less on failure.)
     let dest = group.path().to_path_buf();
-    let n = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let staging =
-        StagingGuard::new(base.join(format!(".staging-{tag}-{}-{n}", std::process::id())));
-    std::fs::create_dir_all(staging.path()).context("create staging dir")?;
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .with_context(|| format!("clear stale {}", dest.display()))?;
+    }
+    // Group creation normalizes; the re-sweep after extract clears the
+    // read-only modes tar writes per member. Single call, owned by
+    // cache-manager — no local permission logic anywhere in this flow.
+    // WHY: release tarballs ship 0444 lib files (verified live against
+    // the macos-arm64 asset); without this, the quarantine strip below
+    // fails EACCES on every member and Windows tree deletion breaks on
+    // rotation. Belt (ensure_dir) and suspenders (this call): tar
+    // re-applies read-only modes during unpack, after creation normalized.
+    group.ensure_dir()?;
     extract(
         kind,
         &archive_path,
-        staging.path(),
+        &dest,
         &format!(
             "{}/{}",
             crate::paths::QEMU_INNER,
             crate::paths::PORTABLE_BIN_DIR
         ),
     )?;
-    strip_quarantine(staging.path()).await?;
+    // WHY (explicitly): tar just re-applied 0444 modes per member
+    // during unpack, undoing what creation normalized. This re-sweep —
+    // through the group interface, owned by cache-manager — clears them
+    // so the strip below, and every later cache operation, never hits
+    // EACCES. The comment stays so nobody "simplifies" it away.
+    group.ensure_dir()?;
+    strip_quarantine(&dest).await?;
     let _ = std::fs::remove_file(&archive_path);
-    let sentinel = dest
-        .join(crate::paths::QEMU_INNER)
-        .join(crate::paths::PORTABLE_BIN_DIR)
-        .join(crate::paths::QEMU_IMG_NAME);
-    let root = publish_staged(staging, &dest, &sentinel, crate::paths::QEMU_INNER)?;
+    let root = dest.join(crate::paths::QEMU_INNER);
 
     Ok(PortableQemu { root, version: tag })
 }
@@ -824,27 +744,34 @@ pub async fn ensure_wimlib(
     )
     .await?;
     let dest = group.path().to_path_buf();
-    let n = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let staging =
-        StagingGuard::new(base.join(format!(".staging-{tag}-{}-{n}", std::process::id())));
-    std::fs::create_dir_all(staging.path()).context("create staging dir")?;
+    // No staging (see QEMU flow above): sentinel check at entry guarantees
+    // no good tree lives here; validity is sentinel presence alone.
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .with_context(|| format!("clear stale {}", dest.display()))?;
+    }
+    // Group creation normalizes; the re-sweep after extract clears the
+    // read-only modes tar writes per member. Owned by cache-manager.
+    group.ensure_dir()?;
     extract(
         kind,
         &archive_path,
-        staging.path(),
+        &dest,
         &format!(
             "{}/{}",
             crate::paths::WIMLIB_INNER,
             crate::paths::PORTABLE_BIN_DIR
         ),
     )?;
-    strip_quarantine(staging.path()).await?;
+    // WHY (explicitly): tar just re-applied 0444 modes per member
+    // during unpack, undoing what creation normalized. This re-sweep —
+    // through the group interface, owned by cache-manager — clears them
+    // so the strip below, and every later cache operation, never hits
+    // EACCES. The comment stays so nobody "simplifies" it away.
+    group.ensure_dir()?;
+    strip_quarantine(&dest).await?;
     let _ = std::fs::remove_file(&archive_path);
-    let sentinel = dest
-        .join(crate::paths::WIMLIB_INNER)
-        .join(crate::paths::PORTABLE_BIN_DIR)
-        .join(crate::paths::WIMLIB_IMGX_NAME);
-    let root = publish_staged(staging, &dest, &sentinel, crate::paths::WIMLIB_INNER)?;
+    let root = dest.join(crate::paths::WIMLIB_INNER);
     Ok(PortableWimlib { root, version: tag })
 }
 
@@ -1040,34 +967,22 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn staging_guard_drop_removes_and_commit_keeps() {
-        // NOTE: #[tokio::test] is REQUIRED: Drop offloads via spawn_blocking,
-        // which panics outside a runtime.
-        let tmp = tempfile::tempdir().unwrap();
-        let staging_path = tmp.path().join(".staging-test-1");
-        std::fs::create_dir_all(&staging_path).unwrap();
-        std::fs::write(staging_path.join("f"), b"x").unwrap();
-        {
-            let _guard = StagingGuard::new(staging_path.clone());
-            // Drop without commit → removed (deletion is async: poll).
+    // TODO: Remove
+    #[test]
+    fn no_staging_abstractions_anywhere() {
+        // No staging, anywhere: no guard types, no staging dirs, no
+        // publish step. Fetches extract straight into the group dir;
+        // validity is the sentinel file alone. Patterns are assembled at
+        // runtime so this test never matches its own source.
+        let src = std::fs::read_to_string(file!()).unwrap();
+        let banned = [
+            ["struct Staging", "Guard {"].concat(),
+            ["Staging", "Dir::"].concat(),
+            ["publish_staged", "("].concat(),
+            [".staging", "-{"].concat(),
+        ];
+        for b in &banned {
+            assert!(!src.contains(b), "staging abstraction resurrected");
         }
-        let mut gone = false;
-        for _ in 0..100 {
-            if !staging_path.exists() {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(gone, "staging dir was not cleaned up");
-
-        let keep_path = tmp.path().join(".staging-test-2");
-        std::fs::create_dir_all(&keep_path).unwrap();
-        {
-            let guard = StagingGuard::new(keep_path.clone());
-            guard.commit();
-        }
-        assert!(keep_path.is_dir());
     }
 }
