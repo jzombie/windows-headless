@@ -181,6 +181,28 @@
           <Path>cmd /c netsh advfirewall set allprofiles state off</Path>
           <Description>Firewall off (slirp NAT is the gate; saves ~30s to SSH)</Description>
         </RunSynchronousCommand>
+        <!-- Pre-SSH workload trim (reg writes only: no PowerShell cold
+             start, same cost class as orders 1-6). wuauserv, WSearch, and
+             SysMain contend for CPU/disk through first boot while sshd
+             waits to start; disabling here moves relief before first SSH
+             instead of after. End states stay owned post-READY (wuauserv
+             by the updates flag, the rest by the headless diet), so these
+             are timing, never policy. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>15</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\wuauserv" /v Start /t REG_DWORD /d 4 /f</Path>
+          <Description>Windows Update off until post-READY owns the end state</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>16</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\WSearch" /v Start /t REG_DWORD /d 4 /f</Path>
+          <Description>Search indexing off until the headless diet re-asserts</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>17</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\SysMain" /v Start /t REG_DWORD /d 4 /f</Path>
+          <Description>SysMain prefetch off until the headless diet re-asserts</Description>
+        </RunSynchronousCommand>
       </RunSynchronous>
     </component>
   </settings>

@@ -3026,28 +3026,54 @@ fn report_sample(label: &str, sampler: &ScreenSampler, activity: &ActivityMonito
     );
 }
 
-/// One banner read ([`timeouts::SSH_BANNER_CONNECT_BUDGET`] +
-/// [`timeouts::SSH_BANNER_READ_BUDGET`]). `None` = no sshd right now.
-async fn banner_once(port: u16) -> Option<String> {
+/// Tri-state banner probe: distinguishes a closed port (nothing
+/// listening — sshd not started) from an open-but-silent one (TCP
+/// accepted, no SSH banner — sshd starting, or something else holding
+/// the port). The wait loops log transitions; a long silence that moves
+/// Closed→Silent is progress, not a stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BannerProbe {
+    Banner,
+    /// Accepted, no bytes (timeout or clean EOF): listener present,
+    /// banner not out yet.
+    OpenSilent,
+    /// Accepted, but the bytes are not SSH: wrong daemon, port squat,
+    /// or corrupt transmission — never "sshd starting".
+    Unexpected,
+    Closed,
+}
+
+async fn probe_banner(port: u16) -> (BannerProbe, Option<String>) {
     use tokio::io::AsyncReadExt;
-    let stream = tokio::time::timeout(
+    let stream = match tokio::time::timeout(
         timeouts::SSH_BANNER_CONNECT_BUDGET,
         tokio::net::TcpStream::connect((PROVEN_SSH_HOST, port)),
     )
     .await
-    .ok()?
-    .ok()?;
+    {
+        Ok(Ok(s)) => s,
+        _ => return (BannerProbe::Closed, None),
+    };
     let mut buf = [0u8; 256];
     let mut stream = stream;
-    let n = tokio::time::timeout(timeouts::SSH_BANNER_READ_BUDGET, stream.read(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-    if n == 0 {
-        return None;
+    match tokio::time::timeout(timeouts::SSH_BANNER_READ_BUDGET, stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let b = String::from_utf8_lossy(&buf[..n]);
+            if b.starts_with("SSH-") {
+                (BannerProbe::Banner, Some(b.trim().to_string()))
+            } else {
+                (BannerProbe::Unexpected, None)
+            }
+        }
+        // Accepted but silent: starting, not absent.
+        _ => (BannerProbe::OpenSilent, None),
     }
-    let b = String::from_utf8_lossy(&buf[..n]);
-    b.starts_with("SSH-").then(|| b.trim().to_string())
+}
+
+/// One banner read ([`timeouts::SSH_BANNER_CONNECT_BUDGET`] +
+/// [`timeouts::SSH_BANNER_READ_BUDGET`]). `None` = no sshd right now.
+async fn banner_once(port: u16) -> Option<String> {
+    probe_banner(port).await.1
 }
 
 /// Guest readiness: banner phases for display, registry probe for truth.
@@ -3101,6 +3127,10 @@ async fn wait_install_ready(
     // (Ctrl-C). Past the deadline the loop says so loudly and keeps
     // waiting — a slow host is not a failed install.
     let mut deadline_warned = false;
+    // Miss-reason tracking: a silence that moves closed→silent is sshd
+    // stirring (progress); log transitions, never pollute per tick. None
+    // until the first probe, so tick 1 always announces the baseline.
+    let mut probe_state: Option<BannerProbe> = None;
     let banner = loop {
         if start.elapsed() > deadline && !deadline_warned {
             deadline_warned = true;
@@ -3109,11 +3139,30 @@ async fn wait_install_ready(
                 deadline.as_secs()
             );
         }
-        if let Some(b) = banner_once(port).await {
-            eprintln!(
-                "guest SSH is up (first contact) — Setup is still installing Windows, not ready yet ({b})"
-            );
-            break b;
+        match probe_banner(port).await {
+            (BannerProbe::Banner, Some(b)) => {
+                eprintln!(
+                    "guest SSH is up (first contact) — Setup is still installing Windows, not ready yet ({b})"
+                );
+                break b;
+            }
+            (state, _) => {
+                if Some(state) != probe_state {
+                    probe_state = Some(state);
+                    match state {
+                        BannerProbe::Closed => eprintln!(
+                            "ssh port {port} closed (sshd not started yet) — still waiting"
+                        ),
+                        BannerProbe::OpenSilent => eprintln!(
+                            "ssh port {port} open but silent (sshd starting?) — still waiting"
+                        ),
+                        BannerProbe::Unexpected => eprintln!(
+                            "ssh port {port} answered but not with SSH (wrong daemon or port squat?) — still waiting"
+                        ),
+                        BannerProbe::Banner => {}
+                    }
+                }
+            }
         }
         // Dead-screen watchdog (same as run): fail fast with evidence.
         check_boot_failure(&scope.serial_log)?;

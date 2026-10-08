@@ -315,7 +315,8 @@ mod tests {
         // partitions also use <Order>; only RunSynchronous counts here.
         // Both command passes are checked: specialize carries the gpsvc
         // repair, the SSH firewall commands, the recovery policy, and
-        // firewall-off (orders 1..=14; the service diet moved post-READY).
+        // firewall-off (orders 1..=14; pre-SSH trim is 15..=17, the rest
+        // of the service diet moved post-READY).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,
