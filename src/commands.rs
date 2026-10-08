@@ -4271,25 +4271,28 @@ mod tests {
         // nowhere. A changed verdict fails with a diff; bless it with
         // `cargo insta review` (or `INSTA_UPDATE=always` as the
         // auto-accept escape hatch).
-        let expected_for_class = |class: &str| match class {
-            "dark" => ScreenState::Dark,
-            "flat-field" => ScreenState::FlatField,
-            "error-shell" => ScreenState::ErrorShell,
-            "error-recovery" => ScreenState::ErrorRecovery,
-            "error-bluescreen" => ScreenState::ErrorScreen,
-            "error-modal" => ScreenState::ErrorScreen,
-            "oobe-step" => ScreenState::OobeStep,
-            "installer-step" => ScreenState::InstallerStep,
-            "firmware-boot" => ScreenState::FirmwareBoot,
-            "lockscreen" => ScreenState::Lockscreen,
-            // Unknown future class dirs: fail loudly below via the
-            // unreachable arm instead of silently passing as progress.
+        use crate::screen_cnn::ScreenClass as C;
+        // Single dir→label map: verdict target and loss label travel
+        // together, so a new class dir touches one arm, never two.
+        let target_for_class = |class: &str| match class {
+            "dark" => (ScreenState::Dark, C::Dark),
+            "flat-field" => (ScreenState::FlatField, C::FlatField),
+            "error-shell" => (ScreenState::ErrorShell, C::ErrorShell),
+            "error-recovery" => (ScreenState::ErrorRecovery, C::ErrorRecovery),
+            "error-bluescreen" | "error-modal" => (ScreenState::ErrorScreen, C::ErrorScreen),
+            "oobe-step" => (ScreenState::OobeStep, C::OobeStep),
+            "installer-step" => (ScreenState::InstallerStep, C::InstallerStep),
+            "firmware-boot" => (ScreenState::FirmwareBoot, C::FirmwareBoot),
+            "lockscreen" => (ScreenState::Lockscreen, C::Lockscreen),
+            // Unknown future class dirs: fail loudly here instead of
+            // silently absorbing into the snapshot.
             _ => panic!("test map missing class dir: {class}"),
         };
         let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
         let mut checked = 0;
         let mut lines = Vec::new();
         let mut misses = Vec::new();
+        let mut ok_loss_sum = 0.0f64;
         let mut versions: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -4319,12 +4322,23 @@ mod tests {
                 names.sort();
                 for name in names {
                     let key = format!("{version}/{class}/{name}");
-                    let got = classify_fixture(&key);
                     // Unknown class dirs fail loudly via the map (never
                     // silently absorbed); misses group at the bottom under
-                    // their own header, so no horizontal hunt/peck.
-                    let want = expected_for_class(&class);
+                    // their own header, so no horizontal hunt/peck. Loss
+                    // prints to stdout (not the snapshot: `exp`/`ln`
+                    // round the last ulp differently per platform libm,
+                    // and snapshots must be bit-exact everywhere). Run
+                    // with `-- --nocapture` to score a retrain: falling
+                    // loss blesses new weights, rising loss doesn't.
+                    let (want, want_class) = target_for_class(&class);
+                    let label = crate::screen_cnn::BY_INDEX
+                        .iter()
+                        .position(|c| *c == want_class)
+                        .unwrap();
+                    let (got, loss) = classify_fixture(&key, label);
+                    println!("loss {loss:.4} {key}");
                     if got == want {
+                        ok_loss_sum += f64::from(loss);
                         lines.push(format!("ok   {key} => {got:?}"));
                     } else {
                         misses.push(format!("MISS {key} => got {got:?}, want {want:?}"));
@@ -4334,17 +4348,31 @@ mod tests {
             }
         }
         assert!(checked > 0, "no fixtures found under tests/fixtures");
+        let ok_count = checked - misses.len();
+        let mean_ok = ok_loss_sum / f64::from(ok_count.max(1) as u32);
+        println!("mean ok-loss {mean_ok:.4} over {ok_count}/{checked}");
         lines.push(format!("--- misses {}/{checked} ---", misses.len()));
         lines.extend(misses);
         insta::assert_snapshot!("screen_state_by_directory", lines.join("\n"));
     }
 
     /// Test-only fixture classification: decode via [`crate::screen_cnn`]
-    /// (shared with the trainer) and run the real classifier.
-    fn classify_fixture(name: &str) -> ScreenState {
+    /// (shared with the trainer) and run the real classifier, plus the
+    /// cross-entropy loss of the TRUE label from raw logits — the score
+    /// that judges weight updates. Plain CE (no focal): comparable
+    /// across runs, same max-subtracted softmax the runtime uses.
+    fn classify_fixture(name: &str, label: usize) -> (ScreenState, f32) {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
         let (rgb, w, _) = crate::screen_cnn::load_rgb_8bit(&path);
-        classify_screen(&rgb, w).0
+        let (state, _) = classify_screen(&rgb, w);
+        let logits = crate::screen_cnn::predict_full_logits(&rgb, w);
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0.0f32;
+        for &v in &logits {
+            denom += (v - max).exp();
+        }
+        let loss = (max + denom.ln()) - logits[label];
+        (state, loss)
     }
 
     #[test]

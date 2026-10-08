@@ -1,6 +1,6 @@
 ---
 source: src/commands.rs
-assertion_line: 4339
+assertion_line: 4356
 expression: "lines.join(\"\\n\")"
 ---
 ok   win11-26300-en-us-retail/dark/boot-black.png => Dark

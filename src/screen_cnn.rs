@@ -104,10 +104,15 @@ pub fn decode_weights_le(bytes: &[u8]) -> Vec<f32> {
         N_WEIGHTS * F32_BYTES,
         bytes.len()
     );
-    bytes.as_chunks::<F32_BYTES>().0.iter().map(|c| {
-        let b: &[u8; 4] = c.as_slice().try_into().unwrap();
-        f32::from_le_bytes(*b)
-    }).collect()
+    bytes
+        .as_chunks::<F32_BYTES>()
+        .0
+        .iter()
+        .map(|c| {
+            let b: &[u8; 4] = c.as_slice().try_into().unwrap();
+            f32::from_le_bytes(*b)
+        })
+        .collect()
 }
 
 /// Split a flat weight slice into the four layout segments, in order.
@@ -151,15 +156,19 @@ pub fn append_weights_le(
     assert_eq!(dense_w.len(), DENSE_WEIGHTS, "dense_w layout drift");
     assert_eq!(dense_b.len(), N_CLASSES, "dense_b layout drift");
     out.reserve(N_WEIGHTS * F32_BYTES);
-    for v in conv_w.iter().chain(conv_b.iter()).chain(dense_w.iter()).chain(dense_b.iter()) {
+    for v in conv_w
+        .iter()
+        .chain(conv_b.iter())
+        .chain(dense_w.iter())
+        .chain(dense_b.iter())
+    {
         out.extend_from_slice(&v.to_le_bytes());
     }
 }
 
 /// Decoded weights (f32), parsed once on first use.
-static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
-    decode_weights_le(WEIGHT_BYTES).into_boxed_slice()
-});
+static WEIGHTS: LazyLock<Box<[f32]>> =
+    LazyLock::new(|| decode_weights_le(WEIGHT_BYTES).into_boxed_slice());
 
 /// Screen classes, in logit order (must match the trainer's label map).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,19 +303,16 @@ pub const UNCERTAIN_PROB_MARGIN: f32 = 0.20;
 /// Two-stream predict with calibrated confidence: class, top softmax
 /// probability, and probability margin (`top - second`). Callers use the
 /// margin for hedged wording only — never for stopping or gating.
-pub fn predict_two_stream_margin(
-    full: &[u8; 3 * GRID * GRID],
-    crop: &[u8; 3 * GRID * GRID],
-) -> (ScreenClass, f32, f32) {
-    // Full forward mirror of predict_two_stream (same weights, same
-    // order): the margin needs logits, and factoring the shared trunk out
-    // is a refactor for another day — duplication beats a wrong shortcut.
+/// Shared forward trunk: conv/pool/dense through raw logits. Every
+/// predictor below rides this — one implementation, never mirrored
+/// copies. Pure function of inputs and baked weights.
+fn forward_logits(full: &[u8; 3 * GRID * GRID], crop: &[u8; 3 * GRID * GRID]) -> [f32; N_CLASSES] {
     const GRID2: usize = GRID * GRID;
     const KERNEL2: usize = KERNEL * KERNEL;
     let w = &WEIGHTS[..];
-    let (conv_w, rest) = w.split_at(N_FILTERS * INPUT_CHANNELS * KERNEL2);
+    let (conv_w, rest) = w.split_at(CONV_WEIGHTS);
     let (conv_b, rest) = rest.split_at(N_FILTERS);
-    let (dense_w, rest) = rest.split_at(N_CLASSES * DENSE_TOTAL);
+    let (dense_w, rest) = rest.split_at(DENSE_WEIGHTS);
     let (dense_b, _) = rest.split_at(N_CLASSES);
     let pad = KERNEL / 2;
 
@@ -329,8 +335,6 @@ pub fn predict_two_stream_margin(
                 chw[3 * GRID2 + r * GRID + c] = y_coord;
             }
         }
-
-        // 2. Conv2D + ReLU (pad 1 keeps GRID x GRID).
 
         // 2. Conv2D + ReLU (pad 1 keeps GRID x GRID).
         let mut conv_out = [0.0f32; N_FILTERS * GRID * GRID];
@@ -382,7 +386,7 @@ pub fn predict_two_stream_margin(
         }
     }
 
-    // 4. Dense + argmax.
+    // 4. Dense to raw logits (softmax/argmax is the caller's job).
     let mut logits = [0.0f32; N_CLASSES];
     for o in 0..N_CLASSES {
         let mut sum = dense_b[o];
@@ -392,6 +396,17 @@ pub fn predict_two_stream_margin(
         }
         logits[o] = sum;
     }
+    logits
+}
+
+/// Two-stream predict with calibrated confidence: class, top softmax
+/// probability, and probability margin (`top - second`). Callers use the
+/// margin for hedged wording only — never for stopping or gating.
+pub fn predict_two_stream_margin(
+    full: &[u8; 3 * GRID * GRID],
+    crop: &[u8; 3 * GRID * GRID],
+) -> (ScreenClass, f32, f32) {
+    let logits = forward_logits(full, crop);
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut denom = 0.0f32;
     for &v in &logits {
@@ -450,6 +465,27 @@ pub fn predict_full_margin(rgb: &[u8], width: u32) -> (ScreenClass, f32, f32) {
     let (x0, y0, x1, y1) = crop_region(w, height);
     let crop = downsample_region_to_grid_rgb(rgb, w, height, x0, y0, x1, y1);
     predict_two_stream_margin(&full, &crop)
+}
+
+/// Logit sibling of [`predict_full_margin`]: raw two-stream logits for
+/// scoring against a known label (cross-entropy in the caller). Test and
+/// trainer tooling only — runtime wording uses calibrated margins, never
+/// these. Same empty-input guard shape as the other `predict_full_*`.
+pub fn predict_full_logits(rgb: &[u8], width: u32) -> [f32; N_CLASSES] {
+    if rgb.is_empty() || width == 0 {
+        return [0.0; N_CLASSES];
+    }
+    let height = rgb.len() / 3 / width as usize;
+    assert_eq!(
+        rgb.len(),
+        width as usize * height * 3,
+        "predict_full_logits size mismatch"
+    );
+    let w = width as usize;
+    let full = downsample_to_grid_rgb(rgb, w, height);
+    let (x0, y0, x1, y1) = crop_region(w, height);
+    let crop = downsample_region_to_grid_rgb(rgb, w, height, x0, y0, x1, y1);
+    forward_logits(&full, &crop)
 }
 
 /// Load an 8-bit PNG from disk and expand any color type to raw RGB.

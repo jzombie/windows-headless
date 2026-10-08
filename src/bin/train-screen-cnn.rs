@@ -804,7 +804,13 @@ fn main() {
         match std::fs::read(&weights_path) {
             Ok(bytes) => {
                 let floats = decode_weights_le(&bytes);
-                distribute_weights(&floats, &mut conv_w, &mut conv_b, &mut dense_w, &mut dense_b);
+                distribute_weights(
+                    &floats,
+                    &mut conv_w,
+                    &mut conv_b,
+                    &mut dense_w,
+                    &mut dense_b,
+                );
                 println!("init: warm start from {weights_path}");
                 true
             }
