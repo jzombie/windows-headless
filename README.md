@@ -201,13 +201,7 @@ Run `cargo run --release --bin windows-headless -- verify-pins` to check every p
 
 ## Troubleshooting
 
-> **Highly recommended:** Run your first install with all defaults (no overridden
-> `--memory`, `--cpus`, `--username`, `--password`, etc.). A green
-> default install proves the pipeline works on your machine; only then
-> start tuning. Custom values on a first run entangle your settings
-> with setup problems and make failures much harder to diagnose. See [Where things live](#where-things-live) in this README for where artifacts are stored.
-
-(macOS): If you manually download and extract release archives via a web browser, macOS will quarantine the files. Clear the attributes manually before running: `xattr -dr com.apple.quarantine <cache-dir>`.
+**macOS Gatekeeper:** If you manually download and extract release archives via a web browser, macOS will quarantine the files. Clear the attributes manually before running: `xattr -dr com.apple.quarantine <cache-dir>`.
 
 **If SSH prompt is never reached**
 
