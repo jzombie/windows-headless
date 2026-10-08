@@ -18,6 +18,7 @@ pub mod ssh;
 pub mod storage;
 pub mod timeouts;
 pub mod unattend;
+pub mod vision;
 
 pub use ipc::{MON_SOCK_NAME, QMP_SOCK_NAME, SERIAL_LOG_NAME};
 pub use media::{
