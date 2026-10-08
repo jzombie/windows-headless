@@ -50,7 +50,8 @@ Error states print a `WARNING:` line only when the guest is also flat
 observation, never alarm.
 The classifier is eyes into the installer's progress, not ground truth:
 it misreads, and warnings fire on the activity conjunction, never on a
-single frame.
+single frame. Motion sensing (pixel change between captures) tracks
+whether the screen is alive independently of classification.
 
 ## Where things live
 
