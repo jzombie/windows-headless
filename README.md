@@ -2,7 +2,7 @@
 
 Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI, no host packages.
 
-**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported.**
+**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. See [Troubleshooting](#troubleshooting) section should unanticipated problems occur.**
 
 > Prerequisite: A recent Rust toolchain (`cargo`, 1.85+; any stable via
 > [rustup](https://rustup.rs)). Everything else ([QEMU, wimlib, virtio
@@ -201,7 +201,22 @@ Run `cargo run --release --bin windows-headless -- verify-pins` to check every p
 
 ## Troubleshooting
 
+> **Highly recommended:** Run your first install with all defaults (no overridden
+> `--memory`, `--cpus`, `--username`, `--password`, etc.). A green
+> default install proves the pipeline works on your machine; only then
+> start tuning. Custom values on a first run entangle your settings
+> with setup problems and make failures much harder to diagnose. See [Where things live](#where-things-live) in this README for where artifacts are stored.
+
 (macOS): If you manually download and extract release archives via a web browser, macOS will quarantine the files. Clear the attributes manually before running: `xattr -dr com.apple.quarantine <cache-dir>`.
+
+**If SSH prompt is never reached**
+
+- If the installer screenshots show that you're sitting on a lockscreen and SSH was never reached, it *should* eventually come online.  Typically, on macOS, SSH will be reached within 10 - 15 minutes of QEMU first booting and starting the Windows install, but I've seen it wait for 18 minutes (this is not typical).
+- On non-virtualized, or older, hardware (including running in [OrbStack](https://orbstack.dev/) on macOS), it can take *much longer* to reach that initial stable prompt.  Once it *is* reached, saving a [live snapshot](#snapshots) is **highly recommended** and a subsequent launch via `run --live` should load that live snapshot within seconds.
+
+**Refer to what hasn't yet been tested**
+
+The [not tested](#not-tested) section shows some platforms/archs/releases/spins that have not yet been tested.
 
 ## License
 
