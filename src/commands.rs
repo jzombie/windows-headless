@@ -914,13 +914,17 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     eprintln!("{note}");
                 }
                 boots_seen = boots;
-                // Activity first: frozen disk I/O + no banner = parked.
-                // Bail propagates out of the select arm below.
+                // Sample first: the stall check below needs fresh counters.
                 activity.sample(&mon, Some(disk.as_path())).await;
-                activity.check_stall()?;
                 // One sampler tick, then the reporter line. Save and
                 // classify gate inside; narration gates below.
                 sampler.poll(&profile).await;
+                // Stall watchdog, conditioned on screen state: frozen disk
+                // I/O during valid progress (Setup applying, OOBE) is a
+                // slow host, never a stuck guest — progress states answer
+                // only to the outer SSH deadline. Bail propagates out of
+                // the select arm below.
+                activity.check_stall(sampler.state(), true)?;
                 report_sample("boot", &sampler, &activity);
                 // Narrate the boot on the profile pulse only: last serial
                 // line says what the guest is doing (recovery, Boot Manager,
@@ -2829,14 +2833,49 @@ impl ActivityMonitor {
         self.idle_secs() < timeouts::IDLE_WARN_SECS
     }
 
-    /// Stall watchdog (moved from `BlockIdle`, semantics intact):
-    /// warn-once, then bail. `Err` on bail so callers `?` straight out.
-    fn check_stall(&mut self) -> Result<()> {
+    /// Stall watchdog, conditioned on screen state: frozen disk I/O during
+    /// valid progress (Setup applying, OOBE, boot art, idle desktop) is a
+    /// slow host, never a stuck guest — progress answers only to the
+    /// operator. The bail fires solely on the conjunction: a non-progress
+    /// screen (error states, Dark, FlatField) AND ceased block I/O AND a
+    /// disk that stopped growing. `None` state (no frame yet) takes the
+    /// strict path: nothing rendered is itself evidence of stuck.
+    /// `fatal` decides the teeth: the run boot wait bails (a dead boot
+    /// has its own SSH deadline anyway), the install path only ever warns
+    /// — nothing but the operator halts an install. `Err` on bail so
+    /// fatal callers `?` straight out.
+    fn check_stall(&mut self, state: Option<ScreenState>, fatal: bool) -> Result<()> {
+        let progress = matches!(
+            state,
+            Some(
+                ScreenState::InstallerStep
+                    | ScreenState::OobeStep
+                    | ScreenState::FirmwareBoot
+                    | ScreenState::Lockscreen
+            )
+        );
+        if progress {
+            // Slow host, not stuck guest: reset the warn latch so a later
+            // genuine stall still warns, and return without judging.
+            self.warned = false;
+            return Ok(());
+        }
         let idle = self.idle_secs();
-        if idle >= timeouts::IDLE_BAIL_SECS {
+        let disk_idle = self.disk_idle_secs();
+        if idle >= timeouts::IDLE_BAIL_SECS && disk_idle >= timeouts::IDLE_BAIL_SECS {
+            if !fatal {
+                // Install path: say so loudly, keep waiting. Only the
+                // operator halts an install. Warn every time past bail
+                // (not warn-once): a stall that persists for hours should
+                // stay visible, and nothing else will say it.
+                eprintln!(
+                    "warning: no disk I/O for {idle}s, disk static for {disk_idle}s and no SSH — guest may be parked at an input screen (Ctrl-C stops the install, nothing else does)"
+                );
+                return Ok(());
+            }
             // Cause only; failure arms append frame + serial + VNC.
             anyhow::bail!(
-                "guest appears stuck: no disk I/O for {idle}s and no SSH — likely parked at an input screen (recovery, EULA)"
+                "guest appears stuck: no disk I/O for {idle}s, disk static for {disk_idle}s and no SSH — likely parked at an input screen (recovery, EULA)"
             );
         }
         if idle >= timeouts::IDLE_WARN_SECS && !self.warned {
@@ -3226,11 +3265,13 @@ fn spawn_sampler(
         loop {
             ticker.tick().await;
             activity.sample(&sampler.mon, Some(disk.as_path())).await;
-            if let Err(e) = activity.check_stall() {
-                eprintln!("{e:#}");
-                return;
-            }
             sampler.poll(&profile).await;
+            // Stall check after the fresh classification: frozen I/O
+            // during valid progress is a slow host, never a stuck guest.
+            // Warn-only by construction (fatal=false never errs): no
+            // screen, state, or activity reading exits this loop early.
+            // The task ends solely on abort (victory) or cancellation.
+            activity.check_stall(sampler.state(), false).ok();
             report_sample(label, &sampler, &activity);
         }
     }))
@@ -3344,11 +3385,18 @@ impl ScreenSampler {
         self.last_outcome = SampleOutcome::Skipped;
     }
 
-    /// Fold one captured frame into motion + phase tracking. New geometry
-    /// (driver handoff) or first frame: no baseline, so no claim — the
-    /// buffer adopts the new geometry and the static timer holds.
+    /// Fold one captured frame into motion + phase tracking. The diff runs
+    /// on the center-half crop grid (spinners and progress bars live
+    /// there): a full-frame mean diff dilutes localized animation into
+    /// the static background until a spinning installer reads static.
+    /// New geometry (driver handoff) or first frame: no baseline, so no
+    /// claim — the buffer adopts the new geometry and the static timer
+    /// holds.
     fn observe_frame(&mut self, rgb: &[u8], w: u32, h: u32, state: ScreenState) {
-        let grid = crate::screen_cnn::downsample_to_grid_rgb(rgb, w as usize, h as usize);
+        let (x0, y0, x1, y1) = crate::screen_cnn::crop_region(w as usize, h as usize);
+        let grid = crate::screen_cnn::downsample_region_to_grid_rgb(
+            rgb, w as usize, h as usize, x0, y0, x1, y1,
+        );
         let moved = match &self.prev_grid {
             Some((prev, pw, ph)) if *pw == w && *ph == h => {
                 mean_abs_diff(prev, &grid) >= Self::MOTION_NOISE_FLOOR
@@ -3369,6 +3417,11 @@ impl ScreenSampler {
     /// Seconds in the current screen state.
     fn phase_secs(&self) -> u64 {
         self.state_since.elapsed().as_secs()
+    }
+
+    /// Latest classified state, if any frame has been captured yet.
+    fn state(&self) -> Option<ScreenState> {
+        self.last_state.map(|(s, _)| s)
     }
 
     /// Seconds since pixels last moved beyond the noise floor.
@@ -3544,10 +3597,15 @@ async fn wait_install_ready(
     // Reboot awareness while Setup applies (no SSH yet — serial is the
     // only below-screenshot voice): count OVMF firmware handoffs.
     let mut boots_seen = boot_count(&scope.serial_log);
+    // The install never times out on its own: only the operator stops it
+    // (Ctrl-C). Past the deadline the loop says so loudly and keeps
+    // waiting — a slow host is not a failed install.
+    let mut deadline_warned = false;
     let banner = loop {
-        if start.elapsed() > deadline {
-            anyhow::bail!(
-                "timed out waiting for SSH banner on {PROVEN_SSH_HOST}:{port} after {} s (raise --install-timeout-secs if the host is just slow)",
+        if start.elapsed() > deadline && !deadline_warned {
+            deadline_warned = true;
+            eprintln!(
+                "still no SSH banner on {PROVEN_SSH_HOST}:{port} after {} s — still waiting (Ctrl-C stops the install, nothing else does)",
                 deadline.as_secs()
             );
         }
@@ -3566,9 +3624,12 @@ async fn wait_install_ready(
             eprintln!("{note}");
         }
         boots_seen = boots;
-        // Stall watchdog: frozen disk I/O + no banner = parked.
+        // Stall watchdog: frozen disk I/O + no banner = parked. No screen
+        // state down here (SSH probing, not frame watching), so take the
+        // strict path — same as a boot that never rendered. Warn-only:
+        // nothing but the operator halts an install.
         activity.sample(&scope.mon, disk.as_deref()).await;
-        activity.check_stall()?;
+        activity.check_stall(None, false)?;
         tokio::time::sleep(timeouts::SSH_POLL_INTERVAL).await;
     };
     // Phase 2: ask the guest until it reports done. Banner loss between
@@ -3591,10 +3652,15 @@ async fn wait_install_ready(
     // Last pending-state line printed, and when the heartbeat last fired.
     let mut phase: Option<String> = None;
     let mut last_beat = start;
+    // Same operator-only rule as phase 1: the install never times out on
+    // its own. Past the deadline the loop says so loudly and keeps
+    // probing — a slow host is not a failed install.
+    let mut deadline_warned = false;
     loop {
-        if start.elapsed() > deadline {
-            anyhow::bail!(
-                "timed out waiting for guest readiness on {PROVEN_SSH_HOST}:{port} after {} s (raise --install-timeout-secs if the host is just slow)",
+        if start.elapsed() > deadline && !deadline_warned {
+            deadline_warned = true;
+            eprintln!(
+                "still waiting for guest readiness on {PROVEN_SSH_HOST}:{port} after {} s — still probing (Ctrl-C stops the install, nothing else does)",
                 deadline.as_secs()
             );
         }
@@ -3942,6 +4008,49 @@ mod tests {
         // Fresh activity resets the idle clock.
         m.last_change = std::time::Instant::now();
         assert!(m.is_moving());
+    }
+
+    #[test]
+    fn stall_watchdog_needs_non_progress_and_flat_guest() {
+        // Progress states never bail, however long I/O has been flat: a
+        // slow host applying the image answers only to the operator, not
+        // the stall watchdog (live 2026-10-07: 120s of CPU-bound setup
+        // with InstallerStep on screen aborted a valid install).
+        let mut m = ActivityMonitor {
+            last_total: 1000,
+            last_change: std::time::Instant::now() - Duration::from_secs(10_000),
+            warned: false,
+            disk_start: Some(100),
+            disk_last: 100,
+            disk_last_change: std::time::Instant::now() - Duration::from_secs(10_000),
+            last_sample: None,
+            io_ema_bps: 0.0,
+            growth_ema_bps: 0.0,
+        };
+        for state in [
+            ScreenState::InstallerStep,
+            ScreenState::OobeStep,
+            ScreenState::FirmwareBoot,
+            ScreenState::Lockscreen,
+        ] {
+            assert!(m.check_stall(Some(state), true).is_ok(), "{state:?}");
+        }
+        // Non-progress + flat on both signals bails when fatal.
+        assert!(m.check_stall(Some(ScreenState::ErrorScreen), true).is_err());
+        assert!(m.check_stall(Some(ScreenState::Dark), true).is_err());
+        // No frame yet: strict path, bails like a boot that never rendered.
+        assert!(m.check_stall(None, true).is_err());
+        // Flat I/O but a growing disk is not parked: bail needs both.
+        m.disk_last_change = std::time::Instant::now();
+        m.disk_last = 200;
+        assert!(m.check_stall(Some(ScreenState::ErrorScreen), true).is_ok());
+        // Install path is warn-only: the same flat guest that bails above
+        // only warns when fatal is false — nothing but the operator halts
+        // an install.
+        m.disk_last_change = std::time::Instant::now() - Duration::from_secs(10_000);
+        m.disk_last = 100;
+        assert!(m.check_stall(Some(ScreenState::ErrorScreen), false).is_ok());
+        assert!(m.check_stall(None, false).is_ok());
     }
 
     #[test]
