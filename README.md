@@ -201,7 +201,7 @@ Run `cargo run --release --bin windows-headless -- verify-pins` to check every p
 
 ## Troubleshooting
 
-**macOS Gatekeeper:** If you manually download and extract release archives via a web browser, macOS will quarantine the files. Clear the attributes manually before running: `xattr -dr com.apple.quarantine <cache-dir>`.
+**macOS Gatekeeper:** If you manually download and extract release archives via a web browser, macOS will quarantine the files. Clear the attributes manually before running: `xattr -dr com.apple.quarantine <cache-dir>` (see [Where things live](#where-things-live) for location of `cache-dir`).
 
 **If SSH prompt is never reached**
 
@@ -211,6 +211,11 @@ Run `cargo run --release --bin windows-headless -- verify-pins` to check every p
 **Refer to what hasn't yet been tested**
 
 The [not tested](#not-tested) section shows some platforms/archs/releases/spins that have not yet been tested.
+
+**Something else?**
+
+- Did you try to install with non-default params, such as a custom username/password, or system config params?  Try using the default as a canary run to see if it even works.
+- [Open an issue](https://github.com/jzombie/windows-headless/issues/new) if something else just doesn't work.
 
 ## License
 
