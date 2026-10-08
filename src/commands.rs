@@ -1667,10 +1667,13 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
         eprintln!("Windows installer is running on the {url} display.");
     }
 
-    // TODO: Don't render (much longer under TCG emulation) when not using TCG emulation
-    eprintln!(
-        "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
-    );
+    if accel == "tcg" {
+        eprintln!(
+            "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
+        );
+    } else {
+        eprintln!("This takes a while; SSH answers when Setup finishes.");
+    }
     // Cadence policy resolves after accel detection (same `accel` the
     // install argv above used — post any KVM→TCG fallback): an explicit
     // flag wins, else TCG earns 3x spacing on classification.
