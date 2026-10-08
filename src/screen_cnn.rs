@@ -399,17 +399,14 @@ fn forward_logits(full: &[u8; 3 * GRID * GRID], crop: &[u8; 3 * GRID * GRID]) ->
     logits
 }
 
-/// Two-stream predict with calibrated confidence: class, top softmax
-/// probability, and probability margin (`top - second`). Callers use the
-/// margin for hedged wording only — never for stopping or gating.
-pub fn predict_two_stream_margin(
-    full: &[u8; 3 * GRID * GRID],
-    crop: &[u8; 3 * GRID * GRID],
-) -> (ScreenClass, f32, f32) {
-    let logits = forward_logits(full, crop);
+/// Decide from a logit vector: class, top softmax probability, and
+/// probability margin (`top - second`). Single home for the
+/// logits→decision math — [`predict_two_stream_margin`] and CLI triage
+/// (`classify`) both come through here, never a second copy.
+pub fn decide_from_logits(logits: &[f32; N_CLASSES]) -> (ScreenClass, f32, f32) {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut denom = 0.0f32;
-    for &v in &logits {
+    for &v in logits {
         denom += (v - max).exp();
     }
     let mut best = 0;
@@ -426,6 +423,17 @@ pub fn predict_two_stream_margin(
         }
     }
     (BY_INDEX[best], best_p, best_p - second_p)
+}
+
+/// Two-stream predict with calibrated confidence: class, top softmax
+/// probability, and probability margin (`top - second`). Callers use the
+/// margin for hedged wording only — never for stopping or gating.
+pub fn predict_two_stream_margin(
+    full: &[u8; 3 * GRID * GRID],
+    crop: &[u8; 3 * GRID * GRID],
+) -> (ScreenClass, f32, f32) {
+    let logits = forward_logits(full, crop);
+    decide_from_logits(&logits)
 }
 
 /// Classify a full-resolution RGB frame: full view plus center-half crop,
@@ -490,22 +498,31 @@ pub fn predict_full_logits(rgb: &[u8], width: u32) -> [f32; N_CLASSES] {
 
 /// Load an 8-bit PNG from disk and expand any color type to raw RGB.
 /// Shared by the trainer (`examples/train_cnn.rs`) and the classifier
-/// tests over `tests/fixtures/`.
+/// tests over `tests/fixtures/`. Panics on I/O or decode failure by
+/// design: fixtures are versioned inputs, and a missing fixture is a
+/// repo bug, never a runtime condition. Fallible callers (CLI) use
+/// [`try_load_rgb_8bit`] instead.
 pub fn load_rgb_8bit(path: &str) -> (Vec<u8>, u32, u32) {
-    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open fixture {path}: {e}"));
+    try_load_rgb_8bit(path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+}
+
+/// Fallible sibling of [`load_rgb_8bit`] for callers that face
+/// user-supplied paths (CLI): missing files and corrupt headers come
+/// back as `Err`, never a panic. `String` error keeps this module
+/// std-only; the CLI maps it into `anyhow`.
+pub fn try_load_rgb_8bit(path: &str) -> Result<(Vec<u8>, u32, u32), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
     let decoder = png::Decoder::new(file);
     let mut reader = decoder
         .read_info()
-        .unwrap_or_else(|e| panic!("read fixture {path}: {e}"));
+        .map_err(|e| format!("read header: {e}"))?;
     let mut buf = vec![0; reader.output_buffer_size()];
     let frame = reader
         .next_frame(&mut buf)
-        .unwrap_or_else(|e| panic!("decode fixture {path}: {e}"));
-    assert_eq!(
-        frame.bit_depth,
-        png::BitDepth::Eight,
-        "fixture {path} is not 8-bit"
-    );
+        .map_err(|e| format!("decode: {e}"))?;
+    if frame.bit_depth != png::BitDepth::Eight {
+        return Err("not 8-bit".to_string());
+    }
     let (w, h) = (frame.width, frame.height);
     let px = &buf[..frame.buffer_size()];
     let rgb = match frame.color_type {
@@ -537,7 +554,7 @@ pub fn load_rgb_8bit(path: &str) -> (Vec<u8>, u32, u32) {
                 .collect()
         }
     };
-    (rgb, w, h)
+    Ok((rgb, w, h))
 }
 
 #[cfg(test)]

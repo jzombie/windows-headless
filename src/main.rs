@@ -13,8 +13,8 @@ use windows_headless::{
     Architecture, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
     commands::{
         BuildMediaArgs, GenArgs, GuestArgs, GuestOp, InstallParams, ReportArgs, RunArgs,
-        cmd_build_media, cmd_gen, cmd_guest, cmd_install, cmd_overlay, cmd_report, cmd_run,
-        cmd_snapshot, cmd_stop,
+        cmd_build_media, cmd_classify, cmd_gen, cmd_guest, cmd_install, cmd_overlay, cmd_report,
+        cmd_run, cmd_snapshot, cmd_stop,
     },
 };
 
@@ -260,6 +260,12 @@ enum Cmd {
         /// running): instant-boot state, experimental.
         #[arg(long, default_value_t = false)]
         live: bool,
+    },
+    /// Score one PNG through the micro-CNN (top-1 + margin + top-3
+    /// logits). OOD triage: no fixture dir, no snapshot, nothing blessed.
+    Classify {
+        /// PNG frame to score.
+        png: PathBuf,
     },
     /// Graceful shutdown via QMP + pidfile cleanup (no orphans).
     #[command(hide = true)]
@@ -631,6 +637,7 @@ async fn async_main() -> Result<()> {
             overlay,
             qemu_dir,
         } => cmd_overlay(base, overlay, qemu_dir).await,
+        Cmd::Classify { png } => cmd_classify(&png),
         Cmd::Stop { vm_dir, qmp_sock } => cmd_stop(vm_dir, qmp_sock).await,
         Cmd::Snapshot {
             vm_dir,

@@ -2035,6 +2035,46 @@ pub fn render_report(log: &Path) -> Result<String> {
     Ok(rows.join("\n") + "\n")
 }
 
+/// Score one PNG through the micro-CNN: top-1 class, margin, and whether
+/// the narrate path would hedge it as uncertain. OOD triage in one shot —
+/// no fixture dir, no snapshot, nothing blessed. One forward pass: the
+/// margin is derived from the same logit vector as the ranking, never a
+/// second inference. User-supplied path, so loading is fallible
+/// (`try_load_rgb_8bit`) — bad input exits nonzero via `anyhow`, never a
+/// panic out of the fixture loader.
+pub fn cmd_classify(png: &std::path::Path) -> Result<()> {
+    let path = png
+        .to_str()
+        .with_context(|| format!("non-UTF8 image path: {}", png.display()))?;
+    let (rgb, w, _) = crate::screen_cnn::try_load_rgb_8bit(path)
+        .map_err(|e| anyhow::anyhow!("load {path}: {e}"))?;
+    // Same empty-input guard as `predict_full_margin`: nothing captured
+    // is Dark at full confidence, not a softmax over zeros.
+    let (top, margin, ranked): (crate::screen_cnn::ScreenClass, f32, Vec<(usize, f32)>) =
+        if rgb.is_empty() || w == 0 {
+            (crate::screen_cnn::ScreenClass::Dark, 1.0, Vec::new())
+        } else {
+            let logits = crate::screen_cnn::predict_full_logits(&rgb, w);
+            let (class, _, margin) = crate::screen_cnn::decide_from_logits(&logits);
+            let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            (class, margin, ranked)
+        };
+    println!("top-1: {top:?} margin {margin:.3}");
+    for (i, v) in ranked.iter().take(3) {
+        println!("  {:?}: {v:.3}", crate::screen_cnn::BY_INDEX[*i]);
+    }
+    if margin < crate::screen_cnn::UNCERTAIN_PROB_MARGIN {
+        println!(
+            "verdict: UNCERTAIN (margin below {:.2} — narration hedges, nothing gates)",
+            crate::screen_cnn::UNCERTAIN_PROB_MARGIN
+        );
+    } else {
+        println!("verdict: COMMITTED (margin holds — narration states the label)");
+    }
+    Ok(())
+}
+
 pub fn cmd_report(a: ReportArgs) -> Result<()> {
     let table = render_report(&a.log)?;
     match a.readme {
