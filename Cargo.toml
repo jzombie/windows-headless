@@ -66,10 +66,5 @@ crossterm.workspace = true
 default = ["downloader"]
 downloader = ["reqwest", "cache-manager", "tar", "flate2", "liblzma", "cache-manager/os-cache-dir"]
 
-[patch.crates-io]
-# Local normalize-on-ingest work (cache-owned permission normalization);
-# remove once published upstream.
-cache-manager = { path = "../rust-cache-manager" }
-
 [dev-dependencies]
 insta = "1.49.0"
