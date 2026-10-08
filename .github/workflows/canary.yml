@@ -79,8 +79,13 @@ jobs:
       # Everything from here is the user pipeline — pinned QEMU/wimlib/
       # virtio/OpenSSH via the fetch chain, media build, then install.
       # No manual downloads, no apt QEMU.
+      - name: Fetch host tools (portable QEMU/wimlib, virtio, OpenSSH)
+        # `setup` only: `build` would chain a full install here, and the
+        # `install` step below is the single install (one install per run).
+        run: cargo run -- setup
+
       - name: Build installer media
-        run: cargo run -- build --win-iso /tmp/win11-latest.iso --force
+        run: cargo run -- build-media --win-iso /tmp/win11-latest.iso --force
 
       - name: Free the ISO (media built, provenance recorded)
         # The installer no longer needs the ISO; deleting its 6-8 GB now
