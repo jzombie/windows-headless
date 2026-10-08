@@ -2880,9 +2880,20 @@ impl ActivityMonitor {
         }
         if idle >= timeouts::IDLE_WARN_SECS && !self.warned {
             self.warned = true;
-            eprintln!(
-                "warning: no disk I/O for {idle}s and no SSH yet — guest may be stuck at an input screen"
-            );
+            // Never name an input screen without seeing one: the SSH-probe
+            // loop calls with no frame (None), while the sampler task may
+            // concurrently report progress. A blind loop claiming a parked
+            // input screen next to an installer-progress line is the exact
+            // contradiction that erodes trust in every other warning.
+            if state.is_none() {
+                eprintln!(
+                    "warning: no disk I/O for {idle}s and no SSH banner yet — still waiting"
+                );
+            } else {
+                eprintln!(
+                    "warning: no disk I/O for {idle}s and no SSH yet — guest may be stuck at an input screen"
+                );
+            }
         }
         Ok(())
     }
