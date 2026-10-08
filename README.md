@@ -2,7 +2,7 @@
 
 Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI, no host packages.
 
-**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. macOS users: see [Gatekeeper requirement](#macos-gatekeeper-requirement).**
+**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported.**
 
 > Prerequisite: A recent Rust toolchain (`cargo`, 1.85+; any stable via
 > [rustup](https://rustup.rs)). Everything else ([QEMU, wimlib, virtio
@@ -19,7 +19,6 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
-# (macOS first run: prefix with WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP=1)
 # --release throughout: debug-build screen classification runs an order of
 # magnitude slower and stretches every status tick.
 cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
@@ -200,13 +199,9 @@ The provisioning pipeline downloads third-party binaries. Hash verification is e
 
 Run `cargo run --release --bin windows-headless -- verify-pins` to check every pin without installing anything. It covers all platforms (macos-arm64, linux-x86_64, linux-aarch64) from any single runner: release metadata is platform-independent, so one CI job verifies every arch.
 
-### macOS Gatekeeper Requirement
+## Troubleshooting
 
-macOS hosts are fully supported.
-
-One-time setup: the [portable QEMU and wimlib binaries](https://github.com/jzombie/lab-qemu-portable/releases) are adhoc-signed (not notarized), so Gatekeeper blocks them until the quarantine flag is cleared from the cache directory.
-
-Either set `WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP=1` to let provisioning clear it automatically, or run `xattr -dr com.apple.quarantine <cache-dir>` yourself once. Without one of these, provisioning stops with an error before downloading anything (fail-closed by design, not a malfunction).
+(macOS): If you manually download and extract release archives via a web browser, macOS will quarantine the files. Clear the attributes manually before running: `xattr -dr com.apple.quarantine <cache-dir>`.
 
 ## License
 

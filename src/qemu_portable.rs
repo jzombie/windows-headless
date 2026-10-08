@@ -13,61 +13,10 @@ use std::path::{Component, Path, PathBuf};
 
 const UA: &str = "windows-headless/0.1";
 
-/// Env var granting explicit consent to strip `com.apple.quarantine` off the
-/// extracted portable trees on macOS. Absent/false = fail closed.
-pub const ALLOW_QUARANTINE_STRIP_ENV: &str = "WINDOWS_HEADLESS_ALLOW_QUARANTINE_STRIP";
-
-/// Quarantine attribute stripped off the extracted trees. Single source of
-/// truth for the `xattr` invocation, log lines, and the manual remediation
-/// shown to users — never a second literal copy.
-pub const QUARANTINE_ATTR: &str = "com.apple.quarantine";
-
-/// Binary invoked to clear [`QUARANTINE_ATTR`]. Same single-source rule.
-#[cfg(target_os = "macos")]
-const XATTR_BIN: &str = "xattr";
-
-/// Shell equivalent of the automatic strip, for error messages and logs.
-#[cfg(target_os = "macos")]
-fn quarantine_strip_cmdline(dir: &Path) -> String {
-    format!("{XATTR_BIN} -dr {QUARANTINE_ATTR} \"{}\"", dir.display())
-}
-
-/// Fail-closed Gatekeeper error: `kind` is `"QEMU"` or `"wimlib"`.
-#[cfg(target_os = "macos")]
-fn quarantine_gate_error(dir: &Path, kind: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        r#"macOS Gatekeeper will block the adhoc-signed {kind} binaries.
-
-Execution halted before downloading anything.
-
-To permit automatic stripping of {QUARANTINE_ATTR} from the cache dir, set:
-
-  {ALLOW_QUARANTINE_STRIP_ENV}=1
-
-Or strip it yourself:
-
-  {manual_cmd}"#,
-        manual_cmd = quarantine_strip_cmdline(dir),
-    )
-}
-
 /// Env var granting explicit consent to skip SHA-256 verification when a
 /// release ships no `SHA256SUMS.txt` (or no entry for our asset). Absent/false
 /// = fail closed. Mirrored by the `--allow-unverified` CLI flags.
 pub const ALLOW_UNVERIFIED_ENV: &str = "WINDOWS_HEADLESS_ALLOW_UNVERIFIED";
-
-/// Sole quarantine authorization boundary: true iff the operator explicitly
-/// consented. Checked by `ensure()`/`ensure_wimlib()` BEFORE any download.
-/// Both call sites are macOS-only; allowed-dead elsewhere so the truth-table
-/// test keeps running on Linux CI.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn quarantine_strip_allowed() -> bool {
-    // Bound first: do NOT chain a temporary String into the macro scrutinee.
-    let opt_in = std::env::var(ALLOW_QUARANTINE_STRIP_ENV)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(opt_in.as_str(), "1" | "true" | "yes" | "on")
-}
 
 /// Verification escape hatch: explicit CLI flag wins, else the env var.
 fn unverified_allowed(explicit: bool) -> bool {
@@ -78,46 +27,6 @@ fn unverified_allowed(explicit: bool) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     matches!(v.as_str(), "1" | "true" | "yes" | "on")
-}
-
-/// Apply the quarantine strip to an already-authorized tree. No auth check, no
-/// bail: authorization was proven by `quarantine_strip_allowed()` pre-fetch.
-/// Async: `xattr` runs via `tokio::process::Command` so the executor yields
-/// while the subprocess exits (a blocking `std::process::Command` here would
-/// stall the Tokio worker). A swallowed `Result` would reintroduce the silent
-/// path (extract succeeds, OS kills QEMU later with no explanation) — always
-/// propagate with `.await?`.
-async fn strip_quarantine(dir: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        tracing::info!(
-            "quarantine: stripping {QUARANTINE_ATTR} on {} \
-             (explicitly authorized via {ALLOW_QUARANTINE_STRIP_ENV})",
-            dir.display()
-        );
-
-        match tokio::process::Command::new(XATTR_BIN)
-            .arg("-dr")
-            .arg(QUARANTINE_ATTR)
-            .arg(dir)
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => tracing::warn!(
-                "quarantine: `{}` failed: {}",
-                quarantine_strip_cmdline(dir),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(e) => tracing::warn!("quarantine: could not run `{XATTR_BIN}`: {e:#}"),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = dir;
-    }
-
-    Ok(())
 }
 
 /// Fail-closed verification of `archive_path` against the release
@@ -450,13 +359,6 @@ pub async fn ensure(
         });
     }
 
-    // Fail fast on macOS BEFORE any network: Gatekeeper would block the
-    // adhoc-signed binaries, so downloading first would only waste gigabytes.
-    #[cfg(target_os = "macos")]
-    if !quarantine_strip_allowed() {
-        return Err(quarantine_gate_error(group.path(), "QEMU"));
-    }
-
     // Pin the exact asset URLs from the release metadata so a renamed
     // asset fails loudly instead of 404ing a guessed URL.
     let assets = release_by_tag(&tag).await?;
@@ -509,10 +411,10 @@ pub async fn ensure(
     // read-only modes tar writes per member. Single call, owned by
     // cache-manager — no local permission logic anywhere in this flow.
     // WHY: release tarballs ship 0444 lib files (verified live against
-    // the macos-arm64 asset); without this, the quarantine strip below
-    // fails EACCES on every member and Windows tree deletion breaks on
-    // rotation. Belt (ensure_dir) and suspenders (this call): tar
-    // re-applies read-only modes during unpack, after creation normalized.
+    // the macos-arm64 asset); without the re-sweep below, Windows tree
+    // deletion breaks on rotation. Belt (ensure_dir) and suspenders
+    // (re-sweep): tar re-applies read-only modes during unpack, after
+    // creation normalized.
     group.ensure_dir()?;
     extract(
         kind,
@@ -526,11 +428,9 @@ pub async fn ensure(
     )?;
     // WHY (explicitly): tar just re-applied 0444 modes per member
     // during unpack, undoing what creation normalized. This re-sweep —
-    // through the group interface, owned by cache-manager — clears them
-    // so the strip below, and every later cache operation, never hits
-    // EACCES. The comment stays so nobody "simplifies" it away.
+    // through the group interface, owned by cache-manager — clears them.
+    // The comment stays so nobody "simplifies" it away.
     group.ensure_dir()?;
-    strip_quarantine(&dest).await?;
     let _ = std::fs::remove_file(&archive_path);
     let root = dest.join(crate::paths::QEMU_INNER);
 
@@ -712,11 +612,6 @@ pub async fn ensure_wimlib(
             version: tag,
         });
     }
-    // Fail fast on macOS BEFORE any network (same Gatekeeper boundary as QEMU).
-    #[cfg(target_os = "macos")]
-    if !quarantine_strip_allowed() {
-        return Err(quarantine_gate_error(group.path(), "wimlib"));
-    }
     let (_, assets) = release_for_tag(crate::pins::RELEASE_REPO, &tag).await?;
     let asset_name = assets
         .iter()
@@ -765,11 +660,9 @@ pub async fn ensure_wimlib(
     )?;
     // WHY (explicitly): tar just re-applied 0444 modes per member
     // during unpack, undoing what creation normalized. This re-sweep —
-    // through the group interface, owned by cache-manager — clears them
-    // so the strip below, and every later cache operation, never hits
-    // EACCES. The comment stays so nobody "simplifies" it away.
+    // through the group interface, owned by cache-manager — clears them.
+    // The comment stays so nobody "simplifies" it away.
     group.ensure_dir()?;
-    strip_quarantine(&dest).await?;
     let _ = std::fs::remove_file(&archive_path);
     let root = dest.join(crate::paths::WIMLIB_INNER);
     Ok(PortableWimlib { root, version: tag })
@@ -926,27 +819,6 @@ mod tests {
         // Must not error on the dev/CI hosts we support (macos-arm64,
         // linux x86_64/aarch64); other hosts get the actionable error.
         let _ = asset_for_host();
-    }
-
-    #[test]
-    fn quarantine_gate_truth_table() {
-        // SAFETY: this test owns ALLOW_QUARANTINE_STRIP_ENV; no other test
-        // reads it (only quarantine_strip_allowed, called solely here).
-        let prior = std::env::var(ALLOW_QUARANTINE_STRIP_ENV).ok();
-        unsafe { std::env::remove_var(ALLOW_QUARANTINE_STRIP_ENV) };
-        assert!(!quarantine_strip_allowed());
-        for v in ["1", "true", "yes", "on", "TRUE", "Yes", "ON"] {
-            unsafe { std::env::set_var(ALLOW_QUARANTINE_STRIP_ENV, v) };
-            assert!(quarantine_strip_allowed(), "want allowed for {v:?}");
-        }
-        for v in ["0", "false", "no", "", "maybe"] {
-            unsafe { std::env::set_var(ALLOW_QUARANTINE_STRIP_ENV, v) };
-            assert!(!quarantine_strip_allowed(), "want denied for {v:?}");
-        }
-        match prior {
-            Some(v) => unsafe { std::env::set_var(ALLOW_QUARANTINE_STRIP_ENV, v) },
-            None => unsafe { std::env::remove_var(ALLOW_QUARANTINE_STRIP_ENV) },
-        }
     }
 
     #[test]
