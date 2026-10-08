@@ -1674,11 +1674,7 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     // Cadence policy resolves after accel detection (same `accel` the
     // install argv above used — post any KVM→TCG fallback): an explicit
     // flag wins, else TCG earns 3x spacing on classification.
-    let profile = SamplingProfile::resolve(
-        p.screenshots_every_secs,
-        p.classify_every_secs,
-        accel,
-    );
+    let profile = SamplingProfile::resolve(p.screenshots_every_secs, p.classify_every_secs, accel);
     let screenshots = if !profile.save_every.is_zero() || !profile.classify_every.is_zero() {
         let dir = screenshots_dir(&vm_dir);
         if !profile.save_every.is_zero() {
@@ -2886,9 +2882,7 @@ impl ActivityMonitor {
             // input screen next to an installer-progress line is the exact
             // contradiction that erodes trust in every other warning.
             if state.is_none() {
-                eprintln!(
-                    "warning: no disk I/O for {idle}s and no SSH banner yet — still waiting"
-                );
+                eprintln!("warning: no disk I/O for {idle}s and no SSH banner yet — still waiting");
             } else {
                 eprintln!(
                     "warning: no disk I/O for {idle}s and no SSH yet — guest may be stuck at an input screen"
@@ -3066,9 +3060,7 @@ async fn boot_failure_report(
         .map(|(p, s, _)| (p, s));
     let serial = last_serial_line(serial_log);
     let mut activity_mon = ActivityMonitor::new();
-    let disk = shots_dir
-        .parent()
-        .map(|d| d.join(crate::paths::DISK_IMAGE));
+    let disk = shots_dir.parent().map(|d| d.join(crate::paths::DISK_IMAGE));
     activity_mon.sample(mon, disk.as_deref()).await;
     let activity = Some((activity_mon.idle_secs(), activity_mon.growth_since_start()));
     format_failure_report(frame, &serial, boot_count(serial_log), activity, vnc)
@@ -3384,9 +3376,7 @@ impl ScreenSampler {
             && self
                 .last_classify
                 .is_none_or(|t| t.elapsed() >= profile.classify_every);
-        if classify_due
-            && let Some((w, h, rgb)) = capture_frame(&self.mon, &self.dir).await
-        {
+        if classify_due && let Some((w, h, rgb)) = capture_frame(&self.mon, &self.dir).await {
             let (state, margin) = classify_screen(&rgb, w);
             self.observe_frame(&rgb, w, h, state);
             self.status_n += 1;
@@ -3488,7 +3478,10 @@ fn report_sample(label: &str, sampler: &ScreenSampler, activity: &ActivityMonito
             sampler.shot_n,
             *s,
             *m,
-            p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
         ),
         // Status lines carry wall-clock runtime, not a counter: on a
         // 3-hour install "status 412" says nothing, "2h41m" says where.
