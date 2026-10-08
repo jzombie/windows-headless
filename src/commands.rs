@@ -3307,6 +3307,7 @@ enum SampleOutcome {
 struct ScreenSampler {
     mon: std::sync::Arc<crate::ipc::Monitor>,
     dir: PathBuf,
+    started: std::time::Instant,
     shot_n: u64,
     status_n: u64,
     last_save: Option<std::time::Instant>,
@@ -3330,6 +3331,7 @@ impl ScreenSampler {
         Self {
             mon,
             dir,
+            started: now,
             shot_n: 0,
             status_n: 0,
             // `None` = due immediately: the first poll captures instead of
@@ -3456,13 +3458,9 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
     sum as f32 / a.len() as f32
 }
 
-/// Compact durations: 95s under two minutes, 4m12s above.
+/// Compact durations, always HH:MM:SS: readable at 3 hours, no math.
 fn fmt_secs(s: u64) -> String {
-    if s < 120 {
-        format!("{s}s")
-    } else {
-        format!("{}m{:02}s", s / 60, s % 60)
-    }
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
 /// Compact byte counts: 512B, 12MB, 1.2GB (one decimal under 10 units).
@@ -3492,7 +3490,15 @@ fn report_sample(label: &str, sampler: &ScreenSampler, activity: &ActivityMonito
             *m,
             p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
         ),
-        SampleOutcome::Classified(s, m) => ("status", sampler.status_n, *s, *m, String::new()),
+        // Status lines carry wall-clock runtime, not a counter: on a
+        // 3-hour install "status 412" says nothing, "2h41m" says where.
+        SampleOutcome::Classified(s, m) => (
+            "status",
+            sampler.started.elapsed().as_secs(),
+            *s,
+            *m,
+            String::new(),
+        ),
         SampleOutcome::Skipped => return,
     };
     // Error reads warn only under the activity conjunction (flat guest);
@@ -3521,7 +3527,12 @@ fn report_sample(label: &str, sampler: &ScreenSampler, activity: &ActivityMonito
         format!("disk +{}", fmt_bytes(activity.growth_since_start()))
     };
     eprintln!(
-        "{warn}{label} {noun} {n}: {file_part}{} (phase {}, static {}, io {}/s avg, {disk_part}, io-idle {})",
+        "{warn}{label} {noun} {}: {file_part}{} (phase {}, static {}, io {}/s avg, {disk_part}, io-idle {})",
+        if noun == "status" {
+            fmt_secs(n)
+        } else {
+            n.to_string()
+        },
         describe(state, margin),
         fmt_secs(sampler.phase_secs()),
         fmt_secs(sampler.static_secs()),
@@ -4062,6 +4073,36 @@ mod tests {
         m.disk_last = 100;
         assert!(m.check_stall(Some(ScreenState::ErrorScreen), false).is_ok());
         assert!(m.check_stall(None, false).is_ok());
+    }
+
+    #[test]
+    fn durations_read_hh_mm_ss() {
+        assert_eq!(fmt_secs(0), "00:00:00");
+        assert_eq!(fmt_secs(95), "00:01:35");
+        assert_eq!(fmt_secs(252), "00:04:12");
+        assert_eq!(fmt_secs(3600), "01:00:00");
+        assert_eq!(fmt_secs(3 * 3600 + 41 * 60 + 7), "03:41:07");
+    }
+
+    #[test]
+    fn byte_counts_stay_compact() {
+        assert_eq!(fmt_bytes(0), "0B");
+        assert_eq!(fmt_bytes(512), "512B");
+        assert_eq!(fmt_bytes(1536), "1.5KB");
+        assert_eq!(fmt_bytes(12 * 1024 * 1024), "12MB");
+    }
+
+    #[test]
+    fn motion_diff_grades_noise_vs_movement() {
+        let still = vec![10u8; 64];
+        assert_eq!(mean_abs_diff(&still, &still), 0.0);
+        // One bright pixel in 64: 255/64 ≈ 3.98 — above the 1.5 floor.
+        let mut moved = still.clone();
+        moved[0] = 255;
+        assert!(mean_abs_diff(&still, &moved) > ScreenSampler::MOTION_NOISE_FLOOR);
+        // Degenerate inputs never panic, read as maximum motion.
+        assert_eq!(mean_abs_diff(&[], &[]), 255.0);
+        assert_eq!(mean_abs_diff(&[1, 2], &[1]), 255.0);
     }
 
     #[test]
