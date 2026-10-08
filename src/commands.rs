@@ -4265,6 +4265,12 @@ mod tests {
         // class directory IS the label: drop a capture in and both this
         // test and the trainer pick it up with no filename list anywhere.
         // Layout: tests/fixtures/<windows-version>/<class-dir>/*.png.
+        //
+        // Verdicts are snapshotted, not asserted at 100%: the corpus
+        // holds a known-unlearnable pair, so exact-fit is demanded
+        // nowhere. A changed verdict fails with a diff; bless it with
+        // `cargo insta review` (or `INSTA_UPDATE=always` as the
+        // auto-accept escape hatch).
         let expected_for_class = |class: &str| match class {
             "dark" => ScreenState::Dark,
             "flat-field" => ScreenState::FlatField,
@@ -4282,6 +4288,8 @@ mod tests {
         };
         let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
         let mut checked = 0;
+        let mut lines = Vec::new();
+        let mut misses = Vec::new();
         let mut versions: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -4310,17 +4318,25 @@ mod tests {
                     .collect();
                 names.sort();
                 for name in names {
-                    let got = classify_fixture(&format!("{version}/{class}/{name}"));
-                    assert_eq!(
-                        got,
-                        expected_for_class(&class),
-                        "fixture {version}/{class}/{name}"
-                    );
+                    let key = format!("{version}/{class}/{name}");
+                    let got = classify_fixture(&key);
+                    // Unknown class dirs fail loudly via the map (never
+                    // silently absorbed); misses group at the bottom under
+                    // their own header, so no horizontal hunt/peck.
+                    let want = expected_for_class(&class);
+                    if got == want {
+                        lines.push(format!("ok   {key} => {got:?}"));
+                    } else {
+                        misses.push(format!("MISS {key} => got {got:?}, want {want:?}"));
+                    }
                     checked += 1;
                 }
             }
         }
         assert!(checked > 0, "no fixtures found under tests/fixtures");
+        lines.push(format!("--- misses {}/{checked} ---", misses.len()));
+        lines.extend(misses);
+        insta::assert_snapshot!("screen_state_by_directory", lines.join("\n"));
     }
 
     /// Test-only fixture classification: decode via [`crate::screen_cnn`]
