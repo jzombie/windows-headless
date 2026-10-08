@@ -27,10 +27,19 @@
 //! Regenerate: `cargo run --release --bin train-screen-cnn` (release
 //! matters: thousands of sampled views per epoch over hundreds of
 //! epochs).
+//!
+//! Resume (warm start, no scratch restarts): when `artifacts/weights.bin`
+//! exists and shape-matches, it loads as init and the run fine-tunes from
+//! there — new captures converge in a fraction of full-train epochs.
+//! `--from-scratch` forces fresh He init. Every resume opens with a
+//! pre-evaluation (BASE verdict + HOLDOUT report on the loaded weights,
+//! before epoch 0) in the same line format as training, so the fine-tune
+//! is judged against an established baseline.
 
 use windows_headless::screen_cnn::{
-    BY_INDEX, DENSE_INPUTS, DENSE_TOTAL, GRID, INPUT_CHANNELS, KERNEL, N_CLASSES, N_FILTERS,
-    N_WEIGHTS, POOL, POOL_FEATURES, POOLED, STREAMS, ScreenClass, crop_region,
+    BY_INDEX, CONV_WEIGHTS, DENSE_INPUTS, DENSE_TOTAL, DENSE_WEIGHTS, F32_BYTES, FILTER_WEIGHTS,
+    GRID, INPUT_CHANNELS, KERNEL, N_CLASSES, N_FILTERS, N_WEIGHTS, POOL, POOL_FEATURES, POOLED,
+    STREAMS, ScreenClass, append_weights_le, crop_region, decode_weights_le, distribute_weights,
     downsample_region_to_grid_rgb, downsample_to_grid_rgb, load_rgb_8bit,
 };
 
@@ -74,8 +83,6 @@ const GAMMA: f32 = 2.0;
 /// frames. Same blend in `logit_loss` so reported losses match the
 /// optimized objective.
 const FOCAL_FLOOR: f32 = 0.2;
-/// Weights per convolution filter (all input channels, incl. Y-coord).
-const FILTER_WEIGHTS: usize = INPUT_CHANNELS * KERNEL * KERNEL;
 
 // ---------------------------------------------------------------------------
 // tiny deterministic RNG (fixed seed: same corpus, same weights, every run)
@@ -353,9 +360,9 @@ fn forward(
 /// Accumulated per-epoch gradient plus the batch stats the log line
 /// reports. One struct so the epoch loop reads as accumulate-then-step.
 struct GradAccum {
-    g_conv_w: [f32; N_FILTERS * FILTER_WEIGHTS],
+    g_conv_w: [f32; CONV_WEIGHTS],
     g_conv_b: [f32; N_FILTERS],
-    g_dense_w: [f32; N_CLASSES * DENSE_TOTAL],
+    g_dense_w: [f32; DENSE_WEIGHTS],
     g_dense_b: [f32; N_CLASSES],
     loss: f32,
     correct: usize,
@@ -367,9 +374,9 @@ struct GradAccum {
 impl GradAccum {
     fn zero() -> Self {
         Self {
-            g_conv_w: [0.0; N_FILTERS * FILTER_WEIGHTS],
+            g_conv_w: [0.0; CONV_WEIGHTS],
             g_conv_b: [0.0; N_FILTERS],
-            g_dense_w: [0.0; N_CLASSES * DENSE_TOTAL],
+            g_dense_w: [0.0; DENSE_WEIGHTS],
             g_dense_b: [0.0; N_CLASSES],
             loss: 0.0,
             correct: 0,
@@ -517,9 +524,9 @@ fn train_frame(
 /// freely inside the batch loop.
 #[derive(Clone, Copy)]
 struct TrainNet<'w> {
-    conv_w: &'w [f32; N_FILTERS * FILTER_WEIGHTS],
+    conv_w: &'w [f32; CONV_WEIGHTS],
     conv_b: &'w [f32; N_FILTERS],
-    dense_w: &'w [f32; N_CLASSES * DENSE_TOTAL],
+    dense_w: &'w [f32; DENSE_WEIGHTS],
     dense_b: &'w [f32; N_CLASSES],
 }
 
@@ -625,9 +632,9 @@ struct Checkpoint {
     hold_total: usize,
     margin: f32,
     epoch: usize,
-    conv_w: [f32; N_FILTERS * FILTER_WEIGHTS],
+    conv_w: [f32; CONV_WEIGHTS],
     conv_b: [f32; N_FILTERS],
-    dense_w: [f32; N_CLASSES * DENSE_TOTAL],
+    dense_w: [f32; DENSE_WEIGHTS],
     dense_b: [f32; N_CLASSES],
     stale_evals: usize,
 }
@@ -639,9 +646,9 @@ const MIN_LOSS_DELTA: f32 = 1e-4;
 
 impl Checkpoint {
     fn initial(
-        conv_w: &[f32; N_FILTERS * FILTER_WEIGHTS],
+        conv_w: &[f32; CONV_WEIGHTS],
         conv_b: &[f32; N_FILTERS],
-        dense_w: &[f32; N_CLASSES * DENSE_TOTAL],
+        dense_w: &[f32; DENSE_WEIGHTS],
         dense_b: &[f32; N_CLASSES],
     ) -> Self {
         Self {
@@ -774,15 +781,47 @@ fn main() {
     // He init scaled by each layer's fan-in.
     const CONV_FAN_IN: f32 = FILTER_WEIGHTS as f32;
     const DENSE_FAN_IN: f32 = DENSE_TOTAL as f32;
-    let mut conv_w = [0.0f32; N_FILTERS * FILTER_WEIGHTS];
+    let mut conv_w = [0.0f32; CONV_WEIGHTS];
     let mut conv_b = [0.0f32; N_FILTERS];
-    let mut dense_w = [0.0f32; N_CLASSES * DENSE_TOTAL];
+    let mut dense_w = [0.0f32; DENSE_WEIGHTS];
     let mut dense_b = [0.0f32; N_CLASSES];
-    for v in conv_w.iter_mut() {
-        *v = (rng.next_unit() as f32 * 2.0 - 1.0) * (6.0 / CONV_FAN_IN).sqrt();
-    }
-    for v in dense_w.iter_mut() {
-        *v = (rng.next_unit() as f32 * 2.0 - 1.0) * (6.0 / DENSE_FAN_IN).sqrt();
+    // Warm start: committed weights load as init when present and
+    // shape-matching, so new captures fine-tune instead of retraining.
+    // `--from-scratch` forces fresh He init. Layout and decoding live in
+    // `screen_cnn` (single contract); a present-but-wrong-size file fails
+    // hard there: the architecture drifted under the weights, and
+    // training on would silently misalign every layer.
+    let from_scratch = std::env::args().any(|a| a == "--from-scratch");
+    let weights_path = format!(
+        "{}/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        windows_headless::screen_cnn::WEIGHTS_REL_PATH
+    );
+    let resumed = if from_scratch {
+        println!("init: fresh He init (--from-scratch)");
+        false
+    } else {
+        match std::fs::read(&weights_path) {
+            Ok(bytes) => {
+                let floats = decode_weights_le(&bytes);
+                distribute_weights(&floats, &mut conv_w, &mut conv_b, &mut dense_w, &mut dense_b);
+                println!("init: warm start from {weights_path}");
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("init: no {weights_path}, fresh He init");
+                false
+            }
+            Err(e) => panic!("read {weights_path}: {e}"),
+        }
+    };
+    if !resumed {
+        for v in conv_w.iter_mut() {
+            *v = (rng.next_unit() as f32 * 2.0 - 1.0) * (6.0 / CONV_FAN_IN).sqrt();
+        }
+        for v in dense_w.iter_mut() {
+            *v = (rng.next_unit() as f32 * 2.0 - 1.0) * (6.0 / DENSE_FAN_IN).sqrt();
+        }
     }
     let n = BATCH as f32;
     let mut file_counts = [0usize; N_CLASSES];
@@ -821,6 +860,35 @@ fn main() {
     // margin tiebreak, and the weights that earned them. What ships is the
     // best observed model, never the last epoch's.
     let mut best = Checkpoint::initial(&conv_w, &conv_b, &dense_w, &dense_b);
+    if resumed {
+        // Pre-evaluation on the loaded weights, before epoch 0: the
+        // baseline this fine-tune is judged against. Same line formats as
+        // training (miss lines plus the HOLDOUT | BASE summary), so logs
+        // compare directly — no baseline, no claim of improvement.
+        let base0 = evaluate(&files, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+        for (name, want, got, loss) in &base0.misses {
+            println!(
+                "BASELINE MISCLASSIFIED {name}: want {:?}({want}) got {:?}({got}) loss {loss:.4}",
+                BY_INDEX[*want], BY_INDEX[*got]
+            );
+        }
+        let hold0 = evaluate(&holdout, &conv_w, &conv_b, &dense_w, &dense_b, &mut caches);
+        for (name, want, got, loss) in &hold0.misses {
+            println!(
+                "BASELINE HOLDOUT MISS {name}: want {:?}({want}) got {:?}({got}) loss {loss:.4}",
+                BY_INDEX[*want], BY_INDEX[*got]
+            );
+        }
+        println!(
+            "baseline (loaded weights, before epoch 0): HOLDOUT {}/{} loss {:.4} | BASE {}/{} margin {:.2}",
+            hold0.hits,
+            hold0.total,
+            hold0.mean_loss,
+            base0.hits,
+            files.len(),
+            base0.margin,
+        );
+    }
     for epoch in 0..EPOCHS {
         // Fresh batch every epoch: cycle each class's own base captures
         // with new stochastic draws. Epoch-seeded, so the same epoch
@@ -963,18 +1031,17 @@ fn main() {
             BY_INDEX[*want], BY_INDEX[*got]
         );
     }
-    let out_path = format!("{}/artifacts/weights.bin", env!("CARGO_MANIFEST_DIR"));
-    let mut bytes = Vec::with_capacity(N_WEIGHTS * 4);
-    for v in conv_w
-        .iter()
-        .chain(conv_b.iter())
-        .chain(dense_w.iter())
-        .chain(dense_b.iter())
-    {
-        bytes.extend_from_slice(&v.to_le_bytes());
+    let out_path = format!(
+        "{}/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        windows_headless::screen_cnn::WEIGHTS_REL_PATH
+    );
+    let mut bytes = Vec::new();
+    append_weights_le(&mut bytes, &conv_w, &conv_b, &dense_w, &dense_b);
+    assert_eq!(bytes.len(), N_WEIGHTS * F32_BYTES);
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        std::fs::create_dir_all(parent).unwrap();
     }
-    assert_eq!(bytes.len(), N_WEIGHTS * 4);
-    std::fs::create_dir_all(format!("{}/artifacts", env!("CARGO_MANIFEST_DIR"))).unwrap();
     std::fs::write(&out_path, &bytes).unwrap();
     println!("wrote {out_path} ({} bytes)", bytes.len());
     println!(

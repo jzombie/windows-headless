@@ -823,7 +823,8 @@ mod tests {
 
     #[test]
     fn unverified_gate_truth_table() {
-        // SAFETY: same single-owner discipline as the quarantine gate test.
+        // SAFETY: this test solely owns ALLOW_UNVERIFIED_ENV for its body;
+        // no other test reads it.
         let prior = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
         unsafe { std::env::remove_var(ALLOW_UNVERIFIED_ENV) };
         assert!(!unverified_allowed(false));

@@ -57,34 +57,108 @@ pub const STREAMS: usize = 2;
 pub const DENSE_TOTAL: usize = STREAMS * DENSE_INPUTS;
 
 /// Raw trained weights (little-endian f32), baked into the binary.
+/// Source path: [`WEIGHTS_REL_PATH`] under the crate root (the
+/// `include_bytes!` literal below must stay in sync with it by hand —
+/// macro arguments cannot name a const).
 static WEIGHT_BYTES: &[u8] = include_bytes!("../artifacts/weights.bin");
 
-/// Weight layout inside [`WEIGHT_BYTES`]: conv weights
-/// `[N_FILTERS, INPUT_CHANNELS, KERNEL, KERNEL]` (shared across streams),
-/// conv bias `[N_FILTERS]`, dense weights `[N_CLASSES, DENSE_TOTAL]`
-/// (full-stream thumbnail first, crop thumbnail second), dense bias
-/// `[N_CLASSES]`.
-pub const N_WEIGHTS: usize =
-    N_FILTERS * INPUT_CHANNELS * KERNEL * KERNEL + N_FILTERS + N_CLASSES * DENSE_TOTAL + N_CLASSES;
+/// Crate-root-relative path of the weights file. Single source of truth
+/// for every human-readable reference (prints, asserts, docs); the
+/// `include_bytes!` above is the only place that repeats it, by macro
+/// necessity.
+pub const WEIGHTS_REL_PATH: &str = "artifacts/weights.bin";
+
+/// Serialized byte size of one weight: `size_of`, never a literal, so a
+/// platform or type change stays correct by construction.
+pub const F32_BYTES: usize = size_of::<f32>();
+
+/// Conv weights per filter stack (`[N_FILTERS, INPUT_CHANNELS, KERNEL,
+/// KERNEL]`, shared across streams).
+pub const CONV_WEIGHTS: usize = N_FILTERS * FILTER_WEIGHTS;
+/// Conv weights per single filter: the stride of one filter's block
+/// inside [`CONV_WEIGHTS`].
+pub const FILTER_WEIGHTS: usize = INPUT_CHANNELS * KERNEL * KERNEL;
+/// Dense weights (`[N_CLASSES, DENSE_TOTAL]`).
+pub const DENSE_WEIGHTS: usize = N_CLASSES * DENSE_TOTAL;
+
+/// Weight layout inside [`WEIGHT_BYTES`]: conv weights, conv bias
+/// `[N_FILTERS]`, dense weights (full-stream thumbnail first, crop
+/// thumbnail second), dense bias `[N_CLASSES]`. The segment order lives
+/// here, in [`distribute_weights`] and [`append_weights_le`] — nowhere
+/// else. Reorder segments and every reader/writer moves together, by
+/// compiler force (all take the four segments as separate args).
+pub const N_WEIGHTS: usize = CONV_WEIGHTS + N_FILTERS + DENSE_WEIGHTS + N_CLASSES;
 
 /// Number of screen classes (dense outputs).
 pub const N_CLASSES: usize = 9;
 
+/// Decode a little-endian f32 weight blob into floats. Fail-hard on size:
+/// a short/long file means architecture drift, and decoding anyway would
+/// silently misalign every layer.
+pub fn decode_weights_le(bytes: &[u8]) -> Vec<f32> {
+    assert_eq!(
+        bytes.len(),
+        N_WEIGHTS * F32_BYTES,
+        "{} corrupt: want {} bytes, have {}",
+        WEIGHTS_REL_PATH,
+        N_WEIGHTS * F32_BYTES,
+        bytes.len()
+    );
+    bytes.as_chunks::<F32_BYTES>().0.iter().map(|c| {
+        let b: &[u8; 4] = c.as_slice().try_into().unwrap();
+        f32::from_le_bytes(*b)
+    }).collect()
+}
+
+/// Split a flat weight slice into the four layout segments, in order.
+/// Length asserts make a caller-side reorder a loud failure, not silent
+/// corruption.
+pub fn distribute_weights<'a>(
+    src: &'a [f32],
+    conv_w: &mut [f32],
+    conv_b: &mut [f32],
+    dense_w: &mut [f32],
+    dense_b: &mut [f32],
+) {
+    assert_eq!(conv_w.len(), CONV_WEIGHTS, "conv_w layout drift");
+    assert_eq!(conv_b.len(), N_FILTERS, "conv_b layout drift");
+    assert_eq!(dense_w.len(), DENSE_WEIGHTS, "dense_w layout drift");
+    assert_eq!(dense_b.len(), N_CLASSES, "dense_b layout drift");
+    assert_eq!(src.len(), N_WEIGHTS, "weight slice length mismatch");
+    let src: &'a [f32] = src;
+    let (a, src) = src.split_at(CONV_WEIGHTS);
+    let (b, src) = src.split_at(N_FILTERS);
+    let (c, src) = src.split_at(DENSE_WEIGHTS);
+    let (d, src) = src.split_at(N_CLASSES);
+    assert!(src.is_empty(), "weight slice longer than layout");
+    conv_w.copy_from_slice(a);
+    conv_b.copy_from_slice(b);
+    dense_w.copy_from_slice(c);
+    dense_b.copy_from_slice(d);
+}
+
+/// Serialize the four segments into little-endian bytes, in layout order:
+/// the single writer behind every `weights.bin` producer.
+pub fn append_weights_le(
+    out: &mut Vec<u8>,
+    conv_w: &[f32],
+    conv_b: &[f32],
+    dense_w: &[f32],
+    dense_b: &[f32],
+) {
+    assert_eq!(conv_w.len(), CONV_WEIGHTS, "conv_w layout drift");
+    assert_eq!(conv_b.len(), N_FILTERS, "conv_b layout drift");
+    assert_eq!(dense_w.len(), DENSE_WEIGHTS, "dense_w layout drift");
+    assert_eq!(dense_b.len(), N_CLASSES, "dense_b layout drift");
+    out.reserve(N_WEIGHTS * F32_BYTES);
+    for v in conv_w.iter().chain(conv_b.iter()).chain(dense_w.iter()).chain(dense_b.iter()) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
 /// Decoded weights (f32), parsed once on first use.
 static WEIGHTS: LazyLock<Box<[f32]>> = LazyLock::new(|| {
-    assert_eq!(
-        WEIGHT_BYTES.len(),
-        N_WEIGHTS * 4,
-        "artifacts/weights.bin corrupt: want {} bytes, have {} (regenerate with `cargo run --release --bin train-screen-cnn`)",
-        N_WEIGHTS * 4,
-        WEIGHT_BYTES.len()
-    );
-    WEIGHT_BYTES
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect()
+    decode_weights_le(WEIGHT_BYTES).into_boxed_slice()
 });
 
 /// Screen classes, in logit order (must match the trainer's label map).
