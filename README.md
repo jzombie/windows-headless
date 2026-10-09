@@ -34,24 +34,25 @@ Sizing is Docker-style: `--memory 8g --cpus 8 --disk-size 128g`
 `--smp` still works as an alias of `--cpus`.
 Sizing applies to installs too, so `run --win-iso` honors the same flags.
 
-Monitoring: watch the installer live at `vnc://127.0.0.1:5910` (password
-`demo2026`); a screenshot lands in `<cache>/vms/win11/screenshots/` every
-60 seconds until SSH answers (`--screenshots-every-secs`, `0` disables).
-Between saves, a tiny on-device CNN classifies the screen in memory every
-10s on hardware accel (30s on TCG; `--classify-every-secs`, `0` disables),
-so phase changes and error screens surface in the log within seconds.
-Dead boots end with a diagnosis block: latest frame path, screen state, last
-serial line, and firmware reboot count, so dead boots are readable without
-VNC. Screen states: installer progress, first-boot OOBE, firmware boot art,
-lock/idle, plus error states (modal error dialog, UEFI shell with no
-bootable device found, Windows recovery).
-Error states print a `WARNING:` line only when the guest is also flat
-(no disk I/O, no disk growth) — a moving guest with an error read logs as
-observation, never alarm.
-The classifier is eyes into the installer's progress, not ground truth:
-it misreads, and warnings fire on the activity conjunction, never on a
-single frame. Motion sensing (pixel change between captures) tracks
-whether the screen is alive independently of classification.
+Connect:
+- SSH: `ssh -p 2232 AdminUser@127.0.0.1`, password `P@ssw0rd123!`
+  (`--username` / `--password` override; the CLI prints the exact
+  command when ready).
+- VNC: `vnc://127.0.0.1:5910`, password `demo2026`.
+
+Watch:
+- Screenshots land in `<cache>/vms/win11/screenshots/` every 60s
+  (`--screenshots-every-secs`, `0` disables).
+- Between saves, a tiny on-device CNN classifies the screen in memory
+  every 10s on hardware accel (30s on TCG; `--classify-every-secs`,
+  `0` disables). States: installer progress, OOBE, firmware boot art,
+  lock/idle, plus error states (modal dialog, UEFI shell, recovery).
+- Warnings fire only on the conjunction (error state AND flat guest:
+  no disk I/O, no growth). A moving guest never alarms. The classifier
+  misreads; motion sensing (pixel change between captures) tracks
+  aliveness independently of classification.
+- Dead boots end with a diagnosis block: latest frame path, screen
+  state, last serial line, firmware reboot count.
 
 ## Where things live
 
