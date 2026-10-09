@@ -70,6 +70,23 @@ jobs:
           sudo journalctl --vacuum-size=100M 2>/dev/null || true
           df -h
 
+      - name: Host alibi (CPU, memory, disk speed)
+        # Same image + ISO + QEMU pin has measured 1h40m green and 5h
+        # crawl, so the variance lives below us (physical host, noisy
+        # neighbors, throttled nested KVM). This prints the host's own
+        # specs into the step log so the next slow run arrives with its
+        # alibi attached instead of inferred.
+        run: |
+          lscpu | grep -E "Model name|Architecture|CPU\(s\)|Thread|Core|Socket" || lscpu
+          echo "--- memory ---"
+          free -h
+          echo "--- disk throughput (1 GB write + read, /tmp) ---"
+          dd if=/dev/zero of=/tmp/canary-disk-probe bs=1M count=1024 conv=fdatasync 2>&1 | tail -2
+          dd if=/tmp/canary-disk-probe of=/dev/null bs=1M 2>&1 | tail -2
+          rm -f /tmp/canary-disk-probe
+          echo "--- disk free ---"
+          df -h /tmp /home/runner/work 2>/dev/null || df -h
+
       - name: Download Windows ISO (direct from Microsoft)
         # Time-limited signed URL (hours); the Linux job runs back-to-back.
         run: |
