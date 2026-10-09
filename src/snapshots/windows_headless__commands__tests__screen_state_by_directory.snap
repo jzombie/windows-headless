@@ -1,6 +1,6 @@
 ---
 source: src/commands.rs
-assertion_line: 4356
+assertion_line: 3836
 expression: "lines.join(\"\\n\")"
 ---
 ok   win11-26300-en-us-retail/dark/boot-black.png => Dark
@@ -11,15 +11,18 @@ ok   win11-26300-en-us-retail/error-bluescreen/bsod-qr-dark.png => ErrorScreen
 ok   win11-26300-en-us-retail/error-bluescreen/bsod-qr-stopcode-installerbg.png => ErrorScreen
 ok   win11-26300-en-us-retail/error-bluescreen/bsod-qr-stopcode.png => ErrorScreen
 ok   win11-26300-en-us-retail/error-bluescreen/bsod-text-memory-installerbg.png => ErrorScreen
+ok   win11-26300-en-us-retail/error-modal/pc-doesn't-currently-meet-requirements.png => ErrorScreen
 ok   win11-26300-en-us-retail/error-modal/setup-installation-failed.png => ErrorScreen
+ok   win11-26300-en-us-retail/error-modal/setup-requirements-block.png => ErrorScreen
 ok   win11-26300-en-us-retail/error-recovery/error-recovery-unrepaired.png => ErrorRecovery
 ok   win11-26300-en-us-retail/error-shell/uefi-shell.png => ErrorShell
 ok   win11-26300-en-us-retail/firmware-boot/tianocore-logo.png => FirmwareBoot
 ok   win11-26300-en-us-retail/firmware-boot/tianocore-recoverable-error.png => FirmwareBoot
+ok   win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt.png => FirmwareBoot
 ok   win11-26300-en-us-retail/firmware-boot/tianocore-splash-partial.png => FirmwareBoot
 ok   win11-26300-en-us-retail/firmware-boot/tianocore-splash.png => FirmwareBoot
+ok   win11-26300-en-us-retail/firmware-boot/tianocore-start-boot-option-plain.png => FirmwareBoot
 ok   win11-26300-en-us-retail/flat-field/blank-navy.png => FlatField
-ok   win11-26300-en-us-retail/installer-step/disk-part.png => InstallerStep
 ok   win11-26300-en-us-retail/installer-step/installer-blue-10pct.png => InstallerStep
 ok   win11-26300-en-us-retail/installer-step/installer-blue-11pct-alt.png => InstallerStep
 ok   win11-26300-en-us-retail/installer-step/installer-blue-11pct.png => InstallerStep
@@ -62,6 +65,9 @@ ok   win11-26300-en-us-retail/installer-step/installing-black-58pct.png => Insta
 ok   win11-26300-en-us-retail/installer-step/installing-black-94pct-alt.png => InstallerStep
 ok   win11-26300-en-us-retail/installer-step/installing-black-94pct-alt2.png => InstallerStep
 ok   win11-26300-en-us-retail/installer-step/installing-black-94pct.png => InstallerStep
+ok   win11-26300-en-us-retail/installer-step/installing-black-powershell-empty-alt.png => InstallerStep
+ok   win11-26300-en-us-retail/installer-step/setup-disk-part.png => InstallerStep
+ok   win11-26300-en-us-retail/installer-step/setup-diskpart-console-alt.png => InstallerStep
 ok   win11-26300-en-us-retail/lockscreen/lock-screen.png => Lockscreen
 ok   win11-26300-en-us-retail/lockscreen/login-screen.png => Lockscreen
 ok   win11-26300-en-us-retail/oobe-step/oobe-add-ms-account.png => OobeStep
@@ -85,21 +91,34 @@ ok   win11-26300-en-us-retail/oobe-step/oobe-set-up-device.png => OobeStep
 ok   win11-26300-en-us-retail/oobe-step/oobe-unlock-ms-experience.png => OobeStep
 ok   win11-26300-en-us-retail/oobe-step/oobe-use-your-phone-from-your-pc.png => OobeStep
 ok   win11-26300-en-us-retail/oobe-step/oobe-welcome.png => OobeStep
---- misses 17/99 ---
-MISS win11-26300-en-us-retail/error-modal/pc-doesn't-currently-meet-requirements.png => got OobeStep, want ErrorScreen
-MISS win11-26300-en-us-retail/error-modal/setup-requirements-block.png => got OobeStep, want ErrorScreen
-MISS win11-26300-en-us-retail/installer-step/getting-a-few-things-ready.png => got OobeStep, want InstallerStep
+--- misses 30/118 ---
+MISS win11-26300-en-us-retail/firmware-boot/guest-has-not-initialized-the-display-yet.png => got Dark, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt2.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt3.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt4.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt5.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt6.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt7.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt8.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/firmware-boot/tianocore-splash-alt9.png => got InstallerStep, want FirmwareBoot
+MISS win11-26300-en-us-retail/installer-step/black-spinner-solo.png => got Dark, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/installing-black-cmd-empty.png => got ErrorShell, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/installing-black-cmd-op-completed-successfully.png => got ErrorShell, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/installing-black-powershell-empty.png => got ErrorShell, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/just-a-moment.png => got OobeStep, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/privacy-statement.png => got OobeStep, want InstallerStep
-MISS win11-26300-en-us-retail/installer-step/product-key.png => got OobeStep, want InstallerStep
-MISS win11-26300-en-us-retail/installer-step/searching-for-disks.png => got OobeStep, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/product-key.png => got ErrorScreen, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/select-image-moved.png => got ErrorScreen, want InstallerStep
-MISS win11-26300-en-us-retail/installer-step/select-image.png => got OobeStep, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/select-image.png => got ErrorScreen, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/setup-admin-console.png => got ErrorShell, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-checking-your-pc.png => got ErrorScreen, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/setup-diskpart-console.png => got ErrorShell, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-getting-a-few-things-ready.png => got ErrorScreen, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-gettting-a-few-things-ready-alt.png => got ErrorScreen, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-license-terms-alt.png => got ErrorScreen, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/setup-license-terms.png => got ErrorScreen, want InstallerStep
 MISS win11-26300-en-us-retail/installer-step/setup-no-target-disk.png => got ErrorScreen, want InstallerStep
-MISS win11-26300-en-us-retail/installer-step/setup-window-loading.png => got OobeStep, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-please-wait-alt.png => got ErrorScreen, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-please-wait.png => got ErrorScreen, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-searching-for-disks.png => got ErrorScreen, want InstallerStep
+MISS win11-26300-en-us-retail/installer-step/setup-window-loading.png => got ErrorScreen, want InstallerStep
