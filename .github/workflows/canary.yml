@@ -115,6 +115,7 @@ jobs:
           # slash, or a query-only URL must fall back, never flow through
           # to curl and build-media as a bogus path.
           [[ "$fname" == *.iso ]] || fname="win11-latest.iso"
+          echo "ISO filename: $fname"
           curl -L -o "/tmp/$fname" "$ISO_URL"
           test -f "/tmp/$fname"
           echo "iso_path=/tmp/$fname" >> "$GITHUB_OUTPUT"
