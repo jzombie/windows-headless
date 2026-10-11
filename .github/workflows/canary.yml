@@ -100,9 +100,24 @@ jobs:
 
       - name: Download Windows ISO (direct from Microsoft)
         # Time-limited signed URL (hours); the Linux job runs back-to-back.
+        # Save under the URL's real filename (not a generic one):
+        # provenance records the --win-iso basename, so this is what the
+        # tested table shows. Observed a generic name once; never again.
+        id: iso
+        # URL arrives via env, never inline interpolation: outputs expand
+        # before the shell parses, so metacharacters in the value would
+        # otherwise parse as script.
+        env:
+          ISO_URL: ${{ needs.fetch-iso-url.outputs.url }}
         run: |
-          curl -L -o /tmp/win11-latest.iso "${{ needs.fetch-iso-url.outputs.url }}"
-          test -f /tmp/win11-latest.iso
+          fname="$(basename "${ISO_URL%%\?*}")"
+          # Only a real .iso basename is accepted: a domain, a trailing
+          # slash, or a query-only URL must fall back, never flow through
+          # to curl and build-media as a bogus path.
+          [[ "$fname" == *.iso ]] || fname="win11-latest.iso"
+          curl -L -o "/tmp/$fname" "$ISO_URL"
+          test -f "/tmp/$fname"
+          echo "iso_path=/tmp/$fname" >> "$GITHUB_OUTPUT"
 
       # Everything from here is the user pipeline — pinned QEMU/wimlib/
       # virtio/OpenSSH via the fetch chain, media build, then install.
@@ -113,12 +128,12 @@ jobs:
         run: cargo run -- setup
 
       - name: Build installer media
-        run: cargo run -- build-media --win-iso /tmp/win11-latest.iso --force
+        run: cargo run -- build-media --win-iso "${{ steps.iso.outputs.iso_path }}" --force
 
       - name: Free the ISO (media built, provenance recorded)
         # The installer no longer needs the ISO; deleting its 6-8 GB now
         # keeps peak disk inside the reclaimed headroom during Setup.
-        run: rm -f /tmp/win11-latest.iso && df -h
+        run: rm -f "${{ steps.iso.outputs.iso_path }}" && df -h
 
       - name: Unattended install (the canary)
         run: cargo run -- install
