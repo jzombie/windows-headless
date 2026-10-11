@@ -5,6 +5,13 @@ on:
     - cron: '0 2 * * 0'
   workflow_dispatch:
 
+# The proof-PR step pushes a branch and opens a PR: without this the
+# default read-only token 403s on push (observed live:
+# "Write access to repository not granted").
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
   # download URL is resolved here. Only the URL crosses the job boundary —
@@ -36,7 +43,12 @@ jobs:
     needs: fetch-iso-url
     runs-on: ubuntu-latest
     steps:
+      # Pin main: a workflow_dispatch launched with any other branch
+      # selected would otherwise run (and base the proof PR on) that
+      # branch — observed live on canary--debug-linux-amd64.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Enable KVM
         run: |
