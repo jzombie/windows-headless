@@ -43,12 +43,11 @@ jobs:
     needs: fetch-iso-url
     runs-on: ubuntu-latest
     steps:
-      # Pin main: a workflow_dispatch launched with any other branch
-      # selected would otherwise run (and base the proof PR on) that
-      # branch — observed live on canary--debug-linux-amd64.
+      # No `ref:` pin: the canary tests the code on the branch it was
+      # dispatched from. (A `ref: main` pin was tried and ran fossil code:
+      # origin/main is two commits old; all real work lives on the
+      # canary/dev branches. Dispatch from the branch you mean to test.)
       - uses: actions/checkout@v4
-        with:
-          ref: main
 
       - name: Enable KVM
         run: |
