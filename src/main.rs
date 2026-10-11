@@ -102,9 +102,9 @@ enum Cmd {
         screenshots_every_secs: u64,
         /// Screen-classification cadence during the boot wait in seconds
         /// (0 = disabled, omit = accel default: 10s hardware, 30s TCG).
-        /// Screendump + CNN with no disk write: phase changes and error
-        /// screens surface in the log within seconds while PNGs stay
-        /// minute-scale.
+        /// Screendump + nearest-exemplar match with no disk write: phase
+        /// changes and error screens surface in the log within seconds
+        /// while PNGs stay minute-scale.
         #[arg(long)]
         classify_every_secs: Option<u64>,
         /// Resume the experimental live snapshot (migrated RAM, no boot):
@@ -131,9 +131,10 @@ enum Cmd {
         #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS)]
         screenshots_every_secs: u64,
         /// Screen-classification cadence in seconds (0 = disabled, omit =
-        /// accel default: 10s hardware, 30s TCG). Screendump + CNN with no
-        /// disk write: phase changes and error screens surface in the log
-        /// within seconds while PNGs stay minute-scale.
+        /// accel default: 10s hardware, 30s TCG). Screendump + nearest-
+        /// exemplar match with no disk write: phase changes and error
+        /// screens surface in the log within seconds while PNGs stay
+        /// minute-scale.
         #[arg(long)]
         classify_every_secs: Option<u64>,
         /// Guest username (must match the media's answer file; used for
@@ -261,8 +262,9 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         live: bool,
     },
-    /// Score one PNG through the micro-CNN (top-1 + margin + top-3
-    /// logits). OOD triage: no fixture dir, no snapshot, nothing blessed.
+    /// Score one PNG through the screen classifier (top-1 + gap + top-3
+    /// matches, naming the exemplar). OOD triage: no fixture dir, no
+    /// snapshot, nothing blessed.
     Classify {
         /// PNG frame to score.
         png: PathBuf,

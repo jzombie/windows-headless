@@ -40,7 +40,7 @@ pub const DEFAULT_INSTALL_SSH_DEADLINE_SECS: u64 = 6 * 60 * 60;
 pub const DEFAULT_SCREENSHOTS_EVERY_SECS: u64 = 60;
 
 /// Default for `--classify-every-secs`: the in-memory screen-classification
-/// cadence (screendump + CNN, no disk write). Faster than the disk
+/// cadence (screendump + nearest-exemplar match, no disk write). Faster than the disk
 /// time-lapse so phase changes and error screens surface in the log
 /// within seconds while PNGs stay minute-scale. 0 disables it.
 pub const DEFAULT_CLASSIFY_EVERY_SECS: u64 = 10;

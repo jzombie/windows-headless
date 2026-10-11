@@ -3,8 +3,8 @@
 //! flows, SSH waits, reporting composition) and never touches a frame
 //! directly.
 //!
-//! Layers, innermost first: `screen_cnn` (the model) → `classify_screen`
-//! (model to `ScreenState`) → `ScreenSampler` (frames, motion, phase
+//! Layers, innermost first: `screen_knn` (embeddings + cluster centers)
+//! → `classify_screen` (nearest center to `ScreenState`) → `ScreenSampler` (frames, motion, phase
 //! clocks on a `SamplingProfile`) → `capture_frame`/`take_screenshot`
 //! (frame acquisition). `report_sample` stays with the orchestrator: it
 //! composes vision with `ActivityMonitor`, and composition belongs there.
@@ -32,7 +32,7 @@ pub(crate) fn screenshot_path(screenshots_dir: &Path) -> PathBuf {
 
 /// Coarse verdict on what the guest screen shows — the one-line answer
 /// boot failures print so they are readable without VNC. Every frame is
-/// judged alone by the micro-CNN: no history, no motion rules.
+/// judged alone by nearest-exemplar match: no history, no motion rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScreenState {
     /// No pixel visibly lit anywhere: literally nothing on screen. A
@@ -56,7 +56,7 @@ pub(crate) enum ScreenState {
     /// is never routine progress — it is the boot having failed.
     ErrorShell,
     /// Windows Recovery screens (WinRE menus and failure text), identified
-    /// by the micro-CNN in [`crate::screen_cnn`] — see its docs for the
+    /// by nearest-exemplar match — see [`crate::screen_knn`] for the
     /// class map. Recovery always needs input, so it is never content.
     ErrorRecovery,
     /// Windows Setup / installer progress screens (language select,
@@ -93,18 +93,27 @@ impl std::fmt::Display for ScreenState {
 }
 
 /// Classify raw RGB (as parsed by [`parse_ppm_p6`]). Every frame goes
-/// through the micro-CNN ([`crate::screen_cnn`]): downsample to GRID,
-/// forward pass, argmax. Single frame, no history, no pixel gates.
-/// Returns the state plus the calibrated probability margin
-/// (`top - second`): wording hedges below
-/// [`crate::screen_cnn::UNCERTAIN_PROB_MARGIN`], never gating.
+/// through the k-NN index ([`crate::screen_knn`]): embed, cosine against
+/// the baked cluster centers, top-1. Single frame, no history, no pixel
+/// gates. Returns the state plus the cosine gap (`best` minus best of
+/// any other class): wording hedges below
+/// [`crate::screen_knn::KNN_UNCERTAIN_GAP`], never gating.
 pub(crate) fn classify_screen(rgb: &[u8], width: u32) -> (ScreenState, f32) {
-    use crate::screen_cnn::ScreenClass as C;
+    use crate::screen_knn::ScreenClass as C;
     // Degenerate empty frame: nothing captured = nothing to see.
-    if rgb.is_empty() {
+    if rgb.is_empty() || width == 0 {
         return (ScreenState::Dark, 1.0);
     }
-    let (class, _, prob_margin) = crate::screen_cnn::predict_full_margin(rgb, width);
+    let height = rgb.len() / 3 / width as usize;
+    assert_eq!(
+        rgb.len(),
+        width as usize * height * 3,
+        "classify_screen size mismatch"
+    );
+    let q = crate::screen_knn::KnnIndex::embed_frame(rgb, width, height as u32);
+    let (class, gap, _) = crate::screen_knn::shared_index()
+        .predict(&q, None)
+        .unwrap_or((C::Dark, 1.0, String::new()));
     let state = match class {
         C::Dark => ScreenState::Dark,
         C::FlatField => ScreenState::FlatField,
@@ -116,19 +125,19 @@ pub(crate) fn classify_screen(rgb: &[u8], width: u32) -> (ScreenState, f32) {
         C::ErrorRecovery => ScreenState::ErrorRecovery,
         C::ErrorScreen => ScreenState::ErrorScreen,
     };
-    (state, prob_margin)
+    (state, gap)
 }
 
 /// Log-line wording for a classified frame: the [`ScreenState`] message,
 /// hedged when an error read is uncertain. Uncertainty never gates —
 /// the activity conjunction alone decides WARNINGs.
-pub(crate) fn describe(state: ScreenState, prob_margin: f32) -> String {
+pub(crate) fn describe(state: ScreenState, gap: f32) -> String {
     let base = state.to_string();
     let is_error = matches!(
         state,
         ScreenState::ErrorScreen | ScreenState::ErrorShell | ScreenState::ErrorRecovery
     );
-    if is_error && prob_margin < crate::screen_cnn::UNCERTAIN_PROB_MARGIN {
+    if is_error && gap < crate::screen_knn::KNN_UNCERTAIN_GAP {
         format!("{base} (uncertain — may need input)")
     } else {
         base
@@ -207,8 +216,8 @@ pub(crate) async fn take_screenshot(
     screenshots_dir: &Path,
 ) -> Option<(PathBuf, ScreenState, f32)> {
     let (w, h, rgb) = capture_frame(mon, screenshots_dir).await?;
-    // Single frame straight from the model: no history, no motion
-    // rules. What the CNN says is what gets reported.
+    // Single frame straight from the index: no history, no motion
+    // rules. What the nearest center says is what gets reported.
     let (state, margin) = classify_screen(&rgb, w);
     let png_path = screenshot_path(screenshots_dir);
     match write_png(&png_path, w, h, &rgb) {
@@ -328,7 +337,7 @@ fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
 pub struct SamplingProfile {
     /// Disk PNG cadence (zero = off).
     pub save_every: Duration,
-    /// In-memory CNN cadence (zero = off).
+    /// In-memory match cadence (zero = off).
     pub classify_every: Duration,
     /// Status-line narration cadence.
     pub narrate_every: Duration,
@@ -471,7 +480,7 @@ impl ScreenSampler {
     }
 
     /// Fold one captured frame into motion + phase tracking. Motion runs
-    /// on the FULL frame (not the classifier's center crop): progress
+    /// on the FULL frame (not a center crop): progress
     /// spinners live on edges (observed: installer spinner at ~4% from
     /// the left), and a crop reused for motion is blind to them. Tile-max
     /// keeps the noise immunity a full-frame mean would lose: localized
@@ -480,10 +489,10 @@ impl ScreenSampler {
     /// claim — the buffer adopts the new geometry and the static timer
     /// holds.
     fn observe_frame(&mut self, rgb: &[u8], w: u32, h: u32, state: ScreenState) {
-        let grid = crate::screen_cnn::downsample_to_grid_rgb(rgb, w as usize, h as usize);
+        let grid = crate::screen_knn::downsample_to_grid_rgb(rgb, w as usize, h as usize);
         let moved = match &self.prev_grid {
             Some((prev, pw, ph)) if *pw == w && *ph == h => {
-                tile_max_diff(prev, &grid, crate::screen_cnn::GRID) >= Self::MOTION_NOISE_FLOOR
+                tile_max_diff(prev, &grid, crate::screen_knn::GRID) >= Self::MOTION_NOISE_FLOOR
             }
             _ => false,
         };
@@ -599,9 +608,11 @@ mod tests {
 
     #[test]
     fn uncertain_errors_hedge_confident_ones_do_not() {
-        let hedged = describe(ScreenState::ErrorScreen, 0.05);
+        // Gap scale, not prob scale: the hedge threshold is
+        // KNN_UNCERTAIN_GAP (0.01), so 0.005 hedges and 0.5 states.
+        let hedged = describe(ScreenState::ErrorScreen, 0.005);
         assert!(hedged.contains("uncertain"), "{hedged}");
-        let firm = describe(ScreenState::ErrorScreen, 0.95);
+        let firm = describe(ScreenState::ErrorScreen, 0.5);
         assert!(!firm.contains("uncertain"), "{firm}");
         // Progress states never hedge: only error reads carry doubt.
         let progress = describe(ScreenState::InstallerStep, 0.0);

@@ -481,7 +481,8 @@ pub struct RunArgs {
     pub screenshots_every_secs: u64,
     /// In-memory screen-classification cadence in seconds: `Some(0)` =
     /// disabled, `None` = profile default from the accelerator (10s
-    /// hardware, 30s TCG). Screendump + CNN with no disk write.
+    /// hardware, 30s TCG). Screendump + nearest-exemplar match with no
+    /// disk write.
     pub classify_every_secs: Option<u64>,
 }
 
@@ -2035,39 +2036,42 @@ pub fn render_report(log: &Path) -> Result<String> {
     Ok(rows.join("\n") + "\n")
 }
 
-/// Score one PNG through the micro-CNN: top-1 class, margin, and whether
-/// the narrate path would hedge it as uncertain. OOD triage in one shot —
-/// no fixture dir, no snapshot, nothing blessed. One forward pass: the
-/// margin is derived from the same logit vector as the ranking, never a
-/// second inference. User-supplied path, so loading is fallible
+/// Score one PNG through the k-NN classifier ([`crate::screen_knn`]:
+/// blurred unit-norm luminance + cosine vs the baked cluster centers).
+/// OOD triage in one shot — no fixture dir, no snapshot, nothing
+/// blessed. The verdict names the matched exemplar, so a miss is a
+/// viewable cause. User-supplied path, so loading is fallible
 /// (`try_load_rgb_8bit`) — bad input exits nonzero via `anyhow`, never a
 /// panic out of the fixture loader.
 pub fn cmd_classify(png: &std::path::Path) -> Result<()> {
+    use crate::screen_knn::{KNN_TOP_K, KNN_UNCERTAIN_GAP, KnnIndex, bundled_index};
     let path = png
         .to_str()
         .with_context(|| format!("non-UTF8 image path: {}", png.display()))?;
-    let (rgb, w, _) = crate::screen_cnn::try_load_rgb_8bit(path)
+    let (rgb, w, h) = crate::screen_knn::try_load_rgb_8bit(path)
         .map_err(|e| anyhow::anyhow!("load {path}: {e}"))?;
-    // Same empty-input guard as `predict_full_margin`: nothing captured
-    // is Dark at full confidence, not a softmax over zeros.
-    let (top, margin, ranked): (crate::screen_cnn::ScreenClass, f32, Vec<(usize, f32)>) =
-        if rgb.is_empty() || w == 0 {
-            (crate::screen_cnn::ScreenClass::Dark, 1.0, Vec::new())
-        } else {
-            let logits = crate::screen_cnn::predict_full_logits(&rgb, w);
-            let (class, _, margin) = crate::screen_cnn::decide_from_logits(&logits);
-            let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-            (class, margin, ranked)
-        };
-    println!("top-1: {top:?} margin {margin:.3}");
-    for (i, v) in ranked.iter().take(3) {
-        println!("  {:?}: {v:.3}", crate::screen_cnn::BY_INDEX[*i]);
+    if rgb.is_empty() || w == 0 {
+        println!("top-1: Dark gap 1.000 (empty input — nothing captured)");
+        println!("verdict: COMMITTED (margin holds — narration states the label)");
+        return Ok(());
     }
-    if margin < crate::screen_cnn::UNCERTAIN_PROB_MARGIN {
+    let index = bundled_index();
+    let q = KnnIndex::embed_frame(&rgb, w, h);
+    let (top, gap, matched) = index
+        .predict(&q, None)
+        .with_context(|| "empty bundled k-NN index — rebuild artifacts/knn_index.bin")?;
+    println!("top-1: {top:?} gap {gap:.4} via {matched}");
+    for (label, cos, name) in index.query(&q, None, KNN_TOP_K) {
+        let class = crate::screen_knn::BY_INDEX
+            .iter()
+            .find(|c| **c as usize == label)
+            .copied()
+            .unwrap_or(crate::screen_knn::ScreenClass::Dark);
+        println!("  {class:?}: {cos:.4} {name}");
+    }
+    if gap < KNN_UNCERTAIN_GAP {
         println!(
-            "verdict: UNCERTAIN (margin below {:.2} — narration hedges, nothing gates)",
-            crate::screen_cnn::UNCERTAIN_PROB_MARGIN
+            "verdict: UNCERTAIN (gap below {KNN_UNCERTAIN_GAP:.2} — narration hedges, nothing gates)"
         );
     } else {
         println!("verdict: COMMITTED (margin holds — narration states the label)");
@@ -3741,38 +3745,40 @@ mod tests {
 
     #[test]
     fn screen_state_real_frames_classify_by_directory() {
-        // Integration over real screendumps through the micro-CNN. The
-        // class directory IS the label: drop a capture in and both this
-        // test and the trainer pick it up with no filename list anywhere.
+        // Integration over real screendumps through the k-NN classifier.
+        // The class directory IS the label: drop a capture in, rebuild
+        // the index, and both this test and the runtime pick it up with
+        // no filename list anywhere.
         // Layout: tests/fixtures/<windows-version>/<class-dir>/*.png.
         //
         // Verdicts are snapshotted, not asserted at 100%: the corpus
-        // holds a known-unlearnable pair, so exact-fit is demanded
+        // holds known-unlearnable twin pairs, so exact-fit is demanded
         // nowhere. A changed verdict fails with a diff; bless it with
         // `cargo insta review` (or `INSTA_UPDATE=always` as the
         // auto-accept escape hatch).
-        use crate::screen_cnn::ScreenClass as C;
-        // Single dir→label map: verdict target and loss label travel
-        // together, so a new class dir touches one arm, never two.
+        // Single dir→label map: a new class dir touches one arm, never two.
         let target_for_class = |class: &str| match class {
-            "dark" => (ScreenState::Dark, C::Dark),
-            "flat-field" => (ScreenState::FlatField, C::FlatField),
-            "error-shell" => (ScreenState::ErrorShell, C::ErrorShell),
-            "error-recovery" => (ScreenState::ErrorRecovery, C::ErrorRecovery),
-            "error-bluescreen" | "error-modal" => (ScreenState::ErrorScreen, C::ErrorScreen),
-            "oobe-step" => (ScreenState::OobeStep, C::OobeStep),
-            "installer-step" => (ScreenState::InstallerStep, C::InstallerStep),
-            "firmware-boot" => (ScreenState::FirmwareBoot, C::FirmwareBoot),
-            "lockscreen" => (ScreenState::Lockscreen, C::Lockscreen),
+            "dark" => ScreenState::Dark,
+            "flat-field" => ScreenState::FlatField,
+            "error-shell" => ScreenState::ErrorShell,
+            "error-recovery" => ScreenState::ErrorRecovery,
+            "error-bluescreen" | "error-modal" => ScreenState::ErrorScreen,
+            "oobe-step" => ScreenState::OobeStep,
+            "installer-step" => ScreenState::InstallerStep,
+            "firmware-boot" => ScreenState::FirmwareBoot,
+            "lockscreen" => ScreenState::Lockscreen,
             // Unknown future class dirs: fail loudly here instead of
             // silently absorbing into the snapshot.
             _ => panic!("test map missing class dir: {class}"),
         };
         let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        // The shipped path, not a test-only twin: the baked artifact
+        // scores here exactly as the live tick scores in production.
+        let index = crate::screen_knn::bundled_index();
         let mut checked = 0;
         let mut lines = Vec::new();
         let mut misses = Vec::new();
-        let mut ok_loss_sum = 0.0f64;
+        let mut ok_gap_sum = 0.0f64;
         let mut versions: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -3804,24 +3810,22 @@ mod tests {
                     let key = format!("{version}/{class}/{name}");
                     // Unknown class dirs fail loudly via the map (never
                     // silently absorbed); misses group at the bottom under
-                    // their own header, so no horizontal hunt/peck. Loss
-                    // prints to stdout (not the snapshot: `exp`/`ln`
-                    // round the last ulp differently per platform libm,
-                    // and snapshots must be bit-exact everywhere). Run
-                    // with `-- --nocapture` to score a retrain: falling
-                    // loss blesses new weights, rising loss doesn't.
-                    let (want, want_class) = target_for_class(&class);
-                    let label = crate::screen_cnn::BY_INDEX
-                        .iter()
-                        .position(|c| *c == want_class)
-                        .unwrap();
-                    let (got, loss) = classify_fixture(&key, label);
-                    println!("loss {loss:.4} {key}");
+                    // their own header, so no horizontal hunt/peck. Gaps
+                    // print to stdout (not the snapshot: float formatting
+                    // must stay bit-exact everywhere, and the gap is a
+                    // tuning signal, not a verdict). Run with
+                    // `-- --nocapture` to score an index rebuild: wider
+                    // gaps bless new centers, narrower ones don't.
+                    let want = target_for_class(&class);
+                    let (got, gap, matched) = classify_fixture(&index, &key);
+                    println!("gap {gap:.4} {key} via {matched}");
                     if got == want {
-                        ok_loss_sum += f64::from(loss);
+                        ok_gap_sum += f64::from(gap);
                         lines.push(format!("ok   {key} => {got:?}"));
                     } else {
-                        misses.push(format!("MISS {key} => got {got:?}, want {want:?}"));
+                        misses.push(format!(
+                            "MISS {key} => got {got:?}, want {want:?} via {matched}"
+                        ));
                     }
                     checked += 1;
                 }
@@ -3829,30 +3833,37 @@ mod tests {
         }
         assert!(checked > 0, "no fixtures found under tests/fixtures");
         let ok_count = checked - misses.len();
-        let mean_ok = ok_loss_sum / f64::from(ok_count.max(1) as u32);
-        println!("mean ok-loss {mean_ok:.4} over {ok_count}/{checked}");
+        let mean_ok = ok_gap_sum / f64::from(ok_count.max(1) as u32);
+        println!("mean ok-gap {mean_ok:.4} over {ok_count}/{checked}");
         lines.push(format!("--- misses {}/{checked} ---", misses.len()));
         lines.extend(misses);
         insta::assert_snapshot!("screen_state_by_directory", lines.join("\n"));
     }
 
-    /// Test-only fixture classification: decode via [`crate::screen_cnn`]
-    /// (shared with the trainer) and run the real classifier, plus the
-    /// cross-entropy loss of the TRUE label from raw logits — the score
-    /// that judges weight updates. Plain CE (no focal): comparable
-    /// across runs, same max-subtracted softmax the runtime uses.
-    fn classify_fixture(name: &str, label: usize) -> (ScreenState, f32) {
+    /// Test-only fixture classification through the real live path:
+    /// [`crate::vision::classify_screen`] on the decoded frame. Returns
+    /// the state plus the matched exemplar name, so misses carry their
+    /// cause into the snapshot itself.
+    fn classify_fixture(
+        index: &crate::screen_knn::KnnIndex,
+        name: &str,
+    ) -> (ScreenState, f32, String) {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        let (rgb, w, _) = crate::screen_cnn::load_rgb_8bit(&path);
-        let (state, _) = crate::vision::classify_screen(&rgb, w);
-        let logits = crate::screen_cnn::predict_full_logits(&rgb, w);
-        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut denom = 0.0f32;
-        for &v in &logits {
-            denom += (v - max).exp();
-        }
-        let loss = (max + denom.ln()) - logits[label];
-        (state, loss)
+        let (rgb, w, h) = crate::screen_knn::load_rgb_8bit(&path);
+        let q = crate::screen_knn::KnnIndex::embed_frame(&rgb, w, h);
+        let (got_class, gap, matched) = index.predict(&q, None).unwrap();
+        let got = match got_class {
+            crate::screen_knn::ScreenClass::Dark => ScreenState::Dark,
+            crate::screen_knn::ScreenClass::FlatField => ScreenState::FlatField,
+            crate::screen_knn::ScreenClass::ErrorShell => ScreenState::ErrorShell,
+            crate::screen_knn::ScreenClass::InstallerStep => ScreenState::InstallerStep,
+            crate::screen_knn::ScreenClass::Lockscreen => ScreenState::Lockscreen,
+            crate::screen_knn::ScreenClass::FirmwareBoot => ScreenState::FirmwareBoot,
+            crate::screen_knn::ScreenClass::OobeStep => ScreenState::OobeStep,
+            crate::screen_knn::ScreenClass::ErrorRecovery => ScreenState::ErrorRecovery,
+            crate::screen_knn::ScreenClass::ErrorScreen => ScreenState::ErrorScreen,
+        };
+        (got, gap, matched)
     }
 
     #[test]

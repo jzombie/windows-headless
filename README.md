@@ -19,8 +19,8 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
-# --release throughout: debug-build screen classification runs an order of
-# magnitude slower and stretches every status tick.
+# --release throughout: debug builds are slower across the board and
+# stretch every status tick.
 cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
 
 # ...or in two steps: build once, boot any time.
@@ -43,9 +43,9 @@ Connect:
 Watch:
 - Screenshots land in `<cache>/vms/win11/screenshots/` every 60s
   (`--screenshots-every-secs`, `0` disables).
-- Between saves, a tiny on-device CNN classifies the screen in memory
-  every 10s on hardware accel (30s on TCG; `--classify-every-secs`,
-  `0` disables). States: installer progress, OOBE, firmware boot art,
+- Between saves, a tiny on-device nearest-exemplar match classifies the
+  screen in memory every 10s on hardware accel (30s on TCG;
+  `--classify-every-secs`, `0` disables). States: installer progress, OOBE, firmware boot art,
   lock/idle, plus error states (modal dialog, UEFI shell, recovery).
 - Warnings fire only on the conjunction (error state AND flat guest:
   no disk I/O, no growth). A moving guest never alarms. The classifier
