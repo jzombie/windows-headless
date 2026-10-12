@@ -4,7 +4,7 @@ name = "windows-headless"
 authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
 version = "0.1.0-alpha"
 edition = "2024"
-description = "Minimal-dependency headless Windows 11 VM provisioning and automation"
+description = "Minimal-dependency headless Windows 11 VM provisioning and automation."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jzombie/windows-headless"
 categories = ["virtualization", "command-line-utilities"]
@@ -26,10 +26,10 @@ hex = "0.4"
 interprocess = { version = "2.4.4", features = ["tokio"] }
 isomage = "2.1"
 liblzma = "0.4"
-png = "0.17"
+png = "0.18"
 quick-xml = "0.42"
 reqwest = { version = "0.13.5", features = ["rustls", "stream", "json"] }
-russh = "0.52"
+russh = "0.64"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = { version = "0.11" }

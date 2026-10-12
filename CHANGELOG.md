@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
-## [0.1.0-alpha] - TBD
+## [0.1.0-alpha] - 10-11-2026
 
 First public shape (`0.1.0-alpha`): one command takes a Microsoft ISO and
 hands back SSH into a headless Windows 11 VM. Tested on macOS (Apple
@@ -35,4 +35,3 @@ Silicon) and Linux (amd64 + arm64); Intel Macs are not supported.
 
 - A recent Rust toolchain (1.85+); no prebuilt binaries yet.
 - Guest arch must match host arch (ARM Windows on Apple Silicon Macs).
-- On macOS, Gatekeeper needs a one-time quarantine clear (see README).
