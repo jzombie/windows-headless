@@ -26,7 +26,7 @@ hex = "0.4"
 interprocess = { version = "2.4.4", features = ["tokio"] }
 isomage = "2.1"
 liblzma = "0.4"
-png = "0.17"
+png = "0.18"
 quick-xml = "0.42"
 reqwest = { version = "0.13.5", features = ["rustls", "stream", "json"] }
 russh = "0.52"
