@@ -11,13 +11,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # The proof branch is cut from the run branch, so it transitively
-  # contains this workflow's own evolution — and GitHub Apps may not
-  # push refs touching .github/workflows/** without this scope
-  # (observed live: "refusing to allow a GitHub App to create or update
-  # workflow '.github/workflows/canary.yml'"). Scoped to this workflow's
-  # token only, not the repo default.
-  workflows: write
 
 jobs:
   # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
@@ -154,6 +147,11 @@ jobs:
         if: success()
         uses: peter-evans/create-pull-request@v7
         with:
+          # Token needs: repo push, workflow write, PR write.
+          # GITHUB_TOKEN is exempted regardless of its permissions block,
+          # so CANARY_PROOF_TOKEN must be a non-App credential carrying
+          # those three.
+          token: ${{ secrets.CANARY_PROOF_TOKEN }}
           # Flat name: `canary/proof-*` is uncreatable while a `canary`
           # branch exists (git forbids refs/heads/X alongside refs/heads/X/*).
           branch: canary-proof-${{ github.run_id }}
