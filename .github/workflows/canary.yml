@@ -5,6 +5,13 @@ on:
     - cron: '0 2 * * 0'
   workflow_dispatch:
 
+# The proof-PR step pushes a branch and opens a PR: without this the
+# default read-only token 403s on push (observed live:
+# "Write access to repository not granted").
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
   # download URL is resolved here. Only the URL crosses the job boundary —
@@ -36,6 +43,10 @@ jobs:
     needs: fetch-iso-url
     runs-on: ubuntu-latest
     steps:
+      # No `ref:` pin: the canary tests the code on the branch it was
+      # dispatched from. (A `ref: main` pin was tried and ran fossil code:
+      # origin/main is two commits old; all real work lives on the
+      # canary/dev branches. Dispatch from the branch you mean to test.)
       - uses: actions/checkout@v4
 
       - name: Enable KVM
@@ -70,22 +81,60 @@ jobs:
           sudo journalctl --vacuum-size=100M 2>/dev/null || true
           df -h
 
+      - name: Host alibi (CPU, memory, disk speed)
+        # Same image + ISO + QEMU pin has measured 1h40m green and 5h
+        # crawl, so the variance lives below us (physical host, noisy
+        # neighbors, throttled nested KVM). This prints the host's own
+        # specs into the step log so the next slow run arrives with its
+        # alibi attached instead of inferred.
+        run: |
+          lscpu | grep -E "Model name|Architecture|CPU\(s\)|Thread|Core|Socket" || lscpu
+          echo "--- memory ---"
+          free -h
+          echo "--- disk throughput (1 GB write + read, /tmp) ---"
+          dd if=/dev/zero of=/tmp/canary-disk-probe bs=1M count=1024 conv=fdatasync 2>&1 | tail -2
+          dd if=/tmp/canary-disk-probe of=/dev/null bs=1M 2>&1 | tail -2
+          rm -f /tmp/canary-disk-probe
+          echo "--- disk free ---"
+          df -h /tmp /home/runner/work 2>/dev/null || df -h
+
       - name: Download Windows ISO (direct from Microsoft)
         # Time-limited signed URL (hours); the Linux job runs back-to-back.
+        # Save under the URL's real filename (not a generic one):
+        # provenance records the --win-iso basename, so this is what the
+        # tested table shows. Observed a generic name once; never again.
+        id: iso
+        # URL arrives via env, never inline interpolation: outputs expand
+        # before the shell parses, so metacharacters in the value would
+        # otherwise parse as script.
+        env:
+          ISO_URL: ${{ needs.fetch-iso-url.outputs.url }}
         run: |
-          curl -L -o /tmp/win11-latest.iso "${{ needs.fetch-iso-url.outputs.url }}"
-          test -f /tmp/win11-latest.iso
+          fname="$(basename "${ISO_URL%%\?*}")"
+          # Only a real .iso basename is accepted: a domain, a trailing
+          # slash, or a query-only URL must fall back, never flow through
+          # to curl and build-media as a bogus path.
+          [[ "$fname" == *.iso ]] || fname="win11-latest.iso"
+          echo "ISO filename: $fname"
+          curl -L -o "/tmp/$fname" "$ISO_URL"
+          test -f "/tmp/$fname"
+          echo "iso_path=/tmp/$fname" >> "$GITHUB_OUTPUT"
 
       # Everything from here is the user pipeline — pinned QEMU/wimlib/
       # virtio/OpenSSH via the fetch chain, media build, then install.
       # No manual downloads, no apt QEMU.
+      - name: Fetch host tools (portable QEMU/wimlib, virtio, OpenSSH)
+        # `setup` only: `build` would chain a full install here, and the
+        # `install` step below is the single install (one install per run).
+        run: cargo run -- setup
+
       - name: Build installer media
-        run: cargo run -- build --win-iso /tmp/win11-latest.iso --force
+        run: cargo run -- build-media --win-iso "${{ steps.iso.outputs.iso_path }}" --force
 
       - name: Free the ISO (media built, provenance recorded)
         # The installer no longer needs the ISO; deleting its 6-8 GB now
         # keeps peak disk inside the reclaimed headroom during Setup.
-        run: rm -f /tmp/win11-latest.iso && df -h
+        run: rm -f "${{ steps.iso.outputs.iso_path }}" && df -h
 
       - name: Unattended install (the canary)
         run: cargo run -- install
@@ -98,6 +147,11 @@ jobs:
         if: success()
         uses: peter-evans/create-pull-request@v7
         with:
+          # Token needs: repo push, workflow write, PR write.
+          # GITHUB_TOKEN is exempted regardless of its permissions block,
+          # so CANARY_PROOF_TOKEN must be a non-App credential carrying
+          # those three.
+          token: ${{ secrets.CANARY_PROOF_TOKEN }}
           # Flat name: `canary/proof-*` is uncreatable while a `canary`
           # branch exists (git forbids refs/heads/X alongside refs/heads/X/*).
           branch: canary-proof-${{ github.run_id }}

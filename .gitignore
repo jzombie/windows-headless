@@ -4,5 +4,7 @@ target/
 # Project-scoped ISO / artifact cache (managed by cache-manager, no eviction)
 .cache/
 
+.DS_Store
 .codegraph
 *.patch
+*.log

@@ -13,8 +13,8 @@ use windows_headless::{
     Architecture, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
     commands::{
         BuildMediaArgs, GenArgs, GuestArgs, GuestOp, InstallParams, ReportArgs, RunArgs,
-        cmd_build_media, cmd_gen, cmd_guest, cmd_install, cmd_overlay, cmd_report, cmd_run,
-        cmd_stop,
+        cmd_build_media, cmd_classify, cmd_gen, cmd_guest, cmd_install, cmd_overlay, cmd_report,
+        cmd_run, cmd_snapshot, cmd_stop,
     },
 };
 
@@ -93,8 +93,25 @@ enum Cmd {
         win_iso: Option<PathBuf>,
         /// Budget for the unattended install's SSH wait, in seconds
         /// (reached only when `--win-iso` triggers an install).
-        #[arg(long, default_value_t = windows_headless::timeouts::INSTALL_SSH_DEADLINE_SECS)]
+        #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_INSTALL_SSH_DEADLINE_SECS)]
         install_timeout_secs: u64,
+        /// Screendump cadence during the boot wait in seconds (0 =
+        /// disabled). Frames land in `<vm-dir>/screenshots/` — a boot
+        /// time-lapse, so a slow or stuck boot is readable without VNC.
+        #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS)]
+        screenshots_every_secs: u64,
+        /// Screen-classification cadence during the boot wait in seconds
+        /// (0 = disabled, omit = accel default: 10s hardware, 30s TCG).
+        /// Screendump + nearest-exemplar match with no disk write: phase
+        /// changes and error screens surface in the log within seconds
+        /// while PNGs stay minute-scale.
+        #[arg(long)]
+        classify_every_secs: Option<u64>,
+        /// Resume the experimental live snapshot (migrated RAM, no boot):
+        /// instant when it works. Default off — golden rewind always works.
+        /// Take one first with `snapshot --live` on a running guest.
+        #[arg(long, default_value_t = false)]
+        live: bool,
     },
     /// Proven install: USB-HDD media + NVMe target, unattended answer
     /// file, ends at SSH with the guest reporting Setup complete.
@@ -111,8 +128,15 @@ enum Cmd {
         win_iso: Option<PathBuf>,
         /// Screendump cadence in seconds (0 = disabled). Screenshots land in
         /// `<vm-dir>/screenshots/` — a time-lapse of the install.
-        #[arg(long, default_value_t = windows_headless::timeouts::SCREENSHOTS_EVERY_SECS)]
+        #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS)]
         screenshots_every_secs: u64,
+        /// Screen-classification cadence in seconds (0 = disabled, omit =
+        /// accel default: 10s hardware, 30s TCG). Screendump + nearest-
+        /// exemplar match with no disk write: phase changes and error
+        /// screens surface in the log within seconds while PNGs stay
+        /// minute-scale.
+        #[arg(long)]
+        classify_every_secs: Option<u64>,
         /// Guest username (must match the media's answer file; used for
         /// the readiness probe login and the ready line).
         #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
@@ -131,7 +155,9 @@ enum Cmd {
         /// Keep Windows Automatic Repair ("Diagnosing your PC") enabled.
         /// Default off: faster boots. With recovery off, a truly damaged
         /// virtual disk fails fast instead of repairing. Snapshots are
-        /// the safety net, not WinRE.
+        /// the safety net, not WinRE. The off default is set at specialize
+        /// (first OS boot, so even an early Ctrl-C is covered); this flag
+        /// re-arms recovery when Setup reports Ready.
         #[arg(long, default_value_t = false)]
         recovery: bool,
         /// Leave Windows Update automatic (download + install + reboot on
@@ -144,7 +170,7 @@ enum Cmd {
         /// Generous on purpose: a slow host applies the image for hours,
         /// and a *parked* guest is caught separately by the no-I/O stall
         /// watchdog — this only bounds an install that is still moving.
-        #[arg(long, default_value_t = windows_headless::timeouts::INSTALL_SSH_DEADLINE_SECS)]
+        #[arg(long, default_value_t = windows_headless::timeouts::DEFAULT_INSTALL_SSH_DEADLINE_SECS)]
         install_timeout_secs: u64,
         /// Guest RAM: Docker syntax (`512m`, `4g`; bare digits are MB).
         /// Minimum 2g; Windows 11 setup needs 4g.
@@ -213,6 +239,36 @@ enum Cmd {
         #[arg(long)]
         qemu_dir: Option<PathBuf>,
     },
+    /// Snapshot the running guest as the new golden state (`docker
+    /// commit`): proves the shell, stops QEMU, snapshots the disk. Boot
+    /// the guest with `run` first; boot again afterward to resume it.
+    Snapshot {
+        /// VM dir holding the disk (default: project cache `vms/win11`).
+        #[arg(long)]
+        vm_dir: Option<PathBuf>,
+        /// Portable tree override (default: newest cached tree from `fetch-qemu`).
+        #[arg(long)]
+        qemu_dir: Option<PathBuf>,
+        /// Guest username (for the shell proof).
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
+        username: String,
+        /// Guest password (for the shell proof).
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
+        password: String,
+        #[arg(long, default_value_t = PROVEN_SSH_PORT)]
+        ssh_port: u16,
+        /// Live snapshot (overlay pivot + RAM migration, guest keeps
+        /// running): instant-boot state, experimental.
+        #[arg(long, default_value_t = false)]
+        live: bool,
+    },
+    /// Score one PNG through the screen classifier (top-1 + gap + top-3
+    /// matches, naming the exemplar). OOD triage: no fixture dir, no
+    /// snapshot, nothing blessed.
+    Classify {
+        /// PNG frame to score.
+        png: PathBuf,
+    },
     /// Graceful shutdown via QMP + pidfile cleanup (no orphans).
     #[command(hide = true)]
     Stop {
@@ -266,9 +322,12 @@ enum Cmd {
         #[arg(long)]
         arch: Option<Architecture>,
     },
-    /// Build the USB installer image: `setup` (fetch deps) + `build-media`.
-    /// One command, one artifact. Only `--win-iso` is required (your Windows
-    /// ISO); drivers, OpenSSH, wimlib, and output all default to the cache.
+    /// Build the USB installer image: `setup` (fetch deps) + `build-media`,
+    /// then install to a disk with proven defaults, settle, and snapshot the
+    /// golden landed state. One command from ISO to snapshot, unattended to
+    /// completion (CI takes its first snapshot exactly this way); `run`
+    /// connects afterward. Only `--win-iso` is required. Sizing stays
+    /// default here (prove it stock first); `install` takes the flags.
     #[cfg(feature = "downloader")]
     Build {
         /// Windows ISO path.
@@ -422,15 +481,40 @@ async fn async_main() -> Result<()> {
             password,
             locale,
         } => {
-            cmd_build(BuildArgs {
+            // Full chain with proven defaults: media, then install, settle,
+            // golden snapshot — then exit. Never a shell here: `build` must
+            // complete unattended (CI takes its first snapshot exactly this
+            // way); `run` is the command that connects.
+            let media = cmd_build(BuildArgs {
                 win_iso,
                 arch,
                 out,
                 force,
-                username,
-                password,
+                username: username.clone(),
+                password: password.clone(),
                 locale,
             })
+            .await?;
+            cmd_install(
+                InstallParams {
+                    usb_image: Some(media),
+                    win_iso: None,
+                    screenshots_every_secs:
+                        windows_headless::timeouts::DEFAULT_SCREENSHOTS_EVERY_SECS,
+                    classify_every_secs: None,
+                    username,
+                    password,
+                    recovery: false,
+                    auto_updates: false,
+                    install_timeout_secs:
+                        windows_headless::timeouts::DEFAULT_INSTALL_SSH_DEADLINE_SECS,
+                    memory_mb: 4096,
+                    cpus: 4,
+                    disk_size_gb: 64,
+                    display: windows_headless::Display::Vnc(PROVEN_VNC_DISPLAY.to_string()),
+                },
+                false,
+            )
             .await
         }
         Cmd::Gen {
@@ -490,6 +574,9 @@ async fn async_main() -> Result<()> {
             shell,
             win_iso,
             install_timeout_secs,
+            screenshots_every_secs,
+            classify_every_secs,
+            live,
         } => {
             cmd_run(RunArgs {
                 disk,
@@ -505,6 +592,9 @@ async fn async_main() -> Result<()> {
                 shell: want_shell(shell),
                 win_iso,
                 install_timeout_secs,
+                screenshots_every_secs,
+                classify_every_secs,
+                live,
             })
             .await
         }
@@ -512,6 +602,7 @@ async fn async_main() -> Result<()> {
             usb_image,
             win_iso,
             screenshots_every_secs,
+            classify_every_secs,
             username,
             password,
             shell,
@@ -528,6 +619,7 @@ async fn async_main() -> Result<()> {
                     usb_image,
                     win_iso,
                     screenshots_every_secs,
+                    classify_every_secs,
                     username,
                     password,
                     recovery,
@@ -547,7 +639,16 @@ async fn async_main() -> Result<()> {
             overlay,
             qemu_dir,
         } => cmd_overlay(base, overlay, qemu_dir).await,
+        Cmd::Classify { png } => cmd_classify(&png),
         Cmd::Stop { vm_dir, qmp_sock } => cmd_stop(vm_dir, qmp_sock).await,
+        Cmd::Snapshot {
+            vm_dir,
+            qemu_dir,
+            username,
+            password,
+            ssh_port,
+            live,
+        } => cmd_snapshot(vm_dir, qemu_dir, username, password, ssh_port, live).await,
         Cmd::Guest {
             op,
             ssh_port,
@@ -665,6 +766,33 @@ mod tests {
         assert!(Cli::try_parse_from(["wh", "run", "--memory", "512m"]).is_err());
         assert!(Cli::try_parse_from(["wh", "run", "--disk-size", "8g"]).is_err());
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn run_boot_screenshot_cadence_defaults_on() {
+        // Boot time-lapse on by default (readable boot, no VNC); 0 opts out.
+        // Classification omitted by default: the profile resolves it from
+        // the accelerator after detection.
+        let cli = Cli::try_parse_from(["wh", "run"]).unwrap();
+        let Cmd::Run {
+            screenshots_every_secs,
+            classify_every_secs,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(screenshots_every_secs, 60);
+        assert_eq!(classify_every_secs, None);
+        let cli = Cli::try_parse_from(["wh", "run", "--screenshots-every-secs", "0"]).unwrap();
+        let Cmd::Run {
+            screenshots_every_secs,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(screenshots_every_secs, 0);
     }
 
     #[test]

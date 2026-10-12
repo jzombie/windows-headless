@@ -221,10 +221,37 @@ fn loud_stderr_message(out: &[u8], err: &[u8]) -> Option<String> {
     Some(format!("guest command produced no stdout — stderr: {text}"))
 }
 
+/// One `bcdedit /enum` line check: `key ... want` (whitespace varies).
+fn bcdedit_value_verified(out: &str, key: &str, want: &str) -> bool {
+    out.lines().any(|l| {
+        let l = l.trim().to_ascii_lowercase();
+        l.starts_with(key) && l.ends_with(&want.to_ascii_lowercase())
+    })
+}
+
+/// Headless service diet + NLA profile, applied once over SSH after the
+/// guest reports Ready — deliberately NOT a specialize step: each list
+/// used to be its own synchronous PowerShell cold start serializing into
+/// Setup. One invocation here costs a single cold start off the critical
+/// path. Best-effort (warn, never fail): Setup is done, this is hygiene.
+/// Defender real-time monitoring is tamper-locked headless — not attempted.
+pub async fn apply_headless_diet(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    const SERVICES: &str = "'Spooler','WSearch','SysMain','DiagTrack','WerSvc','BITS','DoSvc','wisvc','RetailDemo','MapsBroker','Fax','WbioSrvc','PhoneSvc','RemoteRegistry','lfsvc','XblAuthManager','XblGameSave','dmwappushservice'";
+    let cmd = format!(
+        "powershell -NoProfile -Command \"Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; {SERVICES}|%{{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue}}\""
+    );
+    ssh_exec(host, port, user, pass, &cmd).await?;
+    Ok(())
+}
+
 /// Enable or disable Windows Automatic Repair ("Diagnosing your PC") on
 /// the guest. Disabled = boots fail fast instead of parking at recovery;
-/// snapshots are the safety net, not WinRE. Verified by reading the entry
-/// back (`bcdedit /enum`) — same trust-nothing rule as `set_auto_updates`.
+/// snapshots are the safety net, not WinRE. Toggles BOTH BCD switches:
+/// `recoveryenabled` gates WinRE invocation, while the "Diagnosing your
+/// PC" screen itself is the boot-status policy (`bootstatuspolicy`) —
+/// IgnoreAllFailures makes winload skip it after an unclean stop.
+/// Verified by reading the entry back (`bcdedit /enum`) — same
+/// trust-nothing rule as `set_auto_updates`.
 pub async fn set_recovery_enabled(
     host: &str,
     port: u16,
@@ -233,6 +260,11 @@ pub async fn set_recovery_enabled(
     enabled: bool,
 ) -> Result<()> {
     let val = if enabled { "Yes" } else { "No" };
+    let policy = if enabled {
+        "DisplayAllFailures"
+    } else {
+        "IgnoreAllFailures"
+    };
     ssh_exec(
         host,
         port,
@@ -241,17 +273,23 @@ pub async fn set_recovery_enabled(
         &format!("bcdedit /set {{current}} recoveryenabled {val}"),
     )
     .await?;
+    ssh_exec(
+        host,
+        port,
+        user,
+        pass,
+        &format!("bcdedit /set {{current}} bootstatuspolicy {policy}"),
+    )
+    .await?;
     let en = ssh_exec(host, port, user, pass, "bcdedit /enum {current}").await?;
-    // `recoveryenabled    Yes|No` (whitespace varies).
-    let ok = en.lines().any(|l| {
-        let l = l.trim().to_ascii_lowercase();
-        l.starts_with("recoveryenabled") && l.ends_with(&val.to_ascii_lowercase())
-    });
-    if !ok {
+    if !bcdedit_value_verified(&en, "recoveryenabled", val) {
         anyhow::bail!("recoveryenabled {val} unverified (bcdedit /enum): {en:?}");
     }
+    if !bcdedit_value_verified(&en, "bootstatuspolicy", policy) {
+        anyhow::bail!("bootstatuspolicy {policy} unverified (bcdedit /enum): {en:?}");
+    }
     eprintln!(
-        "recovery {val} (Automatic Repair {}, verified)",
+        "recovery {val} (Automatic Repair {}, boot status policy {policy}, verified)",
         if enabled { "kept" } else { "disabled" }
     );
     Ok(())
@@ -430,6 +468,49 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     while crossterm::event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
         let _ = crossterm::event::read();
     }
+    Ok(())
+}
+
+/// Prove a usable interactive shell, not just an exec channel: open a
+/// real pty shell (the exact path a user login takes — profile, prompt,
+/// the lot), send a marker, and read it back. An exec `whoami` passing
+/// while interactive logon hangs is a real failure mode (profile load,
+/// shell startup); only a prompt answering proves the prompt exists.
+/// Bounded by [`timeouts::READINESS_PROBE_BUDGET`]: answers in milliseconds
+/// on a landed guest, loud error otherwise — never a hang.
+pub async fn prove_interactive_shell(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    const MARKER: &str = "GOLDEN_SHELL_PROBE_READY";
+    let session = authed_session(host, port, user, pass).await?;
+    let mut ch = session.channel_open_session().await?;
+    ch.request_pty(false, DEFAULT_PTY_TERM, 80, 24, 0, 0, &[])
+        .await?;
+    ch.request_shell(false).await?;
+    ch.data(format!("echo {MARKER}\r\n").as_bytes()).await?;
+    tokio::time::timeout(timeouts::READINESS_PROBE_BUDGET, async {
+        let mut seen = Vec::new();
+        loop {
+            match ch.wait().await {
+                Some(russh::ChannelMsg::Data { data })
+                | Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                    seen.extend_from_slice(&data);
+                    if seen.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                Some(russh::ChannelMsg::ExitStatus { .. }) | None => {
+                    anyhow::bail!("shell closed before answering");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "no shell prompt within {} s — interactive logon is not usable",
+            timeouts::READINESS_PROBE_BUDGET.as_secs()
+        )
+    })??;
     Ok(())
 }
 
@@ -683,11 +764,42 @@ mod tests {
     #[test]
     fn stderr_is_loud_only_when_it_changes_the_reading() {
         let err = b"ERROR: the key does not exist\r\n";
-        // No stdout: without the loud report a broken command would masquerade
+        // No stdout: without the loud report a broken command would masquer
         // as an empty-but-successful answer (observed live).
         assert!(loud_stderr_message(b"", err).is_some());
         // Routine stderr beside real stdout: that is progress, not an error.
         assert!(loud_stderr_message(b"HKEY_LOCAL_MACHINE\\...\r\n", err).is_none());
         assert!(loud_stderr_message(b"ok", b"").is_none());
+    }
+
+    #[test]
+    fn bcdedit_enum_lines_verify_both_switches() {
+        // Shaped like real `bcdedit /enum {current}` output: variable
+        // whitespace, mixed value widths.
+        let enum_out = "Windows Boot Manager\n---------------------\nidentifier              {bootmgr}\n\nWindows Boot Loader\n-------------------\nidentifier              {current}\npath                    \\Windows\\System32\\winload.efi\ndescription             Windows 11\nrecoveryenabled         No\nbootstatuspolicy        IgnoreAllFailures\n";
+        assert!(bcdedit_value_verified(enum_out, "recoveryenabled", "No"));
+        assert!(bcdedit_value_verified(
+            enum_out,
+            "bootstatuspolicy",
+            "IgnoreAllFailures"
+        ));
+        // Wrong policy (default DisplayAllFailures) must NOT verify.
+        assert!(!bcdedit_value_verified(
+            enum_out,
+            "bootstatuspolicy",
+            "DisplayAllFailures"
+        ));
+        // Keys must anchor at line start: "nrecoveryenabled" fails.
+        assert!(!bcdedit_value_verified(
+            "nrecoveryenabled  No\n",
+            "recoveryenabled",
+            "No"
+        ));
+        // Missing key entirely: verify-never-guess.
+        assert!(!bcdedit_value_verified(
+            "garbage\n",
+            "recoveryenabled",
+            "No"
+        ));
     }
 }

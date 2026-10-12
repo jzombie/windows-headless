@@ -136,6 +136,10 @@ pub struct HeadlessVmBuilder {
     /// Portable tree root (the extracted `qemu-portable` dir holding
     /// `bin/`). `None` = resolve `qemu-system-*` / `qemu-img` via PATH.
     pub qemu_dir: Option<PathBuf>,
+    /// Resume migrated RAM + device state at boot (`-incoming <uri>`):
+    /// the live-snapshot fast path. `None` = normal boot. Set by the
+    /// caller after verifying the state file — the builder never guesses.
+    pub incoming: Option<String>,
 }
 
 impl HeadlessVmBuilder {
@@ -168,6 +172,7 @@ impl HeadlessVmBuilder {
             unattend_dir: PathBuf::from(crate::paths::FALLBACK_UNATTEND_DIR),
             workdir: PathBuf::from("."),
             qemu_dir: None,
+            incoming: None,
         }
     }
 
@@ -232,6 +237,12 @@ impl HeadlessVmBuilder {
     /// `qemu-portable` root containing `bin/`.
     pub fn qemu_dir(mut self, d: PathBuf) -> Self {
         self.qemu_dir = Some(d);
+        self
+    }
+    /// Resume migrated state at boot (`commands::migrate_read_uri` output).
+    /// The caller verifies the state file first.
+    pub fn incoming(mut self, uri: impl Into<String>) -> Self {
+        self.incoming = Some(uri.into());
         self
     }
     /// Working dir anchor for per-VM state (defaults to `.`).
@@ -441,8 +452,25 @@ impl HeadlessVmBuilder {
                 self.vars_file().display()
             ));
         }
+        // Target disk on the SAME NVMe controller + serial boot_argv uses
+        // (inbox stornvme; part.txt/InstallTo pick Disk 0 — see the
+        // template header): identical bus topology across install and
+        // first boot means no controller change, no NIC slot shift, no
+        // minutes-long PnP re-enumeration. Never `if=virtio` here — the
+        // answer file loads no storage driver.
+        //
+        // Deliberately NO bootindex on the install NVMe (unlike
+        // boot_argv): any bootindex makes OVMF build its boot list
+        // exclusively from the fw_cfg bootorder file, and unindexed
+        // devices (the installer CD) get no boot option at all —
+        // observed live: setup drops to the UEFI shell instead of
+        // booting the ISO. Without one, OVMF enumerates every device
+        // and falls through to the installer (today's proven path, with
+        // -boot order=d below unchanged).
         a.push("-drive".into());
-        a.push(format!("file={disk},format=qcow2,if=virtio"));
+        a.push(format!("file={disk},format=qcow2,if=none,id=tgt"));
+        a.push("-device".into());
+        a.push("nvme,drive=tgt,serial=nvme1".into());
         a.push("-drive".into());
         a.push(format!("file={win_iso},media=cdrom,readonly=on"));
         a.push("-drive".into());
@@ -502,6 +530,19 @@ impl HeadlessVmBuilder {
         a.push(machine_for(self.config.arch).into());
         a.push("-smp".into());
         a.push(self.smp_cores.to_string());
+        // Live resume: migrated state streams in over `-incoming`, so the
+        // guest continues where the save left it instead of booting. Disk
+        // and VARS are restored to the save instant by the caller — argv
+        // only carries the RAM side. Guest clock isolated from the host
+        // (`clock=vm`): with `clock=host` the RTC can wait out its whole
+        // next period after a restore and lose ticks forever (documented
+        // migration pathology); vm-clock tracking restarts cleanly.
+        if let Some(uri) = &self.incoming {
+            a.push("-incoming".into());
+            a.push(uri.clone());
+            a.push("-rtc".into());
+            a.push("base=utc,clock=vm".into());
+        }
         if let Some((fw_code, _)) = self.firmware() {
             a.push("-drive".into());
             a.push(format!(
@@ -830,6 +871,22 @@ mod tests {
     }
 
     #[test]
+    fn builder_incoming_reaches_boot_argv() {
+        // Live resume: -incoming streams the migrated state file, no boot.
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11).incoming("exec:cat '/tmp/state'");
+        let argv = b.boot_argv("d.qcow2");
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-incoming"), "exec:cat '/tmp/state'");
+        // Restore carries isolated guest time (documented RTC-stop
+        // workaround); plain boots set no -rtc.
+        assert_eq!(at("-rtc"), "base=utc,clock=vm");
+        // Default boot carries no -incoming.
+        let plain = HeadlessVmBuilder::new(WindowsVersion::Win11).boot_argv("d.qcow2");
+        assert!(!plain.iter().any(|a| a == "-incoming"));
+        assert!(!plain.iter().any(|a| a == "-rtc"));
+    }
+
+    #[test]
     fn display_parse_rejects_typos() {
         assert_eq!(Display::parse("cocoa").unwrap(), Display::Cocoa);
         assert_eq!(Display::parse("none").unwrap(), Display::None);
@@ -898,9 +955,34 @@ mod tests {
                     .iter()
                     .any(|a| a.contains("if=virtio") && a.starts_with("file=fat:"))
             );
+            // Install target: NVMe (same controller as boot_argv, never
+            // virtio-blk) but WITHOUT bootindex — any bootindex starves
+            // the unindexed installer CD of a boot option in OVMF
+            // (observed: setup drops to the UEFI shell instead).
             let os = argv.iter().find(|a| a.contains(".qcow2")).unwrap();
-            assert!(os.contains("if=virtio"));
+            assert!(os.contains("if=none,id=tgt"), "got {os}");
+            assert!(argv.iter().any(|a| a == "nvme,drive=tgt,serial=nvme1"));
+            assert!(!argv.iter().any(|a| a.contains("bootindex")));
         }
+    }
+
+    #[test]
+    fn install_and_boot_share_the_nvme_controller() {
+        // One controller identity across install and first boot: same
+        // device string (bus topology + serial), differing only by
+        // boot_argv's bootindex (firmware boot priority only — invisible
+        // to Windows PnP, so it never perturbs device enumeration).
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
+        let install = b.install_argv("d.qcow2", "w.iso", "v.iso", None);
+        let boot = b.boot_argv("d.qcow2");
+        let dev = |argv: &[String]| {
+            argv.iter()
+                .find(|a| a.starts_with("nvme,drive=tgt"))
+                .expect("NVMe target device present")
+                .clone()
+        };
+        assert_eq!(dev(&install), "nvme,drive=tgt,serial=nvme1");
+        assert_eq!(dev(&boot), "nvme,drive=tgt,serial=nvme1,bootindex=0");
     }
 
     #[test]
