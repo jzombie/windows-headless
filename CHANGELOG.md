@@ -15,7 +15,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - Runtime `tokio` 1.53.1 → 1.53.2.
 - Portable QEMU `qemu-v11.1.1-48` → `qemu-v11.1.2` (SHA-256 pins refreshed).
 - virtio-win driver pack `drivers-20260925` → `drivers-20261005` (identical ISO bytes, tag-only bump).
-- All via Dependabot; no behavior changes expected.
 
 ## [0.1.0-alpha] - 10-11-2026
 
