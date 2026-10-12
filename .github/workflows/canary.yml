@@ -11,6 +11,13 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # The proof branch is cut from the run branch, so it transitively
+  # contains this workflow's own evolution — and GitHub Apps may not
+  # push refs touching .github/workflows/** without this scope
+  # (observed live: "refusing to allow a GitHub App to create or update
+  # workflow '.github/workflows/canary.yml'"). Scoped to this workflow's
+  # token only, not the repo default.
+  workflows: write
 
 jobs:
   # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
