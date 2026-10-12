@@ -2,7 +2,7 @@
 
 Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI, no host packages.
 
-**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported. See [Troubleshooting](#troubleshooting) section should unanticipated problems occur.**
+**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported, and Windows hosts are not yet tested. See [Troubleshooting](#troubleshooting) if anything goes wrong.**
 
 > Prerequisite: A recent Rust toolchain (`cargo`, 1.85+; any stable via
 > [rustup](https://rustup.rs)). Everything else ([QEMU, wimlib, virtio
@@ -187,6 +187,7 @@ Proven so far: English retail ISO on macOS Apple Silicon, linux/amd64, and linux
 
 - **Non-English installs.** Only `en-US` media has been tested. The `run --win-iso` / `install --win-iso` chain rebuilds media as `en-US`, the answer file selects the `Windows 11 Pro` image name, and parts of guest verification parse English command output.
 - **Other hosts.** `macos / aarch64`, `linux / amd64`, and `linux / aarch64` have logged installs (see table above). The `linux / aarch64` runs to date were evaluated inside an OrbStack Linux VM (nested virtualization), not on bare metal. Accel is recorded per run in the table.
+- **Windows hosts.** No proven install has been logged on a Windows host yet (see table above). The portable tree ships a Windows QEMU build, but the install path there is unexercised.
 - **No mixed archs.** Guest arch must match host arch (ARM Windows on macOS Apple Silicon, x64 Windows on x64 Linux). HVF/KVM require it. Cross-arch guests (x64 Windows on macOS) are untested and unsupported; they fall back to TCG emulation at a 5x to 15x slowdown if they boot at all.
 - **Eval / Enterprise / OEM media.** Proven installs used retail ISOs (see table above). Eval, Enterprise, and OEM media have never been exercised against this [answer file](./templates/autounattend.xml).
 
