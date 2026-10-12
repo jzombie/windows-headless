@@ -265,6 +265,9 @@ fn github_client() -> Result<reqwest::Client> {
 
 /// Unpack a `.tar.gz` / `.tar.xz` archive into `dest`, rejecting absolute
 /// paths and `..` components (defense in depth over `unpack_in`).
+// `inner_bin_dir` only feeds the `#[cfg(unix)]` chmod pass below; allow
+// the unused-variable lint where that block compiles out.
+#[cfg_attr(windows, allow(unused_variables))]
 fn extract(kind: AssetKind, archive: &Path, dest: &Path, inner_bin_dir: &str) -> Result<()> {
     // dest must already exist (created via the cache group); `unpack_in`
     // canonicalizes it as a traversal guard and fails otherwise.

@@ -2902,7 +2902,7 @@ impl ActivityMonitor {
 }
 
 /// Time-lapse dir name under the VM dir, and frame filename prefix.
-/// Single source: [`screenshots_dir`] builds the path, `take_screenshot` names files.
+/// Single source: screenshots_dir() builds the path, take_screenshot names files.
 pub const SCREENSHOTS_DIR: &str = "screenshots";
 
 fn screenshots_dir(vm_dir: &Path) -> PathBuf {

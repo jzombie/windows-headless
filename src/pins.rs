@@ -14,7 +14,7 @@ pub const RELEASE_REPO: &str = "jzombie/lab-qemu-portable";
 // NOTE: the tag is used verbatim.
 
 /// Pinned portable QEMU release, as a full release tag in
-/// [`RELEASE_REPO`] (https://github.com/jzombie/lab-qemu-portable) —
+/// [`RELEASE_REPO`] (<https://github.com/jzombie/lab-qemu-portable>) —
 /// never an upstream version number. Rebuilds take `qemu-vX.Y.Z-<run>`
 /// while the proven tag stays intact, so the tag is the only unambiguous
 /// build identity (binaries, bundled libs, firmware as one unit).
@@ -64,7 +64,7 @@ pub const VIRTIO_WIN_SHA256: &str =
 
 /// Win32-OpenSSH release tag (note the four-part `10.0.0.0p2` — the
 /// three-part `v10.0.0p2` form 404s; tag list at
-/// https://github.com/PowerShell/Win32-OpenSSH/releases).
+/// <https://github.com/PowerShell/Win32-OpenSSH/releases>).
 pub const OPENSSH_RELEASE_TAG: &str = "10.0.0.0p2-Preview";
 
 /// SHA-256 of `OpenSSH-Win64.zip` at [`OPENSSH_RELEASE_TAG`], verified
