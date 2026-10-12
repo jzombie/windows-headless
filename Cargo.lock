@@ -1193,9 +1193,9 @@ checksum = "0179c8acf85bf76fb3134c67e41dc53420457f02331f520172bbeb6ac1ab19b5"
 
 [[package]]
 name = "hadris-udf"
-version = "2.4.0"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff80abdac13b09d30c90aca9ecd69e61388a8c19c12192d9e5e244d800125fde"
+checksum = "7b9e1a3e9ab294007df532a9f6b413a5d62d0f5aef14e3db194df91a875f651b"
 dependencies = [
  "bitflags",
  "bytemuck",
