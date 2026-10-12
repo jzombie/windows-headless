@@ -5,37 +5,177 @@ on:
     - cron: '0 2 * * 0'
   workflow_dispatch:
 
+# The proof-PR step pushes a branch and opens a PR: without this the
+# default read-only token 403s on push (observed live:
+# "Write access to repository not granted").
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
+  # Fido is Windows-only by design (it exits 403 on Linux/macOS), so the
+  # download URL is resolved here. Only the URL crosses the job boundary —
+  # the ISO bytes are never stored on GitHub infra (no redistribution:
+  # the Linux job downloads straight from Microsoft, and the links expire).
+  # Eval media is evaluation-licensed, which covers installer testing.
+  #
+  # Single arch by design: everything arch-specific lives in early boot
+  # (firmware, storage/NIC drivers, answer-file arch), already proven per
+  # arch by logged local runs. Past driver injection the unattend passes
+  # are platform-independent, so one leg re-proving the tail against each
+  # new Microsoft build is the whole job.
+  fetch-iso-url:
+    runs-on: windows-latest
+    outputs:
+      url: ${{ steps.fido.outputs.url }}
+    steps:
+      - name: Resolve latest Windows ISO URL (Fido)
+        id: fido
+        run: |
+          # No -Ed flag: the default (retail Home/Pro/Edu) is what this
+          # project actually evaluates; Enterprise media is untested.
+          Invoke-WebRequest -Uri https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1 -OutFile $env:RUNNER_TEMP/Fido.ps1
+          $url = & $env:RUNNER_TEMP/Fido.ps1 -Win 11 -Lang English -Arch x64 -GetUrl -Quiet
+          if ([string]::IsNullOrWhiteSpace($url)) { exit 1 }
+          "url=$url" >> $env:GITHUB_OUTPUT
+
   canary:
+    needs: fetch-iso-url
     runs-on: ubuntu-latest
     steps:
+      # No `ref:` pin: the canary tests the code on the branch it was
+      # dispatched from. (A `ref: main` pin was tried and ran fossil code:
+      # origin/main is two commits old; all real work lives on the
+      # canary/dev branches. Dispatch from the branch you mean to test.)
       - uses: actions/checkout@v4
 
       - name: Enable KVM
         run: |
-          sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils netcat-openbsd curl
-          sudo modprobe kvm || true
-          sudo chmod 666 /dev/kvm || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
 
-      - name: Download latest ISOs (no cache)
+      - name: Free disk space (14GB runner limit)
+        # A canary needs ~35 GB: 6+ GB ISO, 10 GB installer image, and a
+        # disk that grows toward 20 GB during Setup. Stock runners ship
+        # with ~14 GB free — without this the install dies on ENOSPC.
+        # (The old dotnet/ghc/boost set is already gone from stock images;
+        # the weight today is toolchains, SDKs, and PowerShell.)
         run: |
-          wget -O /tmp/virtio-win.iso https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
-          # No static-HTML scrape: EvalCenter links require the interactive
-          # form. Fido drives the real download API instead.
-          wget -O /tmp/Fido.ps1 https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1
-          pwsh -NoProfile -File /tmp/Fido.ps1 -Win 11 -Edition Enterprise -Lang English -Arch x64 -Quiet -Dir /tmp
-          mv /tmp/*Windows_11*.iso /tmp/win11-latest.iso
-          test -f /tmp/win11-latest.iso
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/Java_* \
+            /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Python \
+            /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/Ruby \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /opt/microsoft \
+            /opt/az \
+            2>/dev/null || true
+          sudo docker system prune -af 2>/dev/null || true
+          sudo journalctl --vacuum-size=100M 2>/dev/null || true
+          df -h
 
-      - name: Run canary test
+      - name: Host alibi (CPU, memory, disk speed)
+        # Same image + ISO + QEMU pin has measured 1h40m green and 5h
+        # crawl, so the variance lives below us (physical host, noisy
+        # neighbors, throttled nested KVM). This prints the host's own
+        # specs into the step log so the next slow run arrives with its
+        # alibi attached instead of inferred.
+        run: |
+          lscpu | grep -E "Model name|Architecture|CPU\(s\)|Thread|Core|Socket" || lscpu
+          echo "--- memory ---"
+          free -h
+          echo "--- disk throughput (1 GB write + read, /tmp) ---"
+          dd if=/dev/zero of=/tmp/canary-disk-probe bs=1M count=1024 conv=fdatasync 2>&1 | tail -2
+          dd if=/tmp/canary-disk-probe of=/dev/null bs=1M 2>&1 | tail -2
+          rm -f /tmp/canary-disk-probe
+          echo "--- disk free ---"
+          df -h /tmp /home/runner/work 2>/dev/null || df -h
+
+      - name: Download Windows ISO (direct from Microsoft)
+        # Time-limited signed URL (hours); the Linux job runs back-to-back.
+        # Save under the URL's real filename (not a generic one):
+        # provenance records the --win-iso basename, so this is what the
+        # tested table shows. Observed a generic name once; never again.
+        id: iso
+        # URL arrives via env, never inline interpolation: outputs expand
+        # before the shell parses, so metacharacters in the value would
+        # otherwise parse as script.
         env:
-          LATEST_WIN11_ISO: /tmp/win11-latest.iso
-          VIRTIO_ISO: /tmp/virtio-win.iso
-        run: cargo test --test canary_test -- --ignored --nocapture
+          ISO_URL: ${{ needs.fetch-iso-url.outputs.url }}
+        run: |
+          fname="$(basename "${ISO_URL%%\?*}")"
+          # Only a real .iso basename is accepted: a domain, a trailing
+          # slash, or a query-only URL must fall back, never flow through
+          # to curl and build-media as a bogus path.
+          [[ "$fname" == *.iso ]] || fname="win11-latest.iso"
+          echo "ISO filename: $fname"
+          curl -L -o "/tmp/$fname" "$ISO_URL"
+          test -f "/tmp/$fname"
+          echo "iso_path=/tmp/$fname" >> "$GITHUB_OUTPUT"
 
-      - name: Upload failure screenshot
-        if: failure()
+      # Everything from here is the user pipeline — pinned QEMU/wimlib/
+      # virtio/OpenSSH via the fetch chain, media build, then install.
+      # No manual downloads, no apt QEMU.
+      - name: Fetch host tools (portable QEMU/wimlib, virtio, OpenSSH)
+        # `setup` only: `build` would chain a full install here, and the
+        # `install` step below is the single install (one install per run).
+        run: cargo run -- setup
+
+      - name: Build installer media
+        run: cargo run -- build-media --win-iso "${{ steps.iso.outputs.iso_path }}" --force
+
+      - name: Free the ISO (media built, provenance recorded)
+        # The installer no longer needs the ISO; deleting its 6-8 GB now
+        # keeps peak disk inside the reclaimed headroom during Setup.
+        run: rm -f "${{ steps.iso.outputs.iso_path }}" && df -h
+
+      - name: Unattended install (the canary)
+        run: cargo run -- install
+
+      # A green install appends its own proof (tested-isos.jsonl + README
+      # table, clean tree so no dirty `*`). Human-merged by design: the
+      # Tested table is a trust statement, and the diff (ISO name, commit,
+      # result) deserves a glance before it becomes the project's word.
+      - name: Open proof PR
+        if: success()
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # Token needs: repo push, workflow write, PR write.
+          # GITHUB_TOKEN is exempted regardless of its permissions block,
+          # so CANARY_PROOF_TOKEN must be a non-App credential carrying
+          # those three.
+          token: ${{ secrets.CANARY_PROOF_TOKEN }}
+          # Flat name: `canary/proof-*` is uncreatable while a `canary`
+          # branch exists (git forbids refs/heads/X alongside refs/heads/X/*).
+          branch: canary-proof-${{ github.run_id }}
+          commit-message: "canary: prove latest Windows ISO installs unattended"
+          title: "Canary proof: latest Windows ISO installs unattended"
+          body: |
+            Weekly canary went green. Proof is the `tested-isos.jsonl` line plus the regenerated README table in this diff.
+            Run logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          add-paths: |
+            tested-isos.jsonl
+            README.md
+
+      - name: Upload time-lapse screenshots
+        # Always: frames are tiny (~6 KB PNGs) and a visual history of
+        # Setup across builds is worth more than the storage it costs.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-setup-stuck-screenshot
-          path: /tmp/ci_failure.ppm
+          name: windows-setup-screenshots
+          path: .cache/vms/win11/screenshots
+          # Frames are evidence for the linked run, not an archive: two
+          # weeks keeps last week around for comparison when this week
+          # goes red, without stacking forever.
+          retention-days: 14
+          # A media-build failure means no guest ever booted, so no frames
+          # exist; warn instead of erroring on the absent dir.
+          if-no-files-found: warn

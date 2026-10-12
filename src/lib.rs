@@ -12,18 +12,21 @@ pub mod qemu;
 #[cfg(feature = "downloader")]
 pub mod qemu_portable;
 pub mod qmp;
+pub mod screen_knn;
+pub mod sizes;
 pub mod ssh;
 pub mod storage;
 pub mod timeouts;
 pub mod unattend;
+pub mod vision;
 
 pub use ipc::{MON_SOCK_NAME, QMP_SOCK_NAME, SERIAL_LOG_NAME};
 pub use media::{
     MediaSpec, build_installer_media, extract_iso_file_to_disk, extract_virtio_netkvm, split_wim,
 };
 pub use qemu::{
-    HeadlessVm, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
-    PROVEN_VNC_PASSWORD, WindowsVersion, qmp_alive, vnc_url,
+    Display, HeadlessVm, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY,
+    PROVEN_VNC_PASSWORD, WindowsVersion, machine_for, qmp_alive, vnc_url,
 };
 #[cfg(feature = "downloader")]
 pub use qemu_portable::{PortableQemu, PortableWimlib};

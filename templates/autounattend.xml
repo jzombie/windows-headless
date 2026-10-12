@@ -83,40 +83,125 @@
   <settings pass="specialize">
     <component name="Microsoft-Windows-Deployment" processorArchitecture="{arch}" publicKeyToken="{pkt}" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
+        <!-- FIRST: gpsvc repair. EventLog's ServiceMain calls gpsvc's
+             IUserProfile2 RPC interface during startup. If the GPSvcGroup
+             svchost entry is missing (corrupt on some installs), gpsvc can
+             never start, the RPC endpoint resolution blocks for its full
+             300 s timeout, and boot-to-SSH sits at ~5 min while firewall /
+             NLA / inbound SSH wait on EventLog. Idempotent: rebuild the
+             standard structure, then start gpsvc so the pending resolution
+             completes in seconds on this boot and every later boot.
+             Deliberately FOUR short reg.exe commands, not one PowerShell
+             one-liner: Setup rejects a Path over ~256 chars with
+             WCM_E_INVALIDVALUE 0x80220005 "Value is invalid", which fails
+             the WHOLE answer file (windeploy 0x1f -> "the computer
+             restarted unexpectedly" loop; live 2026-10-04 with an
+             854-char Path). Every Path stays under 243 chars. -->
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost" /v GPSvcGroup /t REG_MULTI_SZ /d gpsvc /f</Path>
+          <Description>Register gpsvc in the Svchost GPSvcGroup (EventLog fix)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost\GPSvcGroup" /v AuthenticationCapabilities /t REG_DWORD /d 12320 /f</Path>
+          <Description>GPSvcGroup COM AuthenticationCapabilities</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Svchost\GPSvcGroup" /v CoInitializeSecurityParam /t REG_DWORD /d 1 /f</Path>
+          <Description>GPSvcGroup COM CoInitializeSecurityParam</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c (sc start gpsvc &amp; exit 0)</Path>
+          <Description>Start gpsvc now to release a pending EventLog RPC wait</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
           <Path>cmd /c reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
           <Description>Bypass OOBE Network Requirement</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>2</Order>
+          <Order>6</Order>
           <Path>cmd /c reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE" /v DisablePrivacyExperience /t REG_DWORD /d 1 /f</Path>
           <Description>Disable OOBE Privacy Experience Page</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>3</Order>
+          <Order>7</Order>
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\drivers\NetKVM pnputil /add-driver %L:\drivers\NetKVM\w11\{arch}\netkvm.inf /install)</Path>
           <Description>Install NetKVM network driver (specialize)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>4</Order>
+          <Order>8</Order>
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\tools\{sshzip} powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%L:\tools\{sshzip}' -DestinationPath 'C:\Program Files\OpenSSH' -Force")</Path>
           <Description>Expand OpenSSH Server zip offline from USB</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>5</Order>
+          <Order>9</Order>
           <Path>cmd /c (pushd "C:\Program Files\OpenSSH\{sshdir}" &amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File install-sshd.ps1 > C:\ssh-install.log 2>&amp;1 &amp; exit 0)</Path>
           <Description>Install OpenSSH Server service offline (cwd-safe, logged)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>6</Order>
+          <Order>10</Order>
           <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service -Name sshd"</Path>
           <Description>Configure SSHD Automatic Startup</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>7</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</Path>
-          <Description>Open Firewall Port 22</Description>
+          <Order>11</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
+          <Description>Configure Firewall for SSH</Description>
+        </RunSynchronousCommand>
+        <!-- Headless hard stops (Ctrl-C, SIGKILL, QEMU crash) dirty the
+             guest; the next boot must NOT park at "Diagnosing your PC" /
+             Startup Repair. IgnoreAllFailures makes winload skip the
+             boot-status diagnosis, recoveryenabled No keeps WinRE out.
+             Runs at specialize (first OS boot) — the post-install SSH
+             step applies the same policy but only when Setup reaches
+             Ready, which an early stop never does. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>12</Order>
+          <Path>cmd /c bcdedit /set {current} bootstatuspolicy IgnoreAllFailures</Path>
+          <Description>Skip "Diagnosing your PC" after unclean stops</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>13</Order>
+          <Path>cmd /c bcdedit /set {current} recoveryenabled No</Path>
+          <Description>WinRE off by default (fail fast, not repair)</Description>
+        </RunSynchronousCommand>
+        <!-- Firewall off here (measured live 2026-10-04): with it on,
+             inbound SSH sat blocked ~27s AFTER sshd was already listening;
+             off, the banner answers within seconds of bind. Slirp NAT is
+             the real gate — only the SSH port is forwarded — so in-guest
+             inbound filtering is pure latency here. The NLA profile force
+             and the service diet live post-READY (one SSH call) instead of
+             serializing PowerShell cold starts into specialize. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>14</Order>
+          <Path>cmd /c netsh advfirewall set allprofiles state off</Path>
+          <Description>Firewall off (slirp NAT is the gate; saves ~30s to SSH)</Description>
+        </RunSynchronousCommand>
+        <!-- Pre-SSH workload trim (reg writes only: no PowerShell cold
+             start, same cost class as orders 1-6). wuauserv, WSearch, and
+             SysMain contend for CPU/disk through first boot while sshd
+             waits to start; disabling here moves relief before first SSH
+             instead of after. End states stay owned post-READY (wuauserv
+             by the updates flag, the rest by the headless diet), so these
+             are timing, never policy. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>15</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\wuauserv" /v Start /t REG_DWORD /d 4 /f</Path>
+          <Description>Windows Update off until post-READY owns the end state</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>16</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\WSearch" /v Start /t REG_DWORD /d 4 /f</Path>
+          <Description>Search indexing off until the headless diet re-asserts</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>17</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\SysMain" /v Start /t REG_DWORD /d 4 /f</Path>
+          <Description>SysMain prefetch off until the headless diet re-asserts</Description>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>

@@ -216,7 +216,9 @@ impl Monitor {
                                 "monitor at {sock} never greeted after {timeout_secs}s on a live QEMU ({e:#})"
                             );
                         }
-                        eprintln!("monitor not ready yet ({e:#}); retrying ...");
+                        // Retries are routine on slow starters (hvf/TCG):
+                        // debug-only so the normal log shows one wait line.
+                        tracing::debug!("monitor not greeted yet ({e:#}); retrying ...");
                         tokio::time::sleep(Duration::from_secs(timeouts::MONITOR_RETRY_STEP_SECS))
                             .await;
                         continue;
@@ -236,7 +238,8 @@ impl Monitor {
                             "monitor at {sock} not accepting after {timeout_secs}s on a live QEMU ({e:#})"
                         );
                     }
-                    eprintln!("monitor not ready yet ({e:#}); retrying ...");
+                    // Same as above: routine while QEMU starts, debug-only.
+                    tracing::debug!("monitor not accepting yet ({e:#}); retrying ...");
                     tokio::time::sleep(Duration::from_secs(timeouts::MONITOR_RETRY_STEP_SECS))
                         .await;
                 }

@@ -272,6 +272,22 @@ mod tests {
             "OpenSSH-Win64",
             "OpenSSH-Win64.zip",
             "New-NetFirewallRule",
+            // SSH must be reachable regardless of NLA's profile verdict
+            // (the profile wait is EventLog's gpsvc stall).
+            "-Profile Any",
+            // gpsvc repair must ship: missing GPSvcGroup blocks EventLog
+            // 300 s on the IUserProfile2 endpoint resolution (5 min boots).
+            "GPSvcGroup",
+            "AuthenticationCapabilities",
+            // Recovery off from the first specialize boot: a hard stop
+            // (Ctrl-C) must never surface "Diagnosing your PC" — the
+            // post-install SSH step only applies once Setup hits Ready.
+            "bootstatuspolicy IgnoreAllFailures",
+            "recoveryenabled No",
+            // Headless diet lives post-READY (one SSH call), not here:
+            // firewall off only (slirp NAT gates inbound; the firewall sat
+            // on port 22 ~27s after sshd bound — measured).
+            "netsh advfirewall set allprofiles state off",
             "NetworkLocation",
             "TimeZone",
         ] {
@@ -297,36 +313,86 @@ mod tests {
         // A gap (orders starting at 2) fails Setup with 0x800700D
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
+        // Both command passes are checked: specialize carries the gpsvc
+        // repair, the SSH firewall commands, the recovery policy, and
+        // firewall-off (orders 1..=14; pre-SSH trim is 15..=17, the rest
+        // of the service diet moved post-READY).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
                 arch,
                 ..VmConfig::default()
             }
             .generate_unattend_xml();
-            let pe = xml
-                .split("<settings pass=\"windowsPE\">")
-                .nth(1)
-                .unwrap()
-                .split("</settings>")
-                .next()
-                .unwrap();
-            let rs = pe
-                .split("<RunSynchronous>")
-                .nth(1)
-                .unwrap()
-                .split("</RunSynchronous>")
-                .next()
-                .unwrap();
-            let orders: Vec<u32> = rs
-                .split("<Order>")
-                .skip(1)
-                .map(|s| s.split("</Order>").next().unwrap().parse().unwrap())
-                .collect();
-            assert_eq!(
-                orders,
-                (1..=orders.len() as u32).collect::<Vec<_>>(),
-                "gap in {arch:?}: {orders:?}"
-            );
+            for pass in ["windowsPE", "specialize"] {
+                let section = format!("<settings pass=\"{pass}\">");
+                let rs = xml
+                    .split(&section)
+                    .nth(1)
+                    .unwrap()
+                    .split("</settings>")
+                    .next()
+                    .unwrap()
+                    .split("<RunSynchronous>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</RunSynchronous>")
+                    .next()
+                    .unwrap();
+                let orders: Vec<u32> = rs
+                    .split("<Order>")
+                    .skip(1)
+                    .map(|s| s.split("</Order>").next().unwrap().parse().unwrap())
+                    .collect();
+                assert_eq!(
+                    orders,
+                    (1..=orders.len() as u32).collect::<Vec<_>>(),
+                    "gap in {arch:?} pass {pass}: {orders:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_synchronous_paths_stay_short() {
+        // Setup validates every <Path> with WCM: a long value comes back
+        // as WCM_E_INVALIDVALUE 0x80220005 "Value is invalid", which fails
+        // the WHOLE answer file (windeploy 0x1f -> the "computer restarted
+        // unexpectedly" loop). Live 2026-10-04: an 854-char PowerShell Path
+        // was rejected while every command up to 243 chars passed, so keep
+        // the proven bound with margin: nothing over 256.
+        for arch in [Architecture::Amd64, Architecture::Arm64] {
+            let xml = VmConfig {
+                arch,
+                ..VmConfig::default()
+            }
+            .generate_unattend_xml();
+            for pass in ["windowsPE", "specialize"] {
+                let section = format!("<settings pass=\"{pass}\">");
+                let rs = xml
+                    .split(&section)
+                    .nth(1)
+                    .unwrap()
+                    .split("</settings>")
+                    .next()
+                    .unwrap()
+                    .split("<RunSynchronous>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</RunSynchronous>")
+                    .next()
+                    .unwrap();
+                let mut paths = rs
+                    .split("<Path>")
+                    .skip(1)
+                    .map(|s| s.split("</Path>").next().unwrap());
+                for path in &mut paths {
+                    assert!(
+                        path.len() <= 256,
+                        "{arch:?} pass {pass}: Path is {} chars (limit 256): {path}",
+                        path.len()
+                    );
+                }
+            }
         }
     }
 

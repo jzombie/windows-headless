@@ -36,6 +36,13 @@ pub const VARS_FILE: &str = "VARS.fd";
 pub const QEMU_PIDFILE: &str = "qemu.pid";
 /// Installer QEMU's stdout/stderr capture.
 pub const INSTALL_LOG: &str = "install.log";
+/// Live-snapshot companions (all inside the VM dir, all removed when an
+/// install voids them): migrated RAM + device state, the VARS backup taken
+/// at the same instant (raw pflash is outside every snapshot), and the
+/// overlay that has held post-save writes since the pivot.
+pub const LIVE_STATE_FILE: &str = "golden-live.state";
+pub const LIVE_VARS_BACKUP: &str = "VARS.fd.golden-live";
+pub const LIVE_OVERLAY: &str = "disk-live-overlay.qcow2";
 
 // --- cache layout (group names under the cache root) ---------------------
 pub const QEMU_GROUP: &str = "qemu-portable";

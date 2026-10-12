@@ -11,7 +11,54 @@ use crate::unattend::{Architecture, VmConfig, auto_detect_platform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsVersion {
-    Win11EnterpriseEval,
+    Win11,
+}
+
+/// QEMU `-display` backend: the closed set this tool supports. Anything
+/// else QEMU accepts is rejected at the CLI so a typo fails fast instead
+/// of dying deep in QEMU startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Display {
+    None,
+    Cocoa,
+    Gtk,
+    Vnc(String),
+}
+
+impl Display {
+    /// Parse a `--display` value: `none`, `cocoa`, `gtk`, or `vnc=<spec>`.
+    /// Clap `value_parser` shape: `Err(String)` renders as a clean CLI error.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Display::None),
+            "cocoa" => Ok(Display::Cocoa),
+            "gtk" => Ok(Display::Gtk),
+            s if s.starts_with("vnc=") => Ok(Display::Vnc(s.to_string())),
+            _ => Err(format!(
+                "unsupported --display '{s}' (want none|cocoa|gtk|vnc=<spec>)"
+            )),
+        }
+    }
+
+    /// The `-display` argv value.
+    pub fn as_arg(&self) -> String {
+        match self {
+            Display::None => "none".to_string(),
+            Display::Cocoa => "cocoa".to_string(),
+            Display::Gtk => "gtk".to_string(),
+            Display::Vnc(spec) => spec.clone(),
+        }
+    }
+
+    pub fn is_vnc(&self) -> bool {
+        matches!(self, Display::Vnc(_))
+    }
+}
+
+impl std::fmt::Display for Display {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_arg())
+    }
 }
 
 /// Proven topology: the exact QEMU configuration `install`
@@ -76,8 +123,8 @@ pub struct HeadlessVmBuilder {
     pub smp_cores: u32,
     pub ssh_host: String,
     pub ssh_port: u16,
-    /// `-display` spec (`none`, `cocoa`, `gtk`, `vnc=127.0.0.1:0`).
-    pub display: String,
+    /// `-display` backend (`none`, `cocoa`, `gtk`, or `vnc=<spec>`).
+    pub display: Display,
     pub monitor_socket: String,
     pub qmp_socket: String,
     /// Guest serial log path (per-VM, next to the disk — never `/tmp`).
@@ -89,6 +136,10 @@ pub struct HeadlessVmBuilder {
     /// Portable tree root (the extracted `qemu-portable` dir holding
     /// `bin/`). `None` = resolve `qemu-system-*` / `qemu-img` via PATH.
     pub qemu_dir: Option<PathBuf>,
+    /// Resume migrated RAM + device state at boot (`-incoming <uri>`):
+    /// the live-snapshot fast path. `None` = normal boot. Set by the
+    /// caller after verifying the state file — the builder never guesses.
+    pub incoming: Option<String>,
 }
 
 impl HeadlessVmBuilder {
@@ -105,7 +156,7 @@ impl HeadlessVmBuilder {
             smp_cores: 4,
             ssh_host: PROVEN_SSH_HOST.to_string(),
             ssh_port: PROVEN_SSH_PORT,
-            display: PROVEN_VNC_DISPLAY.to_string(),
+            display: Display::Vnc(PROVEN_VNC_DISPLAY.to_string()),
             monitor_socket: crate::ipc::vm_endpoint(
                 std::path::Path::new("."),
                 crate::ipc::MON_SOCK_NAME,
@@ -121,6 +172,7 @@ impl HeadlessVmBuilder {
             unattend_dir: PathBuf::from(crate::paths::FALLBACK_UNATTEND_DIR),
             workdir: PathBuf::from("."),
             qemu_dir: None,
+            incoming: None,
         }
     }
 
@@ -161,12 +213,12 @@ impl HeadlessVmBuilder {
         self
     }
     pub fn vnc(mut self, spec: impl Into<String>) -> Self {
-        self.display = format!("vnc={}", spec.into());
+        self.display = Display::Vnc(format!("vnc={}", spec.into()));
         self
     }
-    /// Raw `-display` spec: `none`, `cocoa`, `gtk`, `vnc=127.0.0.1:0`.
-    pub fn display(mut self, spec: impl Into<String>) -> Self {
-        self.display = spec.into();
+    /// Display backend directly.
+    pub fn display(mut self, d: Display) -> Self {
+        self.display = d;
         self
     }
     pub fn monitor_socket(mut self, s: impl Into<String>) -> Self {
@@ -185,6 +237,12 @@ impl HeadlessVmBuilder {
     /// `qemu-portable` root containing `bin/`.
     pub fn qemu_dir(mut self, d: PathBuf) -> Self {
         self.qemu_dir = Some(d);
+        self
+    }
+    /// Resume migrated state at boot (`commands::migrate_read_uri` output).
+    /// The caller verifies the state file first.
+    pub fn incoming(mut self, uri: impl Into<String>) -> Self {
+        self.incoming = Some(uri.into());
         self
     }
     /// Working dir anchor for per-VM state (defaults to `.`).
@@ -394,8 +452,25 @@ impl HeadlessVmBuilder {
                 self.vars_file().display()
             ));
         }
+        // Target disk on the SAME NVMe controller + serial boot_argv uses
+        // (inbox stornvme; part.txt/InstallTo pick Disk 0 — see the
+        // template header): identical bus topology across install and
+        // first boot means no controller change, no NIC slot shift, no
+        // minutes-long PnP re-enumeration. Never `if=virtio` here — the
+        // answer file loads no storage driver.
+        //
+        // Deliberately NO bootindex on the install NVMe (unlike
+        // boot_argv): any bootindex makes OVMF build its boot list
+        // exclusively from the fw_cfg bootorder file, and unindexed
+        // devices (the installer CD) get no boot option at all —
+        // observed live: setup drops to the UEFI shell instead of
+        // booting the ISO. Without one, OVMF enumerates every device
+        // and falls through to the installer (today's proven path, with
+        // -boot order=d below unchanged).
         a.push("-drive".into());
-        a.push(format!("file={disk},format=qcow2,if=virtio"));
+        a.push(format!("file={disk},format=qcow2,if=none,id=tgt"));
+        a.push("-device".into());
+        a.push("nvme,drive=tgt,serial=nvme1".into());
         a.push("-drive".into());
         a.push(format!("file={win_iso},media=cdrom,readonly=on"));
         a.push("-drive".into());
@@ -430,7 +505,7 @@ impl HeadlessVmBuilder {
         a.push(format!("file:{}", self.serial_log));
         a.extend(self.net_args());
         a.push("-display".into());
-        a.push(self.display.clone());
+        a.push(self.display.as_arg());
         a.push("-monitor".into());
         a.push(crate::ipc::qemu_arg(&self.monitor_socket));
         a.push("-qmp".into());
@@ -455,6 +530,19 @@ impl HeadlessVmBuilder {
         a.push(machine_for(self.config.arch).into());
         a.push("-smp".into());
         a.push(self.smp_cores.to_string());
+        // Live resume: migrated state streams in over `-incoming`, so the
+        // guest continues where the save left it instead of booting. Disk
+        // and VARS are restored to the save instant by the caller — argv
+        // only carries the RAM side. Guest clock isolated from the host
+        // (`clock=vm`): with `clock=host` the RTC can wait out its whole
+        // next period after a restore and lose ticks forever (documented
+        // migration pathology); vm-clock tracking restarts cleanly.
+        if let Some(uri) = &self.incoming {
+            a.push("-incoming".into());
+            a.push(uri.clone());
+            a.push("-rtc".into());
+            a.push("base=utc,clock=vm".into());
+        }
         if let Some((fw_code, _)) = self.firmware() {
             a.push("-drive".into());
             a.push(format!(
@@ -490,7 +578,7 @@ impl HeadlessVmBuilder {
         a.push("nvme,drive=tgt,serial=nvme1,bootindex=0".into());
         a.extend(self.net_args());
         a.push("-display".into());
-        a.push(self.display.clone());
+        a.push(self.display.as_arg());
         a.push("-serial".into());
         a.push(format!("file:{}", self.serial_log));
         a.push("-monitor".into());
@@ -770,6 +858,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builder_sizing_reaches_boot_argv() {
+        // Same flags-through-argv proof for the boot path: what the
+        // builder holds is what QEMU gets, no VM needed.
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11)
+            .memory_mb(8192)
+            .smp_cores(8);
+        let argv = b.boot_argv("d.qcow2");
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-m"), "8192");
+        assert_eq!(at("-smp"), "8");
+    }
+
+    #[test]
+    fn builder_incoming_reaches_boot_argv() {
+        // Live resume: -incoming streams the migrated state file, no boot.
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11).incoming("exec:cat '/tmp/state'");
+        let argv = b.boot_argv("d.qcow2");
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-incoming"), "exec:cat '/tmp/state'");
+        // Restore carries isolated guest time (documented RTC-stop
+        // workaround); plain boots set no -rtc.
+        assert_eq!(at("-rtc"), "base=utc,clock=vm");
+        // Default boot carries no -incoming.
+        let plain = HeadlessVmBuilder::new(WindowsVersion::Win11).boot_argv("d.qcow2");
+        assert!(!plain.iter().any(|a| a == "-incoming"));
+        assert!(!plain.iter().any(|a| a == "-rtc"));
+    }
+
+    #[test]
+    fn display_parse_rejects_typos() {
+        assert_eq!(Display::parse("cocoa").unwrap(), Display::Cocoa);
+        assert_eq!(Display::parse("none").unwrap(), Display::None);
+        assert_eq!(
+            Display::parse("vnc=127.0.0.1:10,password=on")
+                .unwrap()
+                .as_arg(),
+            "vnc=127.0.0.1:10,password=on"
+        );
+        assert!(Display::parse("x11").is_err());
+        assert!(Display::parse("vnc").is_err());
+        assert!(!Display::Cocoa.is_vnc());
+        assert!(Display::parse("vnc=127.0.0.1:0").unwrap().is_vnc());
+    }
+
+    #[test]
     fn vnc_display_matches_host() {
         // PROVEN_VNC_DISPLAY is QEMU syntax (can't concat! a const into
         // it), so this test keeps its bind address glued to PROVEN_SSH_HOST.
@@ -782,8 +915,7 @@ mod tests {
     #[test]
     fn vvfat_never_virtio() {
         // x86_64/pc: inbox IDE.
-        let x86 =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Amd64);
+        let x86 = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Amd64);
         let argv = x86.install_argv("d.qcow2", "w.iso", "v.iso", None);
         let vvfat = argv.iter().find(|a| a.starts_with("file=fat:")).unwrap();
         assert!(
@@ -791,8 +923,7 @@ mod tests {
             "vvfat must be if=ide, got {vvfat}"
         );
         // ARM64/virt has no IDE bus: USB mass storage (inbox USBSTOR).
-        let arm =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Arm64);
+        let arm = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Arm64);
         let argv = arm.install_argv("d.qcow2", "w.iso", "v.iso", None);
         let vvfat = argv.iter().find(|a| a.starts_with("file=fat:")).unwrap();
         assert!(vvfat.contains("if=none"), "got {vvfat}");
@@ -824,14 +955,39 @@ mod tests {
                     .iter()
                     .any(|a| a.contains("if=virtio") && a.starts_with("file=fat:"))
             );
+            // Install target: NVMe (same controller as boot_argv, never
+            // virtio-blk) but WITHOUT bootindex — any bootindex starves
+            // the unindexed installer CD of a boot option in OVMF
+            // (observed: setup drops to the UEFI shell instead).
             let os = argv.iter().find(|a| a.contains(".qcow2")).unwrap();
-            assert!(os.contains("if=virtio"));
+            assert!(os.contains("if=none,id=tgt"), "got {os}");
+            assert!(argv.iter().any(|a| a == "nvme,drive=tgt,serial=nvme1"));
+            assert!(!argv.iter().any(|a| a.contains("bootindex")));
         }
     }
 
     #[test]
+    fn install_and_boot_share_the_nvme_controller() {
+        // One controller identity across install and first boot: same
+        // device string (bus topology + serial), differing only by
+        // boot_argv's bootindex (firmware boot priority only — invisible
+        // to Windows PnP, so it never perturbs device enumeration).
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
+        let install = b.install_argv("d.qcow2", "w.iso", "v.iso", None);
+        let boot = b.boot_argv("d.qcow2");
+        let dev = |argv: &[String]| {
+            argv.iter()
+                .find(|a| a.starts_with("nvme,drive=tgt"))
+                .expect("NVMe target device present")
+                .clone()
+        };
+        assert_eq!(dev(&install), "nvme,drive=tgt,serial=nvme1");
+        assert_eq!(dev(&boot), "nvme,drive=tgt,serial=nvme1,bootindex=0");
+    }
+
+    #[test]
     fn unattend_iso_replaces_vvfat() {
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         let argv = b.install_argv("d.qcow2", "w.iso", "v.iso", Some("u.iso"));
         assert!(
             argv.iter()
@@ -842,7 +998,7 @@ mod tests {
 
     #[test]
     fn ephemeral_boot_has_no_install_media() {
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         let argv = b.boot_argv("overlay.qcow2");
         assert!(!argv.iter().any(|a| a.starts_with("file=fat:")));
         assert!(!argv.iter().any(|a| a.contains("media=cdrom")));
@@ -861,7 +1017,7 @@ mod tests {
 
     #[test]
     fn portable_dir_overrides_path_lookup() {
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         assert_eq!(b.system_bin(), b.config.arch.qemu_binary());
         assert_eq!(b.img_bin(), PathBuf::from("qemu-img"));
 
@@ -883,8 +1039,8 @@ mod tests {
     fn machine_type_is_pinned_on_both_arches() {
         // Shared NIC shape (incl. romfile= PXE-ROM suppression) on both.
         for b in [
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval),
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Arm64),
+            HeadlessVmBuilder::new(WindowsVersion::Win11),
+            HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Arm64),
         ] {
             let argv = b.install_argv("d.qcow2", "w.iso", "v.iso", None);
             assert!(
@@ -892,8 +1048,7 @@ mod tests {
                     .any(|a| a == "virtio-net-pci,netdev=n1,romfile=")
             );
         } // qemu-system-aarch64 has no default machine: -M virt is required.
-        let arm =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Arm64);
+        let arm = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Arm64);
         for argv in [
             arm.install_argv("d.qcow2", "w.iso", "v.iso", None),
             arm.boot_argv("d.qcow2"),
@@ -903,8 +1058,7 @@ mod tests {
         }
         // x86 pins q35 — the exact topology install wrote NVRAM on
         // (default `pc` + q35-written VARS hangs OVMF, machine_for).
-        let x86 =
-            HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval).arch(Architecture::Amd64);
+        let x86 = HeadlessVmBuilder::new(WindowsVersion::Win11).arch(Architecture::Amd64);
         for argv in [
             x86.install_argv("d.qcow2", "w.iso", "v.iso", None),
             x86.boot_argv("d.qcow2"),
@@ -917,7 +1071,7 @@ mod tests {
     #[test]
     fn firmware_is_portable_tree_only() {
         // No --qemu-dir: no firmware, never host paths.
-        let b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval);
+        let b = HeadlessVmBuilder::new(WindowsVersion::Win11);
         assert_eq!(b.qemu_dir, None);
         assert!(b.firmware().is_none());
         assert!(b.require_firmware().is_err());
@@ -928,7 +1082,7 @@ mod tests {
         std::fs::create_dir_all(&fw_dir).unwrap();
         std::fs::write(fw_dir.join("edk2-aarch64-code.fd"), b"fake-code").unwrap();
         std::fs::write(fw_dir.join("edk2-arm-vars.fd"), b"fake-vars").unwrap();
-        let p = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval)
+        let p = HeadlessVmBuilder::new(WindowsVersion::Win11)
             .arch(Architecture::Arm64)
             .qemu_dir(tmp.path().join("qemu-portable"))
             .workdir(tmp.path().join("vm"));

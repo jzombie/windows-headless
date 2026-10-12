@@ -12,12 +12,16 @@ use std::time::Duration;
 
 use crate::ipc::{MON_SOCK_NAME, QMP_SOCK_NAME, SERIAL_LOG_NAME, vm_endpoint};
 use crate::qemu::{
-    HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_DISPLAY, PROVEN_VNC_PASSWORD,
+    Display, HeadlessVmBuilder, PROVEN_SSH_HOST, PROVEN_SSH_PORT, PROVEN_VNC_PASSWORD,
     WindowsVersion, qmp_alive, vnc_url,
 };
 use crate::storage::DiskManager;
 use crate::timeouts;
 use crate::unattend::{Architecture, VmConfig, auto_detect_platform};
+use crate::vision::{
+    SampleOutcome, SamplingProfile, ScreenSampler, ScreenState, describe, fmt_bytes, fmt_secs,
+    is_error_state, take_screenshot,
+};
 
 /// Disk partitioning script laid onto the installer USB (`setup/part.txt`).
 const PART_TXT: &str = include_str!("../setup/part.txt");
@@ -97,6 +101,27 @@ fn expand_tilde(p: PathBuf) -> PathBuf {
     }
     p
 }
+
+/// Fail fast when the Windows ISO is absent, naming the path we actually
+/// resolved instead of guessing at a cause. The `~` hint is emitted only
+/// when a literal `~` survived [`expand_tilde`] — i.e. `HOME` was unset (or
+/// the path is `~otheruser/...`), which is the only way a `~` reaches here
+/// from either an unquoted or a quoted argument.
+fn require_win_iso(path: &Path) -> Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+    let shown = path.display();
+    let raw = path.to_string_lossy();
+    if raw == "~" || raw.starts_with("~/") {
+        anyhow::bail!("Windows ISO not found: {shown} (`~` not expanded — is $HOME set?)");
+    }
+    if raw.starts_with('~') {
+        anyhow::bail!("Windows ISO not found: {shown} (`~otheruser` paths are not expanded)");
+    }
+    anyhow::bail!("Windows ISO not found: {shown}");
+}
+
 fn stage_local_dir(base: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
     fn walk(base: &Path, rel: &str, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
         let dir = if rel.is_empty() {
@@ -189,22 +214,29 @@ pub struct BuildArgs {
 }
 
 #[cfg(feature = "downloader")]
-pub async fn cmd_build(a: BuildArgs) -> Result<()> {
+pub async fn cmd_build(a: BuildArgs) -> Result<PathBuf> {
+    // The ISO is the one input `setup` cannot fetch, so check it BEFORE the
+    // downloads: a bad path must fail in milliseconds, not after gigabytes.
+    require_win_iso(&expand_tilde(a.win_iso.clone()))?;
     cmd_setup(None, a.arch).await?;
+    // Resolve the media path here (same rule as build-media) so callers
+    // chaining into `install` know which image came out.
+    let out = a.out.map(expand_tilde).unwrap_or(default_media_image()?);
     cmd_build_media(BuildMediaArgs {
         win_iso: a.win_iso,
         arch: a.arch,
         virtio_iso: None,
         drivers_dir: None,
         openssh_zip: None,
-        out: a.out,
+        out: Some(out.clone()),
         wimlib_bin: None,
         username: a.username,
         password: a.password,
         locale: a.locale,
         force: a.force,
     })
-    .await
+    .await?;
+    Ok(out)
 }
 
 pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
@@ -225,6 +257,10 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
         );
         return Ok(());
     }
+
+    // ISO first, honest error, before any state changes: a missing input
+    // must not invalidate a good sidecar or stage the driver archives.
+    require_win_iso(&win_iso)?;
 
     // Invalidate first: a crashed/failed build must never leave a previous
     // sidecar next to a partial image, or the next run skips as "fresh"
@@ -335,12 +371,6 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
     // tolerates the UDF variants hadris-udf rejects with
     // `invalid Information Control Block` (isomage first, hadris fallback).
     eprintln!("extracting install.wim (several minutes) ...");
-    if !win_iso.is_file() {
-        anyhow::bail!(
-            "Windows ISO {} missing (quote-shielded `~`? the shell only expands it unquoted)",
-            win_iso.display()
-        );
-    }
     // Deterministic scratch under the project cache (not $TMPDIR):
     // a previous killed/failed run leaves it behind, so purge-then-
     // reuse. The Drop guard removes it on every exit path — success,
@@ -425,24 +455,61 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
 pub struct RunArgs {
     pub disk: Option<String>,
     pub ssh_port: u16,
-    pub display: String,
+    pub display: crate::qemu::Display,
+    /// Guest RAM in MB (parsed from Docker syntax by clap `value_parser`).
     pub memory: u32,
-    pub smp: u32,
+    /// Guest vCPUs (`--cpus`; `--smp` is an alias).
+    pub cpus: u32,
+    /// New-disk size in GB (install path only; parsed from Docker syntax).
+    pub disk_size: u32,
     pub vm_dir: Option<PathBuf>,
     pub qemu_dir: Option<PathBuf>,
     pub username: String,
     pub password: String,
     pub shell: bool,
+    /// Opt into the experimental live snapshot resume (`savevm` state):
+    /// instant boot when it works. Default off — golden rewind always works.
+    pub live: bool,
     /// Windows ISO: when the disk is missing, run the install chain
     /// (setup + build-media + install) instead of bailing.
     pub win_iso: Option<PathBuf>,
     /// Budget for that install's SSH wait, in seconds (`run` passes it
     /// straight through; only reached when `--win-iso` installs).
     pub install_timeout_secs: u64,
+    /// Screendump cadence during the boot wait in seconds (0 = disabled);
+    /// frames land in `<vm-dir>/screenshots/`.
+    pub screenshots_every_secs: u64,
+    /// In-memory screen-classification cadence in seconds: `Some(0)` =
+    /// disabled, `None` = profile default from the accelerator (10s
+    /// hardware, 30s TCG). Screendump + nearest-exemplar match with no
+    /// disk write.
+    pub classify_every_secs: Option<u64>,
+}
+
+/// Install params for the `run --win-iso` chain (missing disk): everything
+/// the user sized carries through, nothing silently resets to defaults.
+/// Split out so a test pins the passthrough (the screenshot cadence was
+/// once hardcoded to 60 here while `run` advertised the flag).
+fn run_chain_install_params(a: &RunArgs, iso: PathBuf) -> InstallParams {
+    InstallParams {
+        usb_image: None,
+        win_iso: Some(iso),
+        screenshots_every_secs: a.screenshots_every_secs,
+        classify_every_secs: a.classify_every_secs,
+        username: a.username.clone(),
+        password: a.password.clone(),
+        recovery: false,
+        auto_updates: false,
+        install_timeout_secs: a.install_timeout_secs,
+        memory_mb: a.memory,
+        cpus: a.cpus,
+        disk_size_gb: a.disk_size,
+        display: a.display.clone(),
+    }
 }
 
 pub async fn cmd_run(a: RunArgs) -> Result<()> {
-    let vm_dir = match a.vm_dir {
+    let vm_dir = match a.vm_dir.clone() {
         Some(d) => d,
         None => default_vm_dir()?,
     };
@@ -451,8 +518,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // is the ground truth (pidfile alone may be stale).
     if banner_once(a.ssh_port).await.is_some() {
         eprintln!(
-            "already running — ssh -p {} {}@{PROVEN_SSH_HOST}",
-            a.ssh_port, a.username
+            "already running — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})",
+            a.ssh_port, a.username, a.password
         );
         if a.shell {
             crate::ssh::interactive_shell(PROVEN_SSH_HOST, a.ssh_port, &a.username, &a.password)
@@ -461,7 +528,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         return Ok(());
     }
     let _ = std::fs::remove_file(vm_dir.join(crate::paths::QEMU_PIDFILE));
-    let disk = a.disk.unwrap_or_else(|| {
+    let disk = a.disk.clone().unwrap_or_else(|| {
         vm_dir
             .join(crate::paths::DISK_IMAGE)
             .to_string_lossy()
@@ -476,7 +543,7 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         .map(|m| m.len() >= MIN_VIABLE_DISK)
         .unwrap_or(false);
     if !disk_viable {
-        match a.win_iso.map(expand_tilde) {
+        match a.win_iso.clone().map(expand_tilde) {
             // Chain: install the disk, then fall through to boot it below.
             // Uses the core only — no shell, no Ctrl-C wait mid-chain. The
             // installer VM is torn down immediately so this command blocks
@@ -484,33 +551,42 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             // the guest shell. Explicit `--win-iso` only — never silent.
             Some(iso) => {
                 eprintln!(
-                    "disk {disk} missing — installing from {} ...",
-                    iso.display()
+                    "disk {disk} missing — installing from {} (new {}G disk, {} MB RAM, {} vCPUs) ...",
+                    iso.display(),
+                    a.disk_size,
+                    a.memory,
+                    a.cpus,
                 );
-                let mut session = install_to_ready(
-                    None,
-                    Some(iso),
-                    timeouts::SCREENSHOTS_EVERY_SECS,
-                    &a.username,
-                    &a.password,
-                    false,
-                    false,
-                    a.install_timeout_secs,
-                )
-                .await?;
+                let mut session = install_to_ready(run_chain_install_params(&a, iso)).await?;
                 finish_install_capture(&mut session).await;
+                prove_landed_shell(PROVEN_SSH_PORT, &a.username, &a.password).await?;
+                let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
+                let target_s = target.to_string_lossy().into_owned();
+                shutdown_guest_clean(PROVEN_SSH_HOST, PROVEN_SSH_PORT, &a.username, &a.password)
+                    .await?;
                 session.child.kill().await?;
+                snapshot_golden(&session.img_bin, &target_s).await?;
             }
             None => anyhow::bail!(
                 "disk {disk} does not exist (run `install` first, pass --disk <image>, or pass --win-iso to install it now)"
             ),
         }
     }
-    let mut b = HeadlessVmBuilder::new(WindowsVersion::Win11EnterpriseEval)
+    // Stale serial from a previous session: drop it before the spawn.
+    // QEMU's chardev truncates on open, but the baseline below must be 0
+    // *without racing OVMF's first line* (reading after spawn often found
+    // the first `BdsDxe: starting` already written and swallowed the
+    // "guest booted" narration); an old file would also skew a pre-spawn
+    // read.
+    let _ = std::fs::remove_file(crate::ipc::vm_endpoint(
+        &vm_dir,
+        crate::ipc::SERIAL_LOG_NAME,
+    ));
+    let mut b = HeadlessVmBuilder::new(WindowsVersion::Win11)
         .ssh_port(a.ssh_port)
         .display(a.display.clone())
         .memory_mb(a.memory)
-        .smp_cores(a.smp)
+        .smp_cores(a.cpus)
         .workdir(vm_dir);
     match a.qemu_dir {
         Some(d) => b = b.qemu_dir(d),
@@ -523,15 +599,80 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
             }
         }
     }
+    // Golden rewind: a verified landed state rolls the disk past any
+    // dirty stop — Recovery can never appear on a rewound base. Applied
+    // (`snapshot -a`) rather than `-loadvm`: loadvm restores device state
+    // too, and QEMU refuses it with a writable pflash drive attached.
+    // Runs after qemu_dir resolution so the same portable qemu-img that
+    // wrote the snapshot applies it. Skipped under --live with a live
+    // snapshot present: the live state carries the disk, so rewinding
+    // first is pure waste (and costs a multi-GB copy for nothing).
+    let live_armed = a.live && live_sidecar(&disk).is_file();
+    if live_armed {
+        // Live resume prep, all pre-boot: the state file, VARS backup, and
+        // sidecar must all exist (a partial save resumes nothing); VARS is
+        // restored over the live file (raw pflash is outside every
+        // snapshot); the save-time overlay is consumed (its post-save
+        // writes are superseded by the rewind-to-save-point semantics).
+        let vm_dir_pb = b.workdir.clone();
+        let (state, vars_backup, overlay) = live_paths(&vm_dir_pb);
+        for p in [&state, &vars_backup] {
+            if !p.is_file() {
+                anyhow::bail!(
+                    "live sidecar present but {} is missing (partial save?) — delete {} and re-take with `snapshot --live`",
+                    p.display(),
+                    live_sidecar(&disk).display()
+                );
+            }
+        }
+        std::fs::copy(&vars_backup, vm_dir_pb.join(crate::paths::VARS_FILE))?;
+        if overlay.is_file() {
+            let _ = std::fs::remove_file(&overlay);
+            eprintln!("consuming save-time overlay (post-save writes superseded) ...");
+        }
+        eprintln!("resuming live state (RAM streams in over -incoming, no boot) ...");
+        b = b.incoming(migrate_read_uri(&state));
+    } else {
+        // Orphaned overlay without a live resume: its writes are
+        // unreachable once the base boots alone — drop it out loud rather
+        // than hoarding a dead file.
+        let workdir = b.workdir.clone();
+        let (_, _, overlay) = live_paths(&workdir);
+        if overlay.is_file() {
+            let _ = std::fs::remove_file(&overlay);
+            eprintln!(
+                "dropping orphaned live overlay {} (plain boot cannot reach it) ...",
+                overlay.file_name().unwrap_or_default().to_string_lossy()
+            );
+        }
+        if golden_sidecar(&disk).is_file() {
+            let img_bin = img_bin_for(&b.qemu_dir);
+            eprintln!("rewinding to golden snapshot (landed state) ...");
+            let st = tokio::process::Command::new(&img_bin)
+                .args(["snapshot", "-a", crate::timeouts::GOLDEN_TAG, &disk])
+                .status()
+                .await?;
+            if !st.success() {
+                anyhow::bail!(
+                    "golden sidecar present but snapshot apply failed — disk left untouched, refusing to boot a half-state (delete {} to boot normally)",
+                    golden_sidecar(&disk).display()
+                );
+            }
+        }
+    }
     eprintln!(
-        "booting {disk} ({} MB, {} cores, display {})",
-        a.memory, a.smp, a.display
+        "booting {disk} ({} MB RAM, {} vCPUs, display {})",
+        a.memory,
+        a.cpus,
+        a.display.as_arg()
     );
     eprintln!(
         "waiting for SSH on {PROVEN_SSH_HOST}:{} (up to {} min) ...",
         a.ssh_port,
         timeouts::BOOT_SSH_DEADLINE.as_secs() / 60
     );
+    // Stale serial from a previous session was dropped pre-spawn so the
+    // baseline below is 0 (never a post-spawn read racing OVMF's line).
     let mut vm = b.boot_existing(&disk).await?;
     // One monitor session for the whole boot: VNC handshake plus the stall
     // watchdog below share it (single-client transports forbid overlap).
@@ -543,51 +684,218 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         || vm.child.try_wait().map(|o| o.is_none()).unwrap_or(false),
     )
     .await?;
-    if a.display.starts_with("vnc=") {
-        mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
-            .await?;
-        let url = vnc_url(&a.display).unwrap_or_else(|| a.display.clone());
+    if a.display.is_vnc() {
+        mon.command(&vnc_password_command()).await?;
+        let url = vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg());
         eprintln!("VNC {url} (password {PROVEN_VNC_PASSWORD})");
     }
-    eprintln!("QEMU launched; guest is booting ...");
+    // Opt-in live resume is fully pre-boot now (state streams in over
+    // `-incoming`, VARS + disk restored above): by the time the monitor is
+    // up the guest is already continuing, so SSH should answer in seconds.
+    if a.live {
+        let phase_start = std::time::Instant::now();
+        eprintln!("live state streaming in (2-3 GB over -incoming; watch it land) ...");
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(timeouts::MIGRATION_BUDGET_SECS);
+        loop {
+            let mut qmp = vm.qmp().await?;
+            match qmp.query_migrate_status().await?.as_str() {
+                "completed" => break,
+                "failed" | "cancelled" | "cancelling" => {
+                    anyhow::bail!(
+                        "incoming migration failed — state file may be truncated; re-take with `snapshot --live`"
+                    );
+                }
+                status => {
+                    if std::time::Instant::now() > deadline {
+                        anyhow::bail!(
+                            "incoming migration still '{status}' after {} s — state file unreadable or stream stalled; plain `run` (golden rewind) stays the default that works",
+                            timeouts::MIGRATION_BUDGET_SECS
+                        );
+                    }
+                    eprintln!("... incoming migration '{status}' ...");
+                    tokio::time::sleep(Duration::from_secs(timeouts::MIGRATION_POLL_SECS)).await;
+                }
+            }
+        }
+        eprintln!(
+            "live state loaded in {} s — guest resuming ...",
+            phase_start.elapsed().as_secs()
+        );
+        // Mirror of the save-side guard: a completed incoming stream can
+        // still leave the destination paused (login screen up, nothing
+        // executing — SSH can never answer). Verify running, resume if not.
+        // Then a stop/cont round-trip regardless: HVF may not re-arm
+        // halted-vCPU timers on the incoming path (frozen lock-screen
+        // clock, static frames), and the cycle re-arms them.
+        {
+            let mut qmp = vm.qmp().await?;
+            match qmp.query_vm_status().await?.as_str() {
+                "running" => eprintln!("guest executing after restore."),
+                stalled => {
+                    eprintln!("guest {stalled} after restore — resuming ...");
+                    qmp.resume_vm().await?;
+                }
+            }
+            eprintln!("re-arming guest timers (stop/cont cycle) ...");
+            qmp.pause_vm().await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            qmp.resume_vm().await?;
+            eprintln!(
+                "restore overhead total: {} s (stream + re-arm) — SSH settle next ...",
+                phase_start.elapsed().as_secs()
+            );
+        }
+        // The restored virtio-net rings point at the OLD slirp backend
+        // (gone with the saving QEMU): packets blackhole while Windows
+        // believes nothing changed — healthy desktop, dead SSH (observed).
+        // A link flap forces DHCP + NLA + the listener to re-run against
+        // the fresh backend. The NIC's device name comes from `info
+        // network` (auto-assigned, never guessed); best-effort throughout.
+        let nic = mon
+            .command("info network")
+            .await
+            .ok()
+            .and_then(|info| find_nic_name(&info).map(str::to_string))
+            .unwrap_or_else(|| "n1".to_string());
+        for (state, cmd) in [
+            ("down", format!("set_link {nic} off")),
+            ("up", format!("set_link {nic} on")),
+        ] {
+            if let Err(e) = mon.command(&cmd).await {
+                eprintln!("warning: link flap {state} failed ({e:#}); continuing without it ...");
+                break;
+            }
+            if state == "down" {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+        // Classify the wire before the blind wait: refused means the guest
+        // stack is alive with nothing listening (sshd died in restore);
+        // timeout means packets blackhole (NIC/backend mismatch). The fix
+        // differs completely, so say which.
+        match classify_port(a.ssh_port).await {
+            PortState::Open => eprintln!(
+                "port {} accepts TCP — waiting for the SSH banner ...",
+                a.ssh_port
+            ),
+            PortState::Refused => eprintln!(
+                "port {} REFUSED (guest stack alive, sshd not listening — service did not survive restore)",
+                a.ssh_port
+            ),
+            PortState::Timeout => eprintln!(
+                "port {} connect timeout (packets blackholed — NIC/backend mismatch despite flap)",
+                a.ssh_port
+            ),
+        }
+        eprintln!("link flapped — waiting for SSH to re-bind ...");
+    }
+    if !a.live {
+        eprintln!("QEMU launched; guest is booting ...");
+    }
     let pidfile = vm.builder.pidfile();
     let start = std::time::Instant::now();
-    let mut ticker = tokio::time::interval(timeouts::BOOT_STATUS_TICK);
+    // One shots dir for the whole wait: periodic boot frames land here and
+    // every failure path captures its final frame into it too.
+    let shots_dir = screenshots_dir(&vm.builder.workdir);
+    let disk = vm.builder.workdir.join(crate::paths::DISK_IMAGE);
+    // Cadence policy resolves after accelerator detection: an explicit
+    // flag wins, else TCG earns 3x spacing on classification.
+    let profile = SamplingProfile::resolve(
+        a.screenshots_every_secs,
+        a.classify_every_secs,
+        auto_detect_platform().1,
+    );
+    if !profile.save_every.is_zero() {
+        eprintln!(
+            "Saving a boot screenshot every {}s → {}",
+            profile.save_every.as_secs(),
+            shots_dir.display()
+        );
+    }
+    if !profile.classify_every.is_zero() {
+        eprintln!(
+            "Classifying the boot screen every {}s (in memory, no file)",
+            profile.classify_every.as_secs()
+        );
+    }
+    // VNC coordinates for failure reports (None for gtk/cocoa/none — the
+    // frame + serial line still say what happened).
+    let vnc = a
+        .display
+        .is_vnc()
+        .then(|| vnc_url(&a.display.as_arg()).unwrap_or_else(|| a.display.as_arg()));
+    // Single tick authority: the profile's interval drives; save,
+    // classify, and narration each gate on their own due-check inside.
+    // All-zero cadences still need the SSH wait + stall watchdog, so fall
+    // back to the SSH poll interval (sampling simply never fires).
+    let tick_interval = profile.tick().unwrap_or(timeouts::SSH_POLL_INTERVAL);
+    let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so the first status line comes
-    // after 30s of actual waiting, not at launch.
+    // after a full interval of actual waiting, not at launch.
     ticker.tick().await;
-    // Stall sensor: serial-silent deaths would otherwise poll SSH blindly.
-    let mut idle = BlockIdle::new();
+    // Stall sensor + screen state, reunited per tick: serial-silent deaths
+    // would otherwise poll SSH blindly.
+    let mon = std::sync::Arc::new(mon);
+    let mut activity = ActivityMonitor::new();
+    let mut sampler = ScreenSampler::new(std::sync::Arc::clone(&mon), shots_dir.clone());
+    // Reboot awareness below the screenshot layer: OVMF's per-boot handoff
+    // line in the serial file, so "the guest bounced" is announced even
+    // while the screen looks like nothing happened. Baseline 0 (the stale
+    // file was removed pre-spawn) — never a post-spawn read, which races
+    // OVMF's first line.
+    let mut boots_seen = 0u64;
+    // Narration due-check state: the "... still waiting" pulse on the
+    // profile's rhythm, never a second ticker.
+    let mut last_narrate = start;
     tokio::select! {
         r = vm.wait_for_ssh(timeouts::BOOT_SSH_DEADLINE) => {
-            // One last frame before failing: `run` has no periodic
-            // screenshots and the serial is silent, so the screen is the
-            // only evidence of *where* boot died (observed live: black
-            // "guest has not initialized the display" vs a Windows
-            // prompt — neither is guessable from the timeout alone).
-            if r.is_err() {
-                take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
+            // Time's up: the serial is silent through a Windows boot, so
+            // the screen + serial tail are the only evidence of *where*
+            // boot died (black handoff vs a parked Windows prompt —
+            // neither is guessable from the timeout alone). Attach both
+            // instead of dropping the frame on the floor.
+            if let Err(e) = r {
+                let report =
+                    boot_failure_report(&mon, &vm.builder.serial_log, &shots_dir, &vnc).await;
+                anyhow::bail!("{e:#}\n{report}");
             }
-            r?;
         }
-        _ = async {
+        cause = async {
             loop {
                 ticker.tick().await;
                 // Dead-screen watchdog: a fatal serial signature means the
-                // boot already failed — report it instead of polling on.
-                if let Err(e) = check_boot_failure(&vm.builder.serial_log, &screenshots_dir(&vm.builder.workdir)) {
-                    eprintln!("{e:#}");
-                    return;
+                // boot already failed — return it as the cause instead of
+                // polling on.
+                check_boot_failure(&vm.builder.serial_log)?;
+                // Reboot narration (first boot or a bounce): serial truth,
+                // independent of what the screenshots look like.
+                let boots = boot_count(&vm.builder.serial_log);
+                if let Some(note) = boot_note(boots_seen, boots) {
+                    eprintln!("{note}");
                 }
-                // Stall watchdog: frozen disk I/O + no banner = parked.
-                // Bail propagates out of the select arm below.
-                if let Err(e) = idle.poll(&mon).await {
-                    eprintln!("{e:#}");
-                    return;
+                boots_seen = boots;
+                // Sample first: the stall check below needs fresh counters.
+                activity.sample(&mon, Some(disk.as_path())).await;
+                // One sampler tick, then the reporter line. Save and
+                // classify gate inside; narration gates below.
+                sampler.poll(&profile).await;
+                // Stall watchdog, conditioned on screen state: frozen disk
+                // I/O during valid progress (Setup applying, OOBE) is a
+                // slow host, never a stuck guest — progress states answer
+                // only to the outer SSH deadline. Bail propagates out of
+                // the select arm below.
+                activity.check_stall(sampler.state(), true)?;
+                report_sample("boot", &sampler, &activity);
+                // Narrate the boot on the profile pulse only: last serial
+                // line says what the guest is doing (recovery, Boot Manager,
+                // Setup pass...). The ticker may run faster for
+                // classification; this line must not turn into spam.
+                if last_narrate.elapsed() < profile.narrate_every {
+                    continue;
                 }
-                // Narrate the boot: last serial line says what the guest
-                // is doing (recovery, Boot Manager, Setup pass...).
+                last_narrate = std::time::Instant::now();
                 let doing = last_serial_line(&vm.builder.serial_log);
                 if doing.is_empty() {
                     eprintln!(
@@ -601,14 +909,21 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
                     );
                 }
             }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
         } => {
-            // Wedged/fatal-signature guest: same evidence gap as the
-            // timeout arm — capture the screen before it is torn down.
-            take_screenshot(&mon, &screenshots_dir(&vm.builder.workdir)).await;
+            // The loop only ever ends by erroring (its Ok arm is
+            // unreachable): carry the cause, then the evidence block —
+            // final frame with path + screen classification, last serial
+            // line, VNC coordinates — so the failure reads without VNC.
+            let cause =
+                cause.map_or_else(|e| format!("{e:#}"), |_| "guest failed to boot".to_string());
+            let report =
+                boot_failure_report(&mon, &vm.builder.serial_log, &shots_dir, &vnc).await;
             eprintln!("stopping dead guest...");
             vm.kill().await?;
             let _ = std::fs::remove_file(pidfile);
-            anyhow::bail!("guest failed to boot (see serial evidence above)");
+            anyhow::bail!("{cause}\n{report}");
         }
         _ = shutdown_signal() => {
             eprintln!("interrupted during boot; stopping guest...");
@@ -620,8 +935,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "ready — ssh -p {} {}@{PROVEN_SSH_HOST}",
-        a.ssh_port, a.username,
+        "ready — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})",
+        a.ssh_port, a.username, a.password,
     );
     // Cooked mode, SIGINT/SIGTERM via shutdown_signal — the term-wm way.
     // Raw mode was tried here (Ctrl-C as byte 0x03): under a multiplexer
@@ -632,18 +947,30 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // user decision: a forgotten snapshot is the user's fault, and a
     // 90-second wait that reads as a hang is worse than a dirty bit that
     // chkdsk replays. The overlay/golden design absorbs the risk.
-    shell_then_wait(
-        a.shell,
-        PROVEN_SSH_HOST,
-        a.ssh_port,
-        &a.username,
-        &a.password,
-        "press Ctrl-C to stop the VM (immediate kill, no graceful wait)...",
-    )
-    .await?;
-    eprintln!("killing guest...");
-    if let Err(e) = vm.kill().await {
-        eprintln!("warning: kill failed: {e:#}");
+    // A second branch watches the child: `snapshot` from another terminal
+    // quits this QEMU out from under us — exit with the news instead of
+    // parking at the Ctrl-C prompt on a dead VM.
+    tokio::select! {
+        r = shell_then_wait(
+            a.shell,
+            PROVEN_SSH_HOST,
+            a.ssh_port,
+            &a.username,
+            &a.password,
+            "press Ctrl-C to stop the VM (immediate kill, no graceful wait)...",
+        ) => {
+            r?;
+            eprintln!("killing guest...");
+            if let Err(e) = vm.kill().await {
+                eprintln!("warning: kill failed: {e:#}");
+            }
+        }
+        s = vm.child.wait() => {
+            match s {
+                Ok(status) => eprintln!("VM exited underneath us (status {status}) — e.g. `snapshot` from another terminal. Exiting ..."),
+                Err(e) => eprintln!("VM wait failed ({e:#}) — exiting ..."),
+            }
+        }
     }
     let _ = std::fs::remove_file(pidfile);
     eprintln!("stopped");
@@ -653,6 +980,223 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 // install
 // ---------------------------------------------------------------------------
+
+/// Sidecar next to the disk proving a golden snapshot lives inside it.
+/// Written only after a verified landing; removed when an install starts,
+/// so a stale sidecar can never bless a half-written disk.
+pub fn golden_sidecar(disk: &str) -> PathBuf {
+    PathBuf::from(format!("{disk}.golden"))
+}
+
+/// Sidecar for the experimental live snapshot (`--live`): migrated RAM +
+/// device state plus VARS backup, kept strictly separate from golden so a
+/// failed live experiment can never confuse the rewind path.
+pub fn live_sidecar(disk: &str) -> PathBuf {
+    PathBuf::from(format!("{disk}.golden-live"))
+}
+
+/// NIC device name from HMP `info network` (first `type=nic` entry):
+/// auto-assigned by QEMU, never guessed — the flap must name the device,
+/// not the netdev.
+fn find_nic_name(info: &str) -> Option<&str> {
+    info.lines().find_map(|l| {
+        let l = l.trim();
+        let (name, rest) = l.split_once(':')?;
+        if rest.contains("type=nic") {
+            Some(name.trim())
+        } else {
+            None
+        }
+    })
+}
+
+/// One-shot TCP classification for the SSH port: does the restored guest
+/// accept, refuse, or swallow SYNs? Decides between "sshd died" and
+/// "packets blackholed" without a VNC session.
+enum PortState {
+    Open,
+    Refused,
+    Timeout,
+}
+
+async fn classify_port(port: u16) -> PortState {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect((PROVEN_SSH_HOST, port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => PortState::Open,
+        Ok(Err(_)) => PortState::Refused,
+        Err(_) => PortState::Timeout,
+    }
+}
+/// Shell-quote a path for QEMU `exec:` migration URIs (single-quote with
+/// embedded quotes escaped — cache paths routinely contain spaces).
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Migration-write URI for `snapshot --live` (`migrate` streams the guest
+/// out through `cat` into the state file).
+pub fn migrate_write_uri(state: &Path) -> String {
+    format!("exec:cat > {}", shell_quote(state))
+}
+
+/// Migration-read URI for `run --live` (`-incoming` streams the state file
+/// back into a fresh QEMU).
+pub fn migrate_read_uri(state: &Path) -> String {
+    format!("exec:cat {}", shell_quote(state))
+}
+
+/// Live-snapshot companions inside the VM dir.
+fn live_paths(vm_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        vm_dir.join(crate::paths::LIVE_STATE_FILE),
+        vm_dir.join(crate::paths::LIVE_VARS_BACKUP),
+        vm_dir.join(crate::paths::LIVE_OVERLAY),
+    )
+}
+
+/// Remove all live-snapshot remnants (announced): a new install or rewind
+/// voids them — resuming post-save writes against a rewound base would
+/// boot a half-state.
+fn clear_live_state(vm_dir: &Path) {
+    let disk = vm_dir
+        .join(crate::paths::DISK_IMAGE)
+        .to_string_lossy()
+        .into_owned();
+    let (state, vars, overlay) = live_paths(vm_dir);
+    for p in [live_sidecar(&disk), state, vars, overlay] {
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+            eprintln!(
+                "dropping stale live snapshot file {} ...",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+        }
+    }
+}
+
+/// Portable `qemu-img` for `qemu_dir` (resolved tree) or PATH fallback.
+fn img_bin_for(qemu_dir: &Option<PathBuf>) -> PathBuf {
+    match qemu_dir {
+        Some(d) => d
+            .join(crate::paths::PORTABLE_BIN_DIR)
+            .join(crate::paths::QEMU_IMG_NAME),
+        None => PathBuf::from(crate::paths::QEMU_IMG_NAME),
+    }
+}
+
+/// Prove the landed shell, deterministically: banner up, readiness probe
+/// passing, and a real exec returning the right user. No clocks, no
+/// windows — each check is present-tense evidence, and the snapshot below
+/// is voided the moment the banner drops, so no prediction is needed.
+async fn prove_landed_shell(port: u16, user: &str, password: &str) -> Result<()> {
+    if banner_once(port).await.is_none() {
+        anyhow::bail!("no SSH banner at snapshot time");
+    }
+    if !crate::ssh::probe_setup_done(PROVEN_SSH_HOST, port, user, password)
+        .await
+        .is_ok_and(|g| g.is_ready())
+    {
+        anyhow::bail!("guest not READY at snapshot time");
+    }
+    // LITERAL shell landing: a pty shell answering back, the exact path
+    // a user login takes — not a banner read, not an exec probe.
+    crate::ssh::prove_interactive_shell(PROVEN_SSH_HOST, port, user, password).await?;
+    eprintln!("shell proven (prompt answered), saving golden ...");
+    Ok(())
+}
+
+/// Watch the golden snapshot's premise: any banner loss after snapshotting
+/// means the guest bounced (the extra reboot the first banner never shows),
+/// so the sidecar is deleted on the spot. Returns when voided. Safe
+/// direction only: losing golden just means the next boot is normal.
+async fn watch_golden_void(port: u16, disk: String) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if banner_once(port).await.is_none() {
+            let _ = std::fs::remove_file(golden_sidecar(&disk));
+            eprintln!("guest bounced after golden — snapshot voided, next boot is normal ...");
+            return;
+        }
+    }
+}
+
+/// Clean guest shutdown ahead of a golden snapshot: `Stop-Computer` over
+/// SSH, then wait for the banner to die (halted). Golden must capture a
+/// clean bit — a QMP-quit power cut here would bake the dirty flag into
+/// every future rewind. Loud failure instead of a dirty snapshot: the
+/// caller reports, nothing is captured.
+async fn shutdown_guest_clean(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    eprintln!(
+        "shutting guest down cleanly for snapshot (up to {} s) ...",
+        timeouts::GUEST_SHUTDOWN_SECS
+    );
+    // Best-effort issue: if the guest is already dying, the banner wait
+    // below still does the real gating.
+    let _ = crate::ssh::ssh_exec(
+        host,
+        port,
+        user,
+        pass,
+        "powershell -NoProfile -Command \"Stop-Computer -Force\"",
+    )
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeouts::GUEST_SHUTDOWN_SECS);
+    // Two consecutive misses: a single loopback blip must not pass for a
+    // halt with the guest still running (snapshotting that disk would
+    // bless torn writes).
+    let mut misses = 0u32;
+    loop {
+        if banner_once(port).await.is_none() {
+            misses += 1;
+            if misses >= 2 {
+                eprintln!("guest halted.");
+                return Ok(());
+            }
+        } else {
+            misses = 0;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "guest did not halt within {} s — refusing a dirty snapshot (stop it and retry)",
+                timeouts::GUEST_SHUTDOWN_SECS
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Disk-only golden snapshot of the landed state + sidecar. QEMU must
+/// already be stopped (this runs post-kill): offline `qemu-img snapshot`
+/// sidesteps live device state entirely — boots rewind with `snapshot -a`
+/// and enumerate devices fresh, so pflash never blocks anything.
+async fn snapshot_golden(img_bin: &Path, disk: &str) -> Result<()> {
+    // Best-effort delete first: re-snapshotting over an existing tag must
+    // not fail. Stderr nulled: deleting a nonexistent tag is the normal
+    // first-snapshot case, not an error worth printing.
+    use std::process::Stdio;
+    let _ = tokio::process::Command::new(img_bin)
+        .args(["snapshot", "-d", timeouts::GOLDEN_TAG, disk])
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    let st = tokio::process::Command::new(img_bin)
+        .args(["snapshot", "-c", timeouts::GOLDEN_TAG, disk])
+        .status()
+        .await?;
+    if !st.success() {
+        anyhow::bail!("qemu-img snapshot failed");
+    }
+    std::fs::write(
+        golden_sidecar(disk),
+        format!("{}\n", crate::provenance::now_epoch()),
+    )?;
+    eprintln!("golden snapshot saved — next boots resume in seconds.");
+    Ok(())
+}
 
 /// Live installer session: QEMU still running after the OS reports ready.
 /// The caller owns the tail (capture a final frame, optionally offer a
@@ -664,6 +1208,9 @@ pub struct InstallSession {
     pub mon: std::sync::Arc<crate::ipc::Monitor>,
     pub vm_dir: PathBuf,
     pub screenshots: Option<tokio::task::JoinHandle<()>>,
+    /// `qemu-img` binary used for this install (for the post-kill golden
+    /// snapshot — the session outlives the paths that found it).
+    pub img_bin: PathBuf,
 }
 
 /// Shared middle of the run/install tails (defined once, called twice):
@@ -680,6 +1227,9 @@ async fn shell_then_wait(
 ) -> Result<()> {
     if shell {
         crate::ssh::interactive_shell(host, port, username, password).await?;
+        // The guest prompt never terminates its line — without this, the
+        // wait prompt below lands mid-prompt (`C:\...>press Ctrl-C ...`).
+        eprintln!();
     }
     eprintln!("{prompt}");
     shutdown_signal().await;
@@ -694,7 +1244,139 @@ async fn finish_install_capture(session: &mut InstallSession) {
         h.abort();
     }
     // Final frame after victory: the desktop as proven, not mid-install.
-    take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await;
+    if let Some((p, s, m)) = take_screenshot(&session.mon, &screenshots_dir(&session.vm_dir)).await
+    {
+        eprintln!(
+            "final frame: {} ({})",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+            describe(s, m)
+        );
+    }
+}
+
+/// Inputs for the install-time QEMU argv (pure constructor below): every
+/// runtime-resolved path plus the user sizing, so tests can assert the
+/// flags reach QEMU without spawning anything.
+pub(crate) struct InstallQemuArgv<'a> {
+    pub machine: &'a str,
+    pub accel: &'a str,
+    pub cpu: &'a str,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub display: Display,
+    pub code_tpl: &'a Path,
+    pub vars_fd: &'a Path,
+    pub serial_log: &'a str,
+    pub mon_sock: &'a str,
+    pub qmp_sock: &'a str,
+    pub usb_image: &'a Path,
+    pub target: &'a str,
+    pub arch: Architecture,
+}
+
+/// `qemu-img create` args (binary excluded): carries the user disk size.
+/// `-q` silences the `Formatting ...` line (our own banner says it).
+pub(crate) fn qemu_img_create_args(target: &str, disk_size_gb: u32) -> Vec<String> {
+    vec![
+        "create".into(),
+        "-q".into(),
+        "-f".into(),
+        "qcow2".into(),
+        target.into(),
+        format!("{disk_size_gb}G"),
+    ]
+}
+
+/// Installer QEMU argv (binary excluded): `-m`/`-smp` carry the user sizing.
+pub(crate) fn install_qemu_argv(s: &InstallQemuArgv) -> Vec<String> {
+    let mut argv = vec![
+        "-M".into(),
+        s.machine.to_string(),
+        "-accel".into(),
+        s.accel.to_string(),
+        "-cpu".into(),
+        s.cpu.to_string(),
+        "-m".into(),
+        s.memory_mb.to_string(),
+        "-smp".into(),
+        s.cpus.to_string(),
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,file={},readonly=on",
+            s.code_tpl.display()
+        ),
+        "-drive".into(),
+        format!("if=pflash,format=raw,file={}", s.vars_fd.display()),
+        "-display".into(),
+        s.display.to_string(),
+        "-serial".into(),
+        format!("file:{}", s.serial_log),
+        "-drive".into(),
+        format!(
+            "file={},format=raw,if=none,id=usbstick",
+            s.usb_image.display()
+        ),
+        "-netdev".into(),
+        format!("user,id=n1,hostfwd=tcp::{}-:22", PROVEN_SSH_PORT),
+        "-device".into(),
+        "virtio-net-pci,netdev=n1".into(),
+        "-monitor".into(),
+        crate::ipc::qemu_arg(s.mon_sock),
+        "-qmp".into(),
+        crate::ipc::qemu_arg(s.qmp_sock),
+    ];
+    // xHCI first: neither q35 nor virt ships a USB bus, so usb-storage and
+    // the ARM64 input devices below would be bus-less without it.
+    argv.push("-device".into());
+    argv.push("qemu-xhci,id=xhci".into());
+    // ARM64 virt ships with NO input/display devices of its own:
+    // USB keyboard (send-key needs it) + USB tablet (VNC
+    // pointer needs it), and ramfb as the one framebuffer (single
+    // console: VNC and screendump keep working after Windows takes
+    // over, unlike virtio-gpu). x86/pc has PS/2 + VGA by default.
+    if s.arch == Architecture::Arm64 {
+        argv.push("-device".into());
+        argv.push("usb-kbd".into());
+        argv.push("-device".into());
+        argv.push("usb-tablet".into());
+        argv.push("-device".into());
+        argv.push("ramfb".into());
+    }
+    // Removable USB media (never ide-hd). Two separate things decide
+    // whether Setup finds its media and where it installs — they were
+    // conflated here before, and both were verified live:
+    //   * partition type (media.rs): WinPE letters a Microsoft Basic Data
+    //     FAT32 volume, but mounts an ESP — or any GUID it won't letter —
+    //     Hidden with no drive letter, so Setup never sees
+    //     sources/install.swm and parks at "Install driver to show hardware";
+    //   * enumeration order: USB storage lands behind the NVMe (Disk 0 =
+    //     the target), while ide-hd came first (Disk 0 = the 10 GB media),
+    //     and the unattend installs to Disk 0.
+    argv.push("-device".into());
+    argv.push("usb-storage,drive=usbstick,removable=true,bootindex=1".into());
+    argv.push("-drive".into());
+    argv.push(format!("file={},format=qcow2,if=none,id=tgt", s.target));
+    argv.push("-device".into());
+    argv.push("nvme,drive=tgt,serial=nvme1,bootindex=0".into());
+    argv
+}
+
+/// One orchestrator for all install stages: grouping the params in a
+/// struct beats counting them in a lint attribute.
+pub struct InstallParams {
+    pub usb_image: Option<PathBuf>,
+    pub win_iso: Option<PathBuf>,
+    pub screenshots_every_secs: u64,
+    pub classify_every_secs: Option<u64>,
+    pub username: String,
+    pub password: String,
+    pub recovery: bool,
+    pub auto_updates: bool,
+    pub install_timeout_secs: u64,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub disk_size_gb: u32,
+    pub display: crate::qemu::Display,
 }
 
 /// Proven NVMe+USB unattended install: installer USB + NVMe target,
@@ -709,19 +1391,7 @@ async fn finish_install_capture(session: &mut InstallSession) {
 /// `shell_then_wait` + `finish_install_capture`.
 ///
 /// Run from the repo root (USB media must already exist).
-/// Nine params is the honest shape (one orchestrator for all install
-/// stages); an args struct would just relocate the list.
-#[allow(clippy::too_many_arguments)]
-async fn install_to_ready(
-    usb_image: Option<PathBuf>,
-    win_iso: Option<PathBuf>,
-    screenshots_every_secs: u64,
-    username: &str,
-    password: &str,
-    recovery: bool,
-    auto_updates: bool,
-    install_timeout_secs: u64,
-) -> Result<InstallSession> {
+async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
     // Sockets, serial log, SSH port and VNC settings match what `run`
     // boots: every endpoint is scoped to this VM dir (never /tmp —
     // world-writable-sticky, symlink squatting, cross-VM collisions).
@@ -742,14 +1412,21 @@ async fn install_to_ready(
     // firmware state survives its boots.
     let vars_fd = vm_dir.join(crate::paths::VARS_FILE);
     let run_log = vm_dir.join(crate::paths::INSTALL_LOG);
-    let usb_image = usb_image.unwrap_or(default_media_image()?);
+    let usb_image = p.usb_image.unwrap_or(default_media_image()?);
     if !usb_image.is_file() {
-        match win_iso {
+        match p.win_iso {
             // Chain: fetch deps + build the USB image, then install from it.
             // Explicit `--win-iso` only — never silent (setup downloads).
             #[cfg(feature = "downloader")]
             Some(iso) => {
-                eprintln!("USB image missing — building from {} ...", iso.display());
+                // The ISO is the one input `setup` cannot fetch: check it
+                // BEFORE the downloads, so a bad path fails in milliseconds
+                // instead of after gigabytes of tools.
+                require_win_iso(&expand_tilde(iso.clone()))?;
+                eprintln!(
+                    "USB installer media missing — building it from {} (one-time; downloads tools, then builds a ~7 GB image) ...",
+                    iso.display()
+                );
                 cmd_setup(None, None).await?;
                 cmd_build_media(BuildMediaArgs {
                     win_iso: iso,
@@ -759,8 +1436,8 @@ async fn install_to_ready(
                     openssh_zip: None,
                     out: Some(usb_image.clone()),
                     wimlib_bin: None,
-                    username: username.to_string(),
-                    password: password.to_string(),
+                    username: p.username.clone(),
+                    password: p.password.clone(),
                     locale: "en-US".to_string(),
                     // Chain runs only when the image is absent — nothing to force.
                     force: false,
@@ -834,9 +1511,20 @@ async fn install_to_ready(
         )
     })?;
     let _ = std::fs::remove_file(&target);
-    eprintln!("installing to {target_s} ...");
+    // A new install voids any golden snapshot (sidecar dies with the
+    // disk it blessed — a stale sidecar must never bless new bytes).
+    let _ = std::fs::remove_file(golden_sidecar(&target_s));
+    // ...and any live snapshot (its base, RAM, and VARS all predate this
+    // disk — resuming them would boot a half-state).
+    if let Some(parent) = std::path::Path::new(&target_s).parent() {
+        clear_live_state(parent);
+    }
+    eprintln!(
+        "installing Windows to {target_s} (new {}G disk, {} MB RAM, {} vCPUs) ...",
+        p.disk_size_gb, p.memory_mb, p.cpus
+    );
     let st = tokio::process::Command::new(&img_bin)
-        .args(["create", "-f", "qcow2", &target_s, "64G"])
+        .args(qemu_img_create_args(&target_s, p.disk_size_gb))
         .status()
         .await?;
     if !st.success() {
@@ -846,7 +1534,7 @@ async fn install_to_ready(
         crate::ipc::stale_remove(s);
     }
     let out = std::fs::File::create(&run_log)?;
-    eprintln!("install log: {}", run_log.display());
+    eprintln!("QEMU output log: {}", run_log.display());
     // Same probe as `run`/boot argv (unattend::resolve_accel): Linux
     // without usable /dev/kvm (OrbStack, containers) falls back to tcg
     // instead of dying on `-accel kvm`. CPU follows the accel: `host`
@@ -854,83 +1542,25 @@ async fn install_to_ready(
     // is too old for Windows 11 ARM64).
     let (_, accel) = auto_detect_platform();
     let cpu = if accel == "tcg" { "max" } else { "host" };
-    if accel == "tcg" {
-        eprintln!(
-            "warning: no usable /dev/kvm — installing under TCG emulation (5-15x slower; for full speed run on the macOS host with hvf or bare-metal Linux with KVM)"
-        );
-    }
+    // (No extra warning here: resolve_accel already warned via tracing.)
     let machine = crate::qemu::machine_for(arch);
     let mut child = tokio::process::Command::new(&sys_bin);
-    child.args([
-        "-M",
+    child.args(install_qemu_argv(&InstallQemuArgv {
         machine,
-        "-accel",
         accel,
-        "-cpu",
         cpu,
-        "-m",
-        "4096",
-        "-smp",
-        "4",
-        "-drive",
-        &format!(
-            "if=pflash,format=raw,file={},readonly=on",
-            code_tpl.display()
-        ),
-        "-drive",
-        &format!("if=pflash,format=raw,file={}", vars_fd.display()),
-        "-display",
-        PROVEN_VNC_DISPLAY,
-        "-serial",
-        &format!("file:{serial_log}"),
-        "-drive",
-        &format!(
-            "file={},format=raw,if=none,id=usbstick",
-            usb_image.display()
-        ),
-        "-netdev",
-        &format!("user,id=n1,hostfwd=tcp::{}-:22", PROVEN_SSH_PORT),
-        "-device",
-        "virtio-net-pci,netdev=n1",
-        "-monitor",
-        &crate::ipc::qemu_arg(&mon_sock),
-        "-qmp",
-        &crate::ipc::qemu_arg(&qmp_sock),
-    ]);
-    // xHCI first: neither q35 nor virt ships a USB bus, so usb-storage and
-    // the ARM64 input devices below would be bus-less without it.
-    child.arg("-device").arg("qemu-xhci,id=xhci");
-    // ARM64 virt ships with NO input/display devices of its own:
-    // USB keyboard (send-key needs it) + USB tablet (VNC
-    // pointer needs it), and ramfb as the one framebuffer (single
-    // console: VNC and screendump keep working after Windows takes
-    // over, unlike virtio-gpu). x86/pc has PS/2 + VGA by default.
-    if arch == Architecture::Arm64 {
-        child
-            .arg("-device")
-            .arg("usb-kbd")
-            .arg("-device")
-            .arg("usb-tablet")
-            .arg("-device")
-            .arg("ramfb");
-    }
-    // Removable USB media (never ide-hd). Two separate things decide
-    // whether Setup finds its media and where it installs — they were
-    // conflated here before, and both were verified live:
-    //   * partition type (media.rs): WinPE letters a Microsoft Basic Data
-    //     FAT32 volume, but mounts an ESP — or any GUID it won't letter —
-    //     Hidden with no drive letter, so Setup never sees
-    //     sources/install.swm and parks at "Install driver to show hardware";
-    //   * enumeration order: USB storage lands behind the NVMe (Disk 0 =
-    //     the target), while ide-hd came first (Disk 0 = the 10 GB media),
-    //     and the unattend installs to Disk 0.
-    child
-        .arg("-device")
-        .arg("usb-storage,drive=usbstick,removable=true,bootindex=1")
-        .arg("-drive")
-        .arg(format!("file={target_s},format=qcow2,if=none,id=tgt"))
-        .arg("-device")
-        .arg("nvme,drive=tgt,serial=nvme1,bootindex=0");
+        memory_mb: p.memory_mb,
+        cpus: p.cpus,
+        display: p.display.clone(),
+        code_tpl: &code_tpl,
+        vars_fd: &vars_fd,
+        serial_log: &serial_log,
+        mon_sock: &mon_sock,
+        qmp_sock: &qmp_sock,
+        usb_image: &usb_image,
+        target: &target_s,
+        arch,
+    }));
     child
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
@@ -953,7 +1583,7 @@ async fn install_to_ready(
     let mut child = child.spawn()?;
     let child_pid = child.id();
     eprintln!(
-        "QEMU spawned (pid {child_pid:?}); waiting up to {} s for monitor ...",
+        "QEMU started (pid {child_pid:?}); waiting for the monitor (up to {}s) ...",
         timeouts::MONITOR_CONNECT_SECS
     );
     // Retry the REAL handshake, never a probe connect: QEMU's listen
@@ -984,22 +1614,54 @@ async fn install_to_ready(
                 );
             }
         };
-    mon.command(&format!("change vnc password {PROVEN_VNC_PASSWORD}"))
-        .await?;
+    // VNC-only step (same guard as the boot path): cocoa/gtk/sdl have
+    // no VNC server to password-protect.
+    if p.display.is_vnc() {
+        mon.command(&vnc_password_command()).await?;
+    }
     let mon = std::sync::Arc::new(mon);
-    let url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string());
-    eprintln!("VNC {url} (password set); waiting for SSH ...");
-    let screenshots = if screenshots_every_secs > 0 {
-        let dir = screenshots_dir(&vm_dir);
+    let url = vnc_url(&p.display.as_arg()).unwrap_or_else(|| p.display.as_arg());
+    if p.display.is_vnc() {
         eprintln!(
-            "screendumps every {screenshots_every_secs}s -> {}",
-            dir.display()
+            "Windows installer is running — watch it at {url} (VNC password: {PROVEN_VNC_PASSWORD})."
         );
-        Some(spawn_screenshots(
+    } else {
+        eprintln!("Windows installer is running on the {url} display.");
+    }
+
+    if accel == "tcg" {
+        eprintln!(
+            "This takes a while (much longer under TCG emulation); SSH answers when Setup finishes."
+        );
+    } else {
+        eprintln!("This takes a while; SSH answers when Setup finishes.");
+    }
+    // Cadence policy resolves after accel detection (same `accel` the
+    // install argv above used — post any KVM→TCG fallback): an explicit
+    // flag wins, else TCG earns 3x spacing on classification.
+    let profile = SamplingProfile::resolve(p.screenshots_every_secs, p.classify_every_secs, accel);
+    let screenshots = if !profile.save_every.is_zero() || !profile.classify_every.is_zero() {
+        let dir = screenshots_dir(&vm_dir);
+        if !profile.save_every.is_zero() {
+            eprintln!(
+                "Saving an installer screenshot every {}s until then → {}",
+                profile.save_every.as_secs(),
+                dir.display()
+            );
+        }
+        if !profile.classify_every.is_zero() {
+            eprintln!(
+                "Classifying the installer screen every {}s (in memory, no file)",
+                profile.classify_every.as_secs()
+            );
+        }
+        spawn_sampler(
             std::sync::Arc::clone(&mon),
             dir,
-            Duration::from_secs(screenshots_every_secs),
-        ))
+            vm_dir.join(crate::paths::DISK_IMAGE),
+            profile,
+            "installer",
+        )
     } else {
         None
     };
@@ -1008,6 +1670,7 @@ async fn install_to_ready(
         mon: std::sync::Arc::clone(&mon),
         shots_dir,
         serial_log: serial_log.clone(),
+        vnc: p.display.is_vnc().then(|| url.clone()),
     };
     tokio::select! {
         r = wait_install_ready(
@@ -1017,19 +1680,34 @@ async fn install_to_ready(
             // fast on a guest that stops moving, so this only bounds how
             // long a *slow* host may keep applying the image (hours on a
             // ~1 MB/s machine).
-            Duration::from_secs(install_timeout_secs),
-            username,
-            password,
-            recovery,
-            auto_updates,
+            Duration::from_secs(p.install_timeout_secs),
+            &p.username,
+            &p.password,
+            p.recovery,
+            p.auto_updates,
             &scope,
         ) => {
-            let banner = r?;
+            let banner = match r {
+                Ok(b) => b,
+                Err(e) => {
+                    // Same evidence block as `run`'s failure arms: final
+                    // frame + serial tail + VNC, attached to the cause
+                    // (banner timeout, fatal signature, stall watchdog).
+                    let report = boot_failure_report(
+                        &scope.mon,
+                        &scope.serial_log,
+                        &scope.shots_dir,
+                        &scope.vnc,
+                    )
+                    .await;
+                    anyhow::bail!("{e:#}\n{report}");
+                }
+            };
             // Committed proof: one tested-isos.jsonl line from the image's
             // sidecar, plus a README table refresh when the markers exist.
             // Best-effort throughout — images built before sidecars existed
             // still install fine, they just leave no record. (The probe
-            // already authenticated as `username`, so the CLI value is
+            // already authenticated as `p.username`, so the CLI value is
             // authoritative for the ready line.)
             match crate::provenance::TestRecord::load_sidecar(&usb_image) {
                 Ok(prov) => {
@@ -1049,7 +1727,7 @@ async fn install_to_ready(
                 }
                 Err(e) => eprintln!("warning: no sidecar, skipping test record: {e:#}"),
             }
-            eprintln!("ready — ssh -p {} {username}@{PROVEN_SSH_HOST}", PROVEN_SSH_PORT);
+            eprintln!("ready — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})", PROVEN_SSH_PORT, p.username, p.password);
         }
         _ = shutdown_signal() => {
             eprintln!("interrupted; stopping guest...");
@@ -1067,47 +1745,186 @@ async fn install_to_ready(
         mon,
         vm_dir,
         screenshots,
+        img_bin,
     })
+}
+
+/// Snapshot the running guest's disk as the new golden state (`docker
+/// commit`): proves the shell, stops QEMU, snapshots offline, and writes
+/// the sidecar. The guest must be up (boot it with `run` first); QEMU is
+/// left stopped afterward, so boot again to resume the new golden.
+/// With `live`: QMP `savevm` on the running guest instead (no shutdown —
+/// instant-boot state, experimental; the writable pflash drive may veto
+/// it, in which case nothing is written and the guest keeps running).
+pub async fn cmd_snapshot(
+    vm_dir: Option<PathBuf>,
+    qemu_dir: Option<PathBuf>,
+    username: String,
+    password: String,
+    ssh_port: u16,
+    live: bool,
+) -> Result<()> {
+    let vm_dir = match vm_dir {
+        Some(d) => d,
+        None => default_vm_dir()?,
+    };
+    let disk = vm_dir
+        .join(crate::paths::DISK_IMAGE)
+        .to_string_lossy()
+        .into_owned();
+    if !std::path::Path::new(&disk).is_file() {
+        anyhow::bail!("no disk at {disk} (install first)");
+    }
+    // The guest must be running: a snapshot of a stopped disk proves
+    // nothing about the shell.
+    if banner_once(ssh_port).await.is_none() {
+        anyhow::bail!(
+            "no SSH banner on {PROVEN_SSH_HOST}:{ssh_port} (boot the guest with `run` first)"
+        );
+    }
+    prove_landed_shell(ssh_port, &username, &password).await?;
+    if live {
+        // Live path: pivot an overlay (atomic — the base freezes at this
+        // instant, post-save writes land in the overlay), then migrate
+        // RAM + devices to the state file (migration transfers pflash
+        // content, so the savevm veto does not apply), then back up VARS
+        // (raw pflash lives outside every snapshot). Guest keeps running
+        // throughout; crash-consistent like a power cut at the pivot.
+        let (state, vars_backup, overlay) = live_paths(&vm_dir);
+        // Fresh pivot each save: a leftover overlay would fail the pivot
+        // and poison the consistency story.
+        for p in [&state, &vars_backup, &overlay] {
+            let _ = std::fs::remove_file(p);
+        }
+        let qmp_sock = crate::ipc::vm_endpoint(&vm_dir, crate::ipc::QMP_SOCK_NAME);
+        let mut qmp = crate::qmp::QmpClient::connect(&qmp_sock).await?;
+        eprintln!("pivoting live overlay (freezing base) ...");
+        qmp.live_overlay("tgt", &overlay.to_string_lossy())
+            .await
+            .map_err(|e| anyhow::anyhow!("live overlay pivot refused ({e:#}) — guest untouched"))?;
+        eprintln!("migrating guest state to file (brief stun) ...");
+        qmp.migrate_to_file(&state).await.map_err(|e| {
+            anyhow::anyhow!(
+                "live migration refused ({e:#}) — guest still running on the overlay; delete {} to unwind",
+                overlay.display()
+            )
+        })?;
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(timeouts::MIGRATION_BUDGET_SECS);
+        loop {
+            let status = qmp.query_migrate_status().await?;
+            if status == "completed" {
+                break;
+            }
+            if status == "failed" || status == "cancelled" {
+                anyhow::bail!(
+                    "live migration {status} — guest still running on the overlay; delete {} to unwind",
+                    overlay.display()
+                );
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "live migration still '{status}' after {} s — guest still running on the overlay; delete {} to unwind",
+                    timeouts::MIGRATION_BUDGET_SECS,
+                    overlay.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(timeouts::MIGRATION_POLL_SECS)).await;
+        }
+        std::fs::copy(vm_dir.join(crate::paths::VARS_FILE), &vars_backup)?;
+        // Post-migration liveness: a completed job can still leave the VM
+        // paused (observed: guest "locked up" after a clean save). Verify
+        // running, resume if paused — never hand back a frozen guest.
+        match qmp.query_vm_status().await?.as_str() {
+            "running" => {}
+            stalled => {
+                eprintln!("guest {stalled} after migration — resuming ...");
+                qmp.resume_vm().await?;
+            }
+        }
+        std::fs::write(
+            live_sidecar(&disk),
+            format!("{}\n", crate::provenance::now_epoch()),
+        )?;
+        eprintln!("live snapshot saved — `run --live` resumes it instantly; guest still running.");
+        return Ok(());
+    }
+    let img_bin = match qemu_dir {
+        Some(d) => d
+            .join(crate::paths::PORTABLE_BIN_DIR)
+            .join(crate::paths::QEMU_IMG_NAME),
+        None => {
+            #[cfg(feature = "downloader")]
+            {
+                let q = crate::qemu_portable::pinned_cached()?;
+                q.root
+                    .join(crate::paths::PORTABLE_BIN_DIR)
+                    .join(crate::paths::QEMU_IMG_NAME)
+            }
+            #[cfg(not(feature = "downloader"))]
+            {
+                PathBuf::from(crate::paths::QEMU_IMG_NAME)
+            }
+        }
+    };
+    // Clean halt first (guest-initiated, so the bit is clean), then QMP
+    // quit reaps a halted QEMU, then the offline snapshot. A power-cut
+    // snapshot would bake the dirty flag into every future rewind.
+    shutdown_guest_clean(PROVEN_SSH_HOST, ssh_port, &username, &password).await?;
+    cmd_stop(Some(vm_dir), None).await?;
+    snapshot_golden(&img_bin, &disk).await?;
+    eprintln!("golden refreshed — `run` resumes this state from now on.");
+    Ok(())
 }
 
 /// Standalone `install`: full install, then supervise the VM for a human
 /// via the shared tail (final frame + optional shell + Ctrl-C wait + kill).
-/// Nine params mirrors the core's honest shape; `shell` only affects this
-/// tail, never the install itself.
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_install(
-    usb_image: Option<PathBuf>,
-    win_iso: Option<PathBuf>,
-    screenshots_every_secs: u64,
-    username: &str,
-    password: &str,
-    shell: bool,
-    recovery: bool,
-    auto_updates: bool,
-    install_timeout_secs: u64,
-) -> Result<()> {
-    let mut session = install_to_ready(
-        usb_image,
-        win_iso,
-        screenshots_every_secs,
-        username,
-        password,
-        recovery,
-        auto_updates,
-        install_timeout_secs,
-    )
-    .await?;
+/// `shell` only affects this tail, never the install itself.
+pub async fn cmd_install(p: InstallParams, shell: bool) -> Result<()> {
+    let username = p.username.clone();
+    let password = p.password.clone();
+    let mut session = install_to_ready(p).await?;
     finish_install_capture(&mut session).await;
-    shell_then_wait(
-        shell,
-        PROVEN_SSH_HOST,
-        PROVEN_SSH_PORT,
-        username,
-        password,
-        "press Ctrl-C to shut the VM down cleanly",
-    )
-    .await?;
+    // Golden before shell/kill: prove the shell now, snapshot now. A bounce
+    // afterward voids the sidecar (watcher below) instead of having been
+    // predicted by a timer.
+    prove_landed_shell(PROVEN_SSH_PORT, &username, &password).await?;
+    let target = session.vm_dir.join(crate::paths::DISK_IMAGE);
+    let target_s = target.to_string_lossy().into_owned();
+    if shell {
+        let disk = target_s.clone();
+        tokio::select! {
+            _ = shell_then_wait(
+                true,
+                PROVEN_SSH_HOST,
+                PROVEN_SSH_PORT,
+                &username,
+                &password,
+                "press Ctrl-C to shut the VM down cleanly",
+            ) => {},
+            // Bounce voids golden but the install stands: keep waiting for
+            // Ctrl-C afterward instead of exiting early.
+            _ = watch_golden_void(PROVEN_SSH_PORT, disk) => {
+                shell_then_wait(
+                    true,
+                    PROVEN_SSH_HOST,
+                    PROVEN_SSH_PORT,
+                    &username,
+                    &password,
+                    "press Ctrl-C to shut the VM down cleanly",
+                )
+                .await?;
+            }
+        }
+    } else {
+        eprintln!("install complete (non-interactive — shutting down guest)...");
+    }
+    // Clean halt before the snapshot (same reason as `snapshot`): golden
+    // must capture a clean bit. Ctrl-C still kills instantly everywhere
+    // else — only snapshot paths pay for clean.
+    shutdown_guest_clean(PROVEN_SSH_HOST, PROVEN_SSH_PORT, &username, &password).await?;
     session.child.kill().await?;
+    snapshot_golden(&session.img_bin, &target_s).await?;
     Ok(())
 }
 
@@ -1219,6 +2036,49 @@ pub fn render_report(log: &Path) -> Result<String> {
     Ok(rows.join("\n") + "\n")
 }
 
+/// Score one PNG through the k-NN classifier ([`crate::screen_knn`]:
+/// blurred unit-norm luminance + cosine vs the baked cluster centers).
+/// OOD triage in one shot — no fixture dir, no snapshot, nothing
+/// blessed. The verdict names the matched exemplar, so a miss is a
+/// viewable cause. User-supplied path, so loading is fallible
+/// (`try_load_rgb_8bit`) — bad input exits nonzero via `anyhow`, never a
+/// panic out of the fixture loader.
+pub fn cmd_classify(png: &std::path::Path) -> Result<()> {
+    use crate::screen_knn::{KNN_TOP_K, KNN_UNCERTAIN_GAP, KnnIndex, bundled_index};
+    let path = png
+        .to_str()
+        .with_context(|| format!("non-UTF8 image path: {}", png.display()))?;
+    let (rgb, w, h) = crate::screen_knn::try_load_rgb_8bit(path)
+        .map_err(|e| anyhow::anyhow!("load {path}: {e}"))?;
+    if rgb.is_empty() || w == 0 {
+        println!("top-1: Dark gap 1.000 (empty input — nothing captured)");
+        println!("verdict: COMMITTED (margin holds — narration states the label)");
+        return Ok(());
+    }
+    let index = bundled_index();
+    let q = KnnIndex::embed_frame(&rgb, w, h);
+    let (top, gap, matched) = index
+        .predict(&q, None)
+        .with_context(|| "empty bundled k-NN index — rebuild artifacts/knn_index.bin")?;
+    println!("top-1: {top:?} gap {gap:.4} via {matched}");
+    for (label, cos, name) in index.query(&q, None, KNN_TOP_K) {
+        let class = crate::screen_knn::BY_INDEX
+            .iter()
+            .find(|c| **c as usize == label)
+            .copied()
+            .unwrap_or(crate::screen_knn::ScreenClass::Dark);
+        println!("  {class:?}: {cos:.4} {name}");
+    }
+    if gap < KNN_UNCERTAIN_GAP {
+        println!(
+            "verdict: UNCERTAIN (gap below {KNN_UNCERTAIN_GAP:.2} — narration hedges, nothing gates)"
+        );
+    } else {
+        println!("verdict: COMMITTED (margin holds — narration states the label)");
+    }
+    Ok(())
+}
+
 pub fn cmd_report(a: ReportArgs) -> Result<()> {
     let table = render_report(&a.log)?;
     match a.readme {
@@ -1311,9 +2171,9 @@ pub async fn cmd_guest(a: GuestArgs) -> Result<()> {
                 .await?;
         }
         GuestOp::Probe => {
-            let done =
+            let progress =
                 crate::ssh::probe_setup_done(host, a.ssh_port, &a.username, &a.password).await?;
-            eprintln!("{}", if done { "READY" } else { "BUSY" });
+            eprintln!("{}", if progress.is_ready() { "READY" } else { "BUSY" });
         }
     }
     Ok(())
@@ -1794,7 +2654,37 @@ fn fatal_boot_patterns() -> Vec<String> {
         .collect()
 }
 
-fn check_boot_failure(serial_log: &str, shots_dir: &Path) -> Result<()> {
+/// Firmware boot handoffs in the serial log: OVMF prints one
+/// `BdsDxe: starting <entry>` line per boot attempt it launches (failed
+/// candidates log `failed to load` instead), so the count rises on every
+/// guest reboot — the below-screenshot "did it bounce?" signal. QEMU's
+/// file chardev truncates at VM start, so it counts this session only.
+/// Caveat: a boot entry whose `Start()` returns without loading can add a
+/// line without a full reboot — the trend (flat vs rising) is the signal.
+fn boot_count(serial_log: &str) -> u64 {
+    std::fs::read_to_string(serial_log)
+        .unwrap_or_default()
+        .matches("BdsDxe: starting")
+        .count() as u64
+}
+
+/// One-shot narration for a rising [`boot_count`]: `None` while flat, a
+/// line for the first boot, a reboot line after it. Count regressions
+/// (a truncated log) stay silent — never claim a reboot that didn't show.
+fn boot_note(old: u64, new: u64) -> Option<String> {
+    (new > old).then(|| {
+        if new == 1 {
+            "guest booted (first firmware boot)".to_string()
+        } else {
+            format!("guest rebooted (firmware boot #{new} seen on serial)")
+        }
+    })
+}
+
+/// Fatal serial signature check (see [`fatal_boot_patterns`]): returns the
+/// cause only — `cmd_run`'s failure arms append the evidence block (frame
+/// path + serial tail + VNC) via [`boot_failure_report`].
+fn check_boot_failure(serial_log: &str) -> Result<()> {
     let fatal = fatal_boot_patterns();
     let text = std::fs::read_to_string(serial_log).unwrap_or_default();
     // Only the tail matters (log persists across runs); keep the last 8 KB.
@@ -1805,35 +2695,47 @@ fn check_boot_failure(serial_log: &str, shots_dir: &Path) -> Result<()> {
     };
     for pat in &fatal {
         if tail.contains(pat) {
-            anyhow::bail!(
-                "guest failed to boot (serial shows {pat:?}); VNC {url} or latest screenshot in {shots} for the screen",
-                url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string()),
-                shots = shots_dir.display(),
-            );
+            anyhow::bail!("guest failed to boot (serial shows {pat:?})");
         }
     }
     Ok(())
 }
 
-/// Stall sensor for serial-silent deaths (WinRE screens, EULA prompts —
-/// anything GUI-only that the patterns file structurally cannot see).
-/// Samples QMP blockstats: a booting guest does disk I/O constantly, so
-/// completely frozen counters + no SSH banner means parked at an input
-/// screen. Warns at [`timeouts::IDLE_WARN_SECS`], bails at
-/// [`timeouts::IDLE_BAIL_SECS`] with the evidence.
-/// Thread-safe by construction: all state lives in the struct.
-struct BlockIdle {
+/// Guest-activity ledger: the sole consumer of `info blockstats` plus
+/// host-side disk-size samples. Answers "is the guest doing anything" so
+/// the warning policy can tell a slow install (moving) from a parked one
+/// (flat). Sample on every tick; judge on horizons — qcow2 grows stepwise,
+/// so per-second diffs false-report static.
+struct ActivityMonitor {
     last_total: u64,
     last_change: std::time::Instant,
     warned: bool,
+    disk_start: Option<u64>,
+    disk_last: u64,
+    disk_last_change: std::time::Instant,
+    last_sample: Option<std::time::Instant>,
+    /// I/O bytes/s, exponential average over [`Self::EMA_WINDOW_SECS`].
+    pub(crate) io_ema_bps: f64,
+    /// Disk-growth bytes/s, same window.
+    pub(crate) growth_ema_bps: f64,
 }
 
-impl BlockIdle {
+impl ActivityMonitor {
+    /// EMA window in seconds: bursts read as rates, not spikes.
+    const EMA_WINDOW_SECS: f64 = 300.0;
+
     fn new() -> Self {
+        let now = std::time::Instant::now();
         Self {
             last_total: 0,
-            last_change: std::time::Instant::now(),
+            last_change: now,
             warned: false,
+            disk_start: None,
+            disk_last: 0,
+            disk_last_change: now,
+            last_sample: None,
+            io_ema_bps: 0.0,
+            growth_ema_bps: 0.0,
         }
     }
 
@@ -1854,31 +2756,146 @@ impl BlockIdle {
         found.then_some(total)
     }
 
-    /// Feed one sample. Returns a message when a threshold trips
-    /// (warn-once, then bail); `Err` on bail so callers `?` straight out.
-    async fn poll(&mut self, mon: &crate::ipc::Monitor) -> Result<()> {
+    /// One EMA step, pure: `prev` toward `inst` over `dt_secs` in a
+    /// `window_secs` horizon. Unit-testable without clocks.
+    fn ema_step(prev: f64, inst: f64, dt_secs: f64, window_secs: f64) -> f64 {
+        if dt_secs <= 0.0 {
+            return prev;
+        }
+        let alpha = (dt_secs / window_secs).min(1.0);
+        prev + alpha * (inst - prev)
+    }
+
+    /// Feed one tick: monitor counters plus host-side disk size. Every
+    /// part best-effort — an unreachable monitor or stat failure skips
+    /// that signal, never the wait. `None` disk skips growth tracking
+    /// (blockstats still feed the stall watchdog).
+    async fn sample(&mut self, mon: &crate::ipc::Monitor, disk: Option<&Path>) {
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_sample
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        self.last_sample = Some(now);
         let text = mon.command("info blockstats").await.unwrap_or_default();
-        let Some(total) = Self::parse_total(&text) else {
-            return Ok(());
-        };
-        if total != self.last_total {
-            self.last_total = total;
-            self.last_change = std::time::Instant::now();
+        if let Some(total) = Self::parse_total(&text) {
+            // Unconditional on movement: a flat interval feeds inst 0.0 so
+            // the average decays toward zero instead of freezing at its
+            // last active rate for hours on an idle guest.
+            if dt > 0.0 {
+                let inst = total.saturating_sub(self.last_total) as f64 / dt;
+                self.io_ema_bps = Self::ema_step(self.io_ema_bps, inst, dt, Self::EMA_WINDOW_SECS);
+            }
+            if total != self.last_total {
+                self.last_total = total;
+                self.last_change = now;
+                self.warned = false;
+            }
+        }
+        if let Some(disk) = disk
+            && let Ok(size) = std::fs::metadata(disk).map(|m| m.len())
+        {
+            if self.disk_start.is_none() {
+                // First sample arms the baseline without tripping motion:
+                // a pre-existing disk is not growth.
+                self.disk_start = Some(size);
+                self.disk_last = size;
+                self.disk_last_change = now;
+            } else if dt > 0.0 {
+                let inst = size.saturating_sub(self.disk_last) as f64 / dt;
+                self.growth_ema_bps =
+                    Self::ema_step(self.growth_ema_bps, inst, dt, Self::EMA_WINDOW_SECS);
+                // Growth timer advances only on real growth; the average
+                // still decays through the zero inst above.
+                if size != self.disk_last {
+                    self.disk_last_change = now;
+                }
+                self.disk_last = size;
+            }
+        }
+    }
+
+    /// Seconds since block I/O last moved.
+    fn idle_secs(&self) -> u64 {
+        self.last_change.elapsed().as_secs()
+    }
+
+    /// Seconds since the disk image last grew.
+    fn disk_idle_secs(&self) -> u64 {
+        self.disk_last_change.elapsed().as_secs()
+    }
+
+    /// Bytes the disk image grew since the first sample (saturating).
+    fn growth_since_start(&self) -> u64 {
+        self.disk_start
+            .map(|s| self.disk_last.saturating_sub(s))
+            .unwrap_or(0)
+    }
+
+    /// Moving right now: any I/O inside the warn horizon.
+    fn is_moving(&self) -> bool {
+        self.idle_secs() < timeouts::IDLE_WARN_SECS
+    }
+
+    /// Stall watchdog, conditioned on screen state: frozen disk I/O during
+    /// valid progress (Setup applying, OOBE, boot art, idle desktop) is a
+    /// slow host, never a stuck guest — progress answers only to the
+    /// operator. The bail fires solely on the conjunction: a non-progress
+    /// screen (error states, Dark, FlatField) AND ceased block I/O AND a
+    /// disk that stopped growing. `None` state (no frame yet) takes the
+    /// strict path: nothing rendered is itself evidence of stuck.
+    /// `fatal` decides the teeth: the run boot wait bails (a dead boot
+    /// has its own SSH deadline anyway), the install path only ever warns
+    /// — nothing but the operator halts an install. `Err` on bail so
+    /// fatal callers `?` straight out.
+    fn check_stall(&mut self, state: Option<ScreenState>, fatal: bool) -> Result<()> {
+        let progress = matches!(
+            state,
+            Some(
+                ScreenState::InstallerStep
+                    | ScreenState::OobeStep
+                    | ScreenState::FirmwareBoot
+                    | ScreenState::Lockscreen
+            )
+        );
+        if progress {
+            // Slow host, not stuck guest: reset the warn latch so a later
+            // genuine stall still warns, and return without judging.
             self.warned = false;
             return Ok(());
         }
-        let idle = self.last_change.elapsed().as_secs();
-        if idle >= timeouts::IDLE_BAIL_SECS {
+        let idle = self.idle_secs();
+        let disk_idle = self.disk_idle_secs();
+        if idle >= timeouts::IDLE_BAIL_SECS && disk_idle >= timeouts::IDLE_BAIL_SECS {
+            if !fatal {
+                // Install path: say so loudly, keep waiting. Only the
+                // operator halts an install. Warn every time past bail
+                // (not warn-once): a stall that persists for hours should
+                // stay visible, and nothing else will say it.
+                eprintln!(
+                    "warning: no disk I/O for {idle}s, disk static for {disk_idle}s and no SSH — guest may be parked at an input screen (Ctrl-C stops the install, nothing else does)"
+                );
+                return Ok(());
+            }
+            // Cause only; failure arms append frame + serial + VNC.
             anyhow::bail!(
-                "guest appears stuck: no disk I/O for {idle}s and no SSH — likely parked at an input screen (recovery, EULA). VNC {url} or latest screenshot for the screen",
-                url = vnc_url(PROVEN_VNC_DISPLAY).unwrap_or_else(|| PROVEN_VNC_DISPLAY.to_string()),
+                "guest appears stuck: no disk I/O for {idle}s, disk static for {disk_idle}s and no SSH — likely parked at an input screen (recovery, EULA)"
             );
         }
         if idle >= timeouts::IDLE_WARN_SECS && !self.warned {
             self.warned = true;
-            eprintln!(
-                "warning: no disk I/O for {idle}s and no SSH yet — guest may be stuck at an input screen"
-            );
+            // Never name an input screen without seeing one: the SSH-probe
+            // loop calls with no frame (None), while the sampler task may
+            // concurrently report progress. A blind loop claiming a parked
+            // input screen next to an installer-progress line is the exact
+            // contradiction that erodes trust in every other warning.
+            if state.is_none() {
+                eprintln!("warning: no disk I/O for {idle}s and no SSH banner yet — still waiting");
+            } else {
+                eprintln!(
+                    "warning: no disk I/O for {idle}s and no SSH yet — guest may be stuck at an input screen"
+                );
+            }
         }
         Ok(())
     }
@@ -1887,198 +2904,220 @@ impl BlockIdle {
 /// Time-lapse dir name under the VM dir, and frame filename prefix.
 /// Single source: [`screenshots_dir`] builds the path, `take_screenshot` names files.
 pub const SCREENSHOTS_DIR: &str = "screenshots";
-const SCREENSHOT_PREFIX: &str = "screenshot-";
 
 fn screenshots_dir(vm_dir: &Path) -> PathBuf {
     vm_dir.join(SCREENSHOTS_DIR)
 }
 
-/// One screendump frame: `screendump` to PPM, converted in-crate to PNG
-/// (README-displayable, ~6 KB vs 1.4 MB), PPM deleted. Frames land as
-/// `<screenshots_dir>/frame-<epoch>.png`.
-/// Best-effort (logs, never fails): the monitor may be busy mid-command
-/// and a missed frame is not worth failing an install over.
-async fn take_screenshot(mon: &crate::ipc::Monitor, screenshots_dir: &Path) {
-    if std::fs::create_dir_all(screenshots_dir).is_err() {
-        return;
-    }
-    let stem = screenshots_dir.join(format!(
-        "{SCREENSHOT_PREFIX}{}",
-        crate::provenance::now_epoch()
-    ));
-    let ppm = stem.with_extension("ppm");
-    let png_path = stem.with_extension("png");
-    // Quote the path: HMP splits unquoted args on whitespace and the cache
-    // path routinely contains spaces (observed live: screendump "succeeded"
-    // but the file never appeared, failing the PNG step with ENOENT).
-    let shot = mon
-        .command(&format!("screendump \"{}\"", ppm.display()))
-        .await;
-    if let Err(e) = shot {
-        eprintln!("warning: screendump failed: {e:#}");
-        return;
-    }
-    match std::fs::read(&ppm)
-        .map_err(anyhow::Error::from)
-        .and_then(|d| {
-            let (w, h, rgb) = parse_ppm_p6(&d)?;
-            write_png(&png_path, w, h, &rgb)
-        }) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&ppm);
-            eprintln!("shot {}", png_path.display());
-        }
-        Err(e) => eprintln!(
-            "warning: ppm->png failed ({e:#}); keeping {}",
-            ppm.display()
-        ),
-    }
+/// Monitor command setting the VNC password. Single source so the run
+/// and install paths cannot drift (or typo) apart again.
+fn vnc_password_command() -> String {
+    format!("change vnc password {PROVEN_VNC_PASSWORD}")
 }
 
-/// Parse binary P6 PPM → (width, height, RGB bytes). QEMU screendump
-/// writes plain `P6\n<w> <h>\n255\n` + pixels; the parser also tolerates
-/// comments and stray whitespace per the spec.
-fn parse_ppm_p6(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
-    let mut pos = 0;
-    let mut token = || -> Result<String> {
-        // Skip whitespace and `#` comments.
-        loop {
-            while pos < data.len() && data[pos].is_ascii_whitespace() {
-                pos += 1;
-            }
-            if pos < data.len() && data[pos] == b'#' {
-                while pos < data.len() && data[pos] != b'\n' {
-                    pos += 1;
-                }
-                continue;
-            }
-            break;
-        }
-        let start = pos;
-        while pos < data.len() && !data[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if start == pos {
-            anyhow::bail!("truncated PPM header");
-        }
-        Ok(String::from_utf8_lossy(&data[start..pos]).into_owned())
+/// Evidence block for a failed boot wait: final frame (path + screen
+/// classification), last serial line, activity evidence, VNC coordinates.
+/// Pure formatter so the layout is unit-testable; [`boot_failure_report`]
+/// gathers the parts.
+fn format_failure_report(
+    frame: Option<(PathBuf, ScreenState)>,
+    serial: &str,
+    boots: u64,
+    activity: Option<(u64, u64)>,
+    vnc: &Option<String>,
+) -> String {
+    let mut out = match frame {
+        Some((p, s)) => format!("boot diagnosis: {s} — {}", p.display()),
+        None => "boot diagnosis: no screenshot could be captured".to_string(),
     };
-    if token()? != "P6" {
-        anyhow::bail!("not a P6 PPM");
+    if !serial.is_empty() {
+        out.push_str(&format!("\n  last serial: {serial}"));
     }
-    let w: u32 = token()?.parse().context("PPM width")?;
-    let h: u32 = token()?.parse().context("PPM height")?;
-    let max: u32 = token()?.parse().context("PPM maxval")?;
-    if max != 255 {
-        anyhow::bail!("unsupported PPM maxval {max} (want 255)");
+    out.push_str(&format!("\n  guest boots seen: {boots}"));
+    if let Some((idle_secs, growth)) = activity {
+        out.push_str(&format!(
+            "\n  guest activity: no I/O for {idle_secs}s, disk +{}",
+            fmt_bytes(growth)
+        ));
     }
-    // Exactly one whitespace byte separates header from pixels.
-    if pos < data.len() && data[pos].is_ascii_whitespace() {
-        pos += 1;
+    if let Some(u) = vnc {
+        out.push_str(&format!("\n  vnc: {u} (password {PROVEN_VNC_PASSWORD})"));
     }
-    let expect = w as usize * h as usize * 3;
-    if data.len() - pos < expect {
-        anyhow::bail!(
-            "truncated PPM pixels (have {}, want {expect})",
-            data.len() - pos
-        );
-    }
-    Ok((w, h, data[pos..pos + expect].to_vec()))
+    out
 }
 
-fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
-    // Screenshots are flat UI: usually < 256 distinct colors, so exact
-    // palette encoding (no dithering, no loss) beats RGB by ~7x
-    // (measured: 42 KB RGB → 5.7 KB palette on a Setup screen).
-    // Falls back to RGB when the frame is richer than 256 colors.
-    use std::collections::HashMap;
-    let mut palette: Vec<[u8; 3]> = Vec::new();
-    let mut index_of: HashMap<[u8; 3], u8> = HashMap::new();
-    let mut indexed = Vec::with_capacity(rgb.len() / 3);
-    let mut fits = true;
-    let (chunks, remainder) = rgb.as_chunks::<3>();
-    if !remainder.is_empty() {
-        fits = false;
-    }
-    for px in chunks {
-        if !fits {
-            break;
-        }
-        let key = [px[0], px[1], px[2]];
-        let idx = match index_of.get(&key) {
-            Some(&i) => i,
-            None => {
-                if palette.len() >= 256 {
-                    fits = false;
-                    break;
-                }
-                let i = palette.len() as u8;
-                palette.push(key);
-                index_of.insert(key, i);
-                i
-            }
-        };
-        indexed.push(idx);
-    }
-    let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Best);
-    if fits {
-        let flat: Vec<u8> = palette.iter().flatten().copied().collect();
-        enc.set_color(png::ColorType::Indexed);
-        enc.set_palette(flat);
-        enc.write_header()?.write_image_data(&indexed)?;
-    } else {
-        enc.set_color(png::ColorType::Rgb);
-        enc.write_header()?.write_image_data(rgb)?;
-    }
-    Ok(())
+/// Gather the evidence for [`format_failure_report`]: one final frame off
+/// the live monitor (the serial is silent through a Windows boot, so the
+/// screen is the primary witness), the last meaningful serial line, one
+/// activity sample, and the caller's VNC coordinates. Every part is
+/// best-effort — a missing piece is stated, never invented.
+async fn boot_failure_report(
+    mon: &crate::ipc::Monitor,
+    serial_log: &str,
+    shots_dir: &Path,
+    vnc: &Option<String>,
+) -> String {
+    let frame = take_screenshot(mon, shots_dir)
+        .await
+        .map(|(p, s, _)| (p, s));
+    let serial = last_serial_line(serial_log);
+    let mut activity_mon = ActivityMonitor::new();
+    let disk = shots_dir.parent().map(|d| d.join(crate::paths::DISK_IMAGE));
+    activity_mon.sample(mon, disk.as_deref()).await;
+    let activity = Some((activity_mon.idle_secs(), activity_mon.growth_since_start()));
+    format_failure_report(frame, &serial, boot_count(serial_log), activity, vnc)
 }
 
-/// Background time-lapse: one frame every `every` until aborted.
-/// Returns the join handle; callers `.abort()` it when the wait ends.
-fn spawn_screenshots(
+/// Background time-lapse: ticks on the profile until aborted. Returns the
+/// join handle (`None` when every cadence is off); callers `.abort()` it
+/// when the wait ends.
+fn spawn_sampler(
     mon: std::sync::Arc<crate::ipc::Monitor>,
     screenshots_dir: PathBuf,
-    every: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    disk: PathBuf,
+    profile: SamplingProfile,
+    label: &'static str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let tick = profile.tick()?;
+    Some(tokio::spawn(async move {
         // First frame immediately (proves the display is alive early),
-        // then on cadence.
-        take_screenshot(&mon, &screenshots_dir).await;
-        let mut ticker = tokio::time::interval(every);
+        // then on cadence. Numbered, basename-only (the dir was announced
+        // once above), so the log reads as progress toward the SSH answer.
+        let mut sampler = ScreenSampler::new(mon, screenshots_dir);
+        let mut activity = ActivityMonitor::new();
+        sampler.poll(&profile).await;
+        report_sample(label, &sampler, &activity);
+        let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate tick
         loop {
             ticker.tick().await;
-            take_screenshot(&mon, &screenshots_dir).await;
+            activity.sample(&sampler.mon, Some(disk.as_path())).await;
+            sampler.poll(&profile).await;
+            // Stall check after the fresh classification: frozen I/O
+            // during valid progress is a slow host, never a stuck guest.
+            // Warn-only by construction (fatal=false never errs): no
+            // screen, state, or activity reading exits this loop early.
+            // The task ends solely on abort (victory) or cancellation.
+            activity.check_stall(sampler.state(), false).ok();
+            report_sample(label, &sampler, &activity);
         }
-    })
+    }))
+}
+
+/// One scrollback-safe status line per tick: the whole instrument panel.
+/// Nothing prints for [`SampleOutcome::Skipped`].
+fn report_sample(label: &str, sampler: &ScreenSampler, activity: &ActivityMonitor) {
+    let (noun, n, state, margin, file) = match &sampler.last_outcome {
+        SampleOutcome::Saved(p, s, m) => (
+            "screenshot",
+            sampler.shot_n,
+            *s,
+            *m,
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        // Status lines carry wall-clock runtime, not a counter: on a
+        // 3-hour install "status 412" says nothing, "2h41m" says where.
+        SampleOutcome::Classified(s, m) => (
+            "status",
+            sampler.started.elapsed().as_secs(),
+            *s,
+            *m,
+            String::new(),
+        ),
+        SampleOutcome::Skipped => return,
+    };
+    // Error reads warn only under the activity conjunction (flat guest);
+    // a moving guest with an error read is a transient misread or live
+    // recovery, and logs as observation, never alarm.
+    let warn = if is_error_state(state) && !activity.is_moving() {
+        "WARNING: "
+    } else {
+        ""
+    };
+    let file_part = if file.is_empty() {
+        String::new()
+    } else {
+        format!("{file} ")
+    };
+    // Disk growth reads with its own age: a disk that stopped growing
+    // long ago while I/O still trickles is a different shape than both
+    // moving together.
+    let disk_part = if activity.disk_idle_secs() >= timeouts::IDLE_WARN_SECS {
+        format!(
+            "disk +{} (static {})",
+            fmt_bytes(activity.growth_since_start()),
+            fmt_secs(activity.disk_idle_secs())
+        )
+    } else {
+        format!("disk +{}", fmt_bytes(activity.growth_since_start()))
+    };
+    eprintln!(
+        "{warn}{label} {noun} {}: {file_part}{} (phase {}, static {}, io {}/s avg, {disk_part}, io-idle {})",
+        if noun == "status" {
+            fmt_secs(n)
+        } else {
+            n.to_string()
+        },
+        describe(state, margin),
+        fmt_secs(sampler.phase_secs()),
+        fmt_secs(sampler.static_secs()),
+        fmt_bytes(activity.io_ema_bps as u64),
+        fmt_secs(activity.idle_secs()),
+    );
+}
+
+/// Tri-state banner probe: distinguishes a closed port (nothing
+/// listening — sshd not started) from an open-but-silent one (TCP
+/// accepted, no SSH banner — sshd starting, or something else holding
+/// the port). The wait loops log transitions; a long silence that moves
+/// Closed→Silent is progress, not a stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BannerProbe {
+    Banner,
+    /// Accepted, no bytes (timeout or clean EOF): listener present,
+    /// banner not out yet.
+    OpenSilent,
+    /// Accepted, but the bytes are not SSH: wrong daemon, port squat,
+    /// or corrupt transmission — never "sshd starting".
+    Unexpected,
+    Closed,
+}
+
+async fn probe_banner(port: u16) -> (BannerProbe, Option<String>) {
+    use tokio::io::AsyncReadExt;
+    let stream = match tokio::time::timeout(
+        timeouts::SSH_BANNER_CONNECT_BUDGET,
+        tokio::net::TcpStream::connect((PROVEN_SSH_HOST, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return (BannerProbe::Closed, None),
+    };
+    let mut buf = [0u8; 256];
+    let mut stream = stream;
+    match tokio::time::timeout(timeouts::SSH_BANNER_READ_BUDGET, stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let b = String::from_utf8_lossy(&buf[..n]);
+            if b.starts_with("SSH-") {
+                (BannerProbe::Banner, Some(b.trim().to_string()))
+            } else {
+                (BannerProbe::Unexpected, None)
+            }
+        }
+        // Accepted but silent: starting, not absent.
+        _ => (BannerProbe::OpenSilent, None),
+    }
 }
 
 /// One banner read ([`timeouts::SSH_BANNER_CONNECT_BUDGET`] +
 /// [`timeouts::SSH_BANNER_READ_BUDGET`]). `None` = no sshd right now.
 async fn banner_once(port: u16) -> Option<String> {
-    use tokio::io::AsyncReadExt;
-    let stream = tokio::time::timeout(
-        timeouts::SSH_BANNER_CONNECT_BUDGET,
-        tokio::net::TcpStream::connect((PROVEN_SSH_HOST, port)),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let mut buf = [0u8; 256];
-    let mut stream = stream;
-    let n = tokio::time::timeout(timeouts::SSH_BANNER_READ_BUDGET, stream.read(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-    if n == 0 {
-        return None;
-    }
-    let b = String::from_utf8_lossy(&buf[..n]);
-    b.starts_with("SSH-").then(|| b.trim().to_string())
+    probe_banner(port).await.1
 }
 
 /// Guest readiness: banner phases for display, registry probe for truth.
@@ -2095,12 +3134,14 @@ async fn banner_once(port: u16) -> Option<String> {
 /// password never touches the answer file.
 /// Shared observability for the install/boot waits: the one monitor
 /// session plus the paths it watches. Bundled so the wait fns don't
-/// sprawl argument lists (clippy limit is 7).
+/// sprawl argument lists (clippy limit is 7). `vnc` is the report
+/// coordinate (None for gtk/cocoa/none displays).
 #[derive(Clone)]
 struct GuestScope {
     mon: std::sync::Arc<crate::ipc::Monitor>,
     shots_dir: PathBuf,
     serial_log: String,
+    vnc: Option<String>,
 }
 
 async fn wait_install_ready(
@@ -2112,38 +3153,107 @@ async fn wait_install_ready(
     auto_updates: bool,
     scope: &GuestScope,
 ) -> Result<String> {
-    use crate::ssh::probe_setup_done;
+    use crate::ssh::{GuestProgress, probe_setup_done};
     use crate::unattend::DEFAULT_PASSWORD;
     let start = std::time::Instant::now();
     // Phase 1: first banner.
-    let mut idle = BlockIdle::new();
+    let mut activity = ActivityMonitor::new();
+    // Disk beside the screenshots dir feeds growth tracking (`shots_dir`
+    // is `<vm>/screenshots`, so its parent is the VM dir).
+    let disk = scope
+        .shots_dir
+        .parent()
+        .map(|d| d.join(crate::paths::DISK_IMAGE));
+    // Reboot awareness while Setup applies (no SSH yet — serial is the
+    // only below-screenshot voice): count OVMF firmware handoffs.
+    let mut boots_seen = boot_count(&scope.serial_log);
+    // The install never times out on its own: only the operator stops it
+    // (Ctrl-C). Past the deadline the loop says so loudly and keeps
+    // waiting — a slow host is not a failed install.
+    let mut deadline_warned = false;
+    // Miss-reason tracking: a silence that moves closed→silent is sshd
+    // stirring (progress); log transitions, never pollute per tick. None
+    // until the first probe, so tick 1 always announces the baseline.
+    let mut probe_state: Option<BannerProbe> = None;
     let banner = loop {
-        if start.elapsed() > deadline {
-            anyhow::bail!(
-                "timed out waiting for SSH banner on {PROVEN_SSH_HOST}:{port} after {} s (raise --install-timeout-secs if the host is just slow)",
+        if start.elapsed() > deadline && !deadline_warned {
+            deadline_warned = true;
+            eprintln!(
+                "still no SSH banner on {PROVEN_SSH_HOST}:{port} after {} s — still waiting (Ctrl-C stops the install, nothing else does)",
                 deadline.as_secs()
             );
         }
-        if let Some(b) = banner_once(port).await {
-            eprintln!("SSH banner: {b} (first contact — Setup still working)");
-            break b;
+        match probe_banner(port).await {
+            (BannerProbe::Banner, Some(b)) => {
+                eprintln!(
+                    "guest SSH is up (first contact) — Setup is still installing Windows, not ready yet ({b})"
+                );
+                break b;
+            }
+            (state, _) => {
+                if Some(state) != probe_state {
+                    probe_state = Some(state);
+                    match state {
+                        BannerProbe::Closed => eprintln!(
+                            "ssh port {port} closed (sshd not started yet) — still waiting"
+                        ),
+                        BannerProbe::OpenSilent => eprintln!(
+                            "ssh port {port} open but silent (sshd starting?) — still waiting"
+                        ),
+                        BannerProbe::Unexpected => eprintln!(
+                            "ssh port {port} answered but not with SSH (wrong daemon or port squat?) — still waiting"
+                        ),
+                        BannerProbe::Banner => {}
+                    }
+                }
+            }
         }
         // Dead-screen watchdog (same as run): fail fast with evidence.
-        check_boot_failure(&scope.serial_log, &scope.shots_dir)?;
-        // Stall watchdog: frozen disk I/O + no banner = parked.
-        idle.poll(&scope.mon).await?;
+        check_boot_failure(&scope.serial_log)?;
+        // Reboot narration: Setup reboots between passes; announce each
+        // firmware bounce instead of leaving the long wait mute.
+        let boots = boot_count(&scope.serial_log);
+        if let Some(note) = boot_note(boots_seen, boots) {
+            eprintln!("{note}");
+        }
+        boots_seen = boots;
+        // Stall watchdog: frozen disk I/O + no banner = parked. No screen
+        // state down here (SSH probing, not frame watching), so take the
+        // strict path — same as a boot that never rendered. Warn-only:
+        // nothing but the operator halts an install.
+        activity.sample(&scope.mon, disk.as_deref()).await;
+        activity.check_stall(None, false)?;
         tokio::time::sleep(timeouts::SSH_POLL_INTERVAL).await;
     };
     // Phase 2: ask the guest until it reports done. Banner loss between
     // probes means a reboot (reported); probe errors mean sshd is
     // mid-restart (retried, not fatal). Each probe gets a hard budget: a
     // stalled handshake mid-reboot must surface, never hang the loop.
+    // Separate counter for the overloaded state: banner stable but every
+    // exec timing out means the guest is too saturated to cold-start
+    // PowerShell (Setup still applying), not rebooting. Hammering it with
+    // a probe every 10 s only stacks more powershell.exe on the pile, so
+    // the cadence backs off while stalled.
+    //
+    // Narration policy: transient states print once per *change* (reboot,
+    // new pending phase) plus a slow heartbeat — never one line per probe.
+    // Default output is progress; words like "failed"/"ERROR" are reserved
+    // for things that are actually wrong (raw errors: RUST_LOG=debug).
     let mut reboots = 0u32;
     let mut was_up = true;
+    let mut exec_stalls = 0u32;
+    // Last pending-state line printed, and when the heartbeat last fired.
+    let mut phase: Option<String> = None;
+    let mut last_beat = start;
+    // Same operator-only rule as phase 1: the install never times out on
+    // its own. Past the deadline the loop says so loudly and keeps
+    // probing — a slow host is not a failed install.
+    let mut deadline_warned = false;
     loop {
-        if start.elapsed() > deadline {
-            anyhow::bail!(
-                "timed out waiting for guest readiness on {PROVEN_SSH_HOST}:{port} after {} s (raise --install-timeout-secs if the host is just slow)",
+        if start.elapsed() > deadline && !deadline_warned {
+            deadline_warned = true;
+            eprintln!(
+                "still waiting for guest readiness on {PROVEN_SSH_HOST}:{port} after {} s — still probing (Ctrl-C stops the install, nothing else does)",
                 deadline.as_secs()
             );
         }
@@ -2156,7 +3266,7 @@ async fn wait_install_ready(
         )
         .await
         {
-            Ok(Ok(true)) => {
+            Ok(Ok(GuestProgress::Ready)) => {
                 if password != DEFAULT_PASSWORD {
                     eprintln!("rotating guest password ...");
                     crate::ssh::change_guest_password(
@@ -2170,7 +3280,10 @@ async fn wait_install_ready(
                 }
                 // Recovery policy (default off, docker-like): a damaged disk
                 // fails fast instead of parking at "Diagnosing your PC".
-                // Runs as the end-state credential (post-rotation).
+                // Specialize already set the off state on the first OS boot
+                // (an early Ctrl-C is covered there); this step applies the
+                // flag's end state as the credential (post-rotation) —
+                // `--recovery` re-arms both switches.
                 if let Err(e) = crate::ssh::set_recovery_enabled(
                     PROVEN_SSH_HOST,
                     port,
@@ -2193,31 +3306,97 @@ async fn wait_install_ready(
                 {
                     eprintln!("warning: wuauserv disable failed ({e:#})");
                 }
+                // Headless diet (was specialize orders; moved post-READY so
+                // four PowerShell cold starts stop serializing into Setup):
+                // NLA Private + service trim in one invocation, best-effort.
+                if let Err(e) =
+                    crate::ssh::apply_headless_diet(PROVEN_SSH_HOST, port, user, password).await
+                {
+                    eprintln!("warning: headless diet failed ({e:#})");
+                }
                 eprintln!(
                     "guest reports Setup complete across {reboots} reboot(s) — install complete"
                 );
                 return Ok(banner);
             }
-            Ok(Ok(false)) => {}
-            Ok(Err(e)) => eprintln!("probe failed (sshd mid-reboot?): {e:#}"),
-            Err(_) => eprintln!("probe timed out (sshd busy?) — retrying ..."),
+            Ok(Ok(GuestProgress::Busy(what))) => {
+                exec_stalls = 0;
+                if phase.as_deref() == Some(what.as_str()) {
+                    // Unchanged since the last probe: stay quiet unless the
+                    // heartbeat is due (proof of life on a long install).
+                    if last_beat.elapsed() >= timeouts::PROGRESS_HEARTBEAT {
+                        last_beat = std::time::Instant::now();
+                        eprintln!(
+                            "still installing: {what} — {}s elapsed, {reboots} reboot(s) so far",
+                            start.elapsed().as_secs()
+                        );
+                    }
+                } else {
+                    eprintln!("still installing: {what}");
+                    phase = Some(what);
+                    last_beat = std::time::Instant::now();
+                }
+            }
+            Ok(Err(e)) => {
+                exec_stalls += 1;
+                if e.downcast_ref::<crate::ssh::ProbeOutputBroken>().is_some() {
+                    // OUR probe broke, not the guest: never narrate that as a
+                    // reboot. Rare but real, so it stays at the default level.
+                    if exec_stalls == 1 || exec_stalls == 5 {
+                        eprintln!(
+                            "warning: readiness probe could not read the guest's reply ({e:#}) — probe/output problem, not a reboot; retrying ..."
+                        );
+                    }
+                } else if exec_stalls == 1 {
+                    // Expected while Setup reboots: sshd restarts with the
+                    // guest. One calm line per stall run; the raw transport
+                    // error goes to RUST_LOG=debug instead of reading as a
+                    // failure.
+                    eprintln!(
+                        "waiting: SSH dropped — Windows is rebooting as part of Setup, retrying ..."
+                    );
+                    tracing::debug!("probe error: {e:#}");
+                } else if exec_stalls == 5 {
+                    // Five straight exec failures with the banner up is not a
+                    // reboot (the banner would drop) — it is saturation.
+                    eprintln!(
+                        "exec stalled 5x with SSH stable — guest is overloaded (Setup still applying), not rebooting; backing off probes ..."
+                    );
+                }
+            }
+            Err(_) => {
+                exec_stalls += 1;
+                if exec_stalls == 1 {
+                    eprintln!(
+                        "waiting: probe timed out — guest is busy (Setup still applying), retrying ..."
+                    );
+                } else if exec_stalls == 5 {
+                    eprintln!(
+                        "probe timed out 5x with SSH stable — guest is overloaded, backing off probes ..."
+                    );
+                }
+            }
         }
         let up = banner_once(port).await.is_some();
         match (was_up, up) {
             (true, false) => {
                 eprintln!(
-                    "SSH lost — reboot #{} in progress, waiting for return ...",
+                    "Windows is rebooting (#{}) — SSH dropped, waiting for it to return ...",
                     reboots + 1
                 );
             }
             (false, true) => {
                 reboots += 1;
+                exec_stalls = 0;
                 eprintln!("SSH back (reboot #{reboots} finished) — resuming probes ...");
             }
             _ => {}
         }
         was_up = up;
-        tokio::time::sleep(timeouts::READINESS_PROBE_INTERVAL).await;
+        // Back off while stalled (10 s → up to 60 s): each probe spawns a
+        // PowerShell cold start, and hammering a saturated guest buries it.
+        let backoff = 1 + (exec_stalls / 5).min(5);
+        tokio::time::sleep(timeouts::READINESS_PROBE_INTERVAL * backoff).await;
     }
 }
 
@@ -2242,44 +3421,197 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ppm_p6_roundtrip() {
-        // 2x1 red/green pixels with a comment in the header.
-        let mut raw = b"P6\n# qemu screendump\n2 1\n255\n".to_vec();
-        raw.extend_from_slice(&[255, 0, 0, 0, 255, 0]);
-        let (w, h, rgb) = parse_ppm_p6(&raw).unwrap();
-        assert_eq!((w, h), (2, 1));
-        assert_eq!(rgb, vec![255, 0, 0, 0, 255, 0]);
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("t.png");
-        write_png(&p, w, h, &rgb).unwrap();
-        let back = std::fs::read(&p).unwrap();
-        assert_eq!(&back[1..4], b"PNG", "not a PNG");
-        // 2 colors → indexed palette (IHDR color type 3), exact pixels.
-        assert_eq!(
-            back[25], 3,
-            "expected palette PNG, got color type {}",
-            back[25]
-        );
-        assert!(
-            back.len() < 100,
-            "2px palette PNG should be tiny, got {}",
-            back.len()
-        );
+    fn install_fixture(memory_mb: u32, cpus: u32) -> (Vec<String>, Vec<String>) {
+        let dir = std::env::temp_dir();
+        let code = dir.join("code.fd");
+        let vars = dir.join("vars.fd");
+        let usb = dir.join("usb.dmg");
+        let spec = InstallQemuArgv {
+            machine: "virt",
+            accel: "tcg",
+            cpu: "max",
+            memory_mb,
+            cpus,
+            display: Display::Vnc("vnc=127.0.0.1:10,password=on".to_string()),
+            code_tpl: &code,
+            vars_fd: &vars,
+            serial_log: "serial.log",
+            mon_sock: "mon.sock",
+            qmp_sock: "qmp.sock",
+            usb_image: &usb,
+            target: "disk.qcow2",
+            arch: Architecture::Arm64,
+        };
+        (
+            install_qemu_argv(&spec),
+            qemu_img_create_args("disk.qcow2", 128),
+        )
     }
 
     #[test]
-    fn ppm_rejects_bad_magic_and_truncation() {
-        assert!(parse_ppm_p6(b"P5\n2 1\n255\n\x00\x00").is_err());
-        assert!(parse_ppm_p6(b"P6\n2 1\n255\n\xff").is_err());
+    fn install_sizing_reaches_qemu_argv() {
+        // The flags a user passes must be the bytes QEMU gets: no QEMU
+        // needed, just the pure argv constructors.
+        // Golden sidecar lives next to the disk it blesses.
+        assert_eq!(
+            golden_sidecar("disk.qcow2"),
+            std::path::PathBuf::from("disk.qcow2.golden")
+        );
+        let (argv, img) = install_fixture(8192, 8);
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-m"), "8192");
+        assert_eq!(at("-smp"), "8");
+        assert_eq!(img.last().unwrap(), "128G");
+        // Defaults stay proven-shaped.
+        let (argv, img) = install_fixture(4096, 4);
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-m"), "4096");
+        assert_eq!(at("-smp"), "4");
+        assert_eq!(at("-display"), "vnc=127.0.0.1:10,password=on");
+        let img64 = qemu_img_create_args("disk.qcow2", 64);
+        assert_eq!(img64.last().unwrap(), "64G");
+        assert_eq!(img[..5], img64[..5]);
+    }
+
+    #[test]
+    fn live_migration_uris_quote_paths() {
+        // NIC name comes from `info network`, never guessed: first
+        // type=nic entry wins, netdev/user lines are skipped.
+        let info = "virtio-net-pci.0: index=0,type=nic,model=virtio-net-pci,macaddr=52:54:00:12:34:56\n \\ n1: index=0,type=user,net=10.0.2.0/24,hostfwd=tcp::2232-:22\n";
+        assert_eq!(find_nic_name(info), Some("virtio-net-pci.0"));
+        assert_eq!(find_nic_name("n1: index=0,type=user\n"), None);
+        assert_eq!(find_nic_name("garbage\n"), None);
+        // Migration URIs quote paths (cache dirs contain spaces) and the
+        // live companions live next to the disk they belong to.
+        let spaced = std::path::Path::new("/Volumes/2TB Storage Vault/vm/golden-live.state");
+        assert_eq!(
+            migrate_write_uri(spaced),
+            "exec:cat > '/Volumes/2TB Storage Vault/vm/golden-live.state'"
+        );
+        assert_eq!(
+            migrate_read_uri(spaced),
+            "exec:cat '/Volumes/2TB Storage Vault/vm/golden-live.state'"
+        );
+        let quoted = std::path::Path::new("/tmp/o'brien/state");
+        assert_eq!(
+            migrate_write_uri(quoted),
+            "exec:cat > '/tmp/o'\\''brien/state'"
+        );
+        let dir = std::path::Path::new("/tmp/vm");
+        let (state, vars, overlay) = live_paths(dir);
+        assert_eq!(state, dir.join(crate::paths::LIVE_STATE_FILE));
+        assert_eq!(vars, dir.join(crate::paths::LIVE_VARS_BACKUP));
+        assert_eq!(overlay, dir.join(crate::paths::LIVE_OVERLAY));
+    }
+
+    #[test]
+    fn install_cocoa_display_passes_through() {
+        // Non-VNC displays reach QEMU verbatim (the VNC password step is
+        // guarded separately); cocoa installs show a window instead.
+        let dir = std::env::temp_dir();
+        let code = dir.join("code.fd");
+        let vars = dir.join("vars.fd");
+        let usb = dir.join("usb.dmg");
+        let spec = InstallQemuArgv {
+            machine: "virt",
+            accel: "tcg",
+            cpu: "max",
+            memory_mb: 4096,
+            cpus: 4,
+            display: Display::Cocoa,
+            code_tpl: &code,
+            vars_fd: &vars,
+            serial_log: "serial.log",
+            mon_sock: "mon.sock",
+            qmp_sock: "qmp.sock",
+            usb_image: &usb,
+            target: "disk.qcow2",
+            arch: Architecture::Arm64,
+        };
+        let argv = install_qemu_argv(&spec);
+        let at = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(at("-display"), "cocoa");
     }
 
     #[test]
     fn blockstats_parse_totals() {
         let sample = "drive-tgt: rd_bytes=1048576 wr_bytes=524288 rd_operations=12\n\
                       drive-usb: rd_bytes=100 wr_bytes=0\n";
-        assert_eq!(BlockIdle::parse_total(sample), Some(1048576 + 524288 + 100));
-        assert_eq!(BlockIdle::parse_total(""), None);
+        assert_eq!(
+            ActivityMonitor::parse_total(sample),
+            Some(1048576 + 524288 + 100)
+        );
+        assert_eq!(ActivityMonitor::parse_total(""), None);
+    }
+
+    #[test]
+    fn activity_math_without_qemu() {
+        // Pure derivations on hand-built state: no monitor, no sleeps.
+        let now = std::time::Instant::now();
+        let mut m = ActivityMonitor {
+            last_total: 1000,
+            last_change: now - Duration::from_secs(61),
+            warned: false,
+            disk_start: Some(100),
+            disk_last: 150,
+            disk_last_change: now - Duration::from_secs(61),
+            last_sample: Some(now),
+            io_ema_bps: 0.0,
+            growth_ema_bps: 0.0,
+        };
+        assert_eq!(m.idle_secs(), 61);
+        assert_eq!(m.disk_idle_secs(), 61);
+        assert_eq!(m.growth_since_start(), 50);
+        assert!(!m.is_moving());
+        // EMA: half-window step moves halfway to the instant rate.
+        assert_eq!(ActivityMonitor::ema_step(0.0, 100.0, 150.0, 300.0), 50.0);
+        assert_eq!(ActivityMonitor::ema_step(50.0, 100.0, 0.0, 300.0), 50.0);
+        // Fresh activity resets the idle clock.
+        m.last_change = std::time::Instant::now();
+        assert!(m.is_moving());
+    }
+
+    #[test]
+    fn stall_watchdog_needs_non_progress_and_flat_guest() {
+        // Progress states never bail, however long I/O has been flat: a
+        // slow host applying the image answers only to the operator, not
+        // the stall watchdog (live 2026-10-07: 120s of CPU-bound setup
+        // with InstallerStep on screen aborted a valid install).
+        let mut m = ActivityMonitor {
+            last_total: 1000,
+            last_change: std::time::Instant::now() - Duration::from_secs(10_000),
+            warned: false,
+            disk_start: Some(100),
+            disk_last: 100,
+            disk_last_change: std::time::Instant::now() - Duration::from_secs(10_000),
+            last_sample: None,
+            io_ema_bps: 0.0,
+            growth_ema_bps: 0.0,
+        };
+        for state in [
+            ScreenState::InstallerStep,
+            ScreenState::OobeStep,
+            ScreenState::FirmwareBoot,
+            ScreenState::Lockscreen,
+        ] {
+            assert!(m.check_stall(Some(state), true).is_ok(), "{state:?}");
+        }
+        // Non-progress + flat on both signals bails when fatal.
+        assert!(m.check_stall(Some(ScreenState::ErrorScreen), true).is_err());
+        assert!(m.check_stall(Some(ScreenState::Dark), true).is_err());
+        // No frame yet: strict path, bails like a boot that never rendered.
+        assert!(m.check_stall(None, true).is_err());
+        // Flat I/O but a growing disk is not parked: bail needs both.
+        m.disk_last_change = std::time::Instant::now();
+        m.disk_last = 200;
+        assert!(m.check_stall(Some(ScreenState::ErrorScreen), true).is_ok());
+        // Install path is warn-only: the same flat guest that bails above
+        // only warns when fatal is false — nothing but the operator halts
+        // an install.
+        m.disk_last_change = std::time::Instant::now() - Duration::from_secs(10_000);
+        m.disk_last = 100;
+        assert!(m.check_stall(Some(ScreenState::ErrorScreen), false).is_ok());
+        assert!(m.check_stall(None, false).is_ok());
     }
 
     #[test]
@@ -2300,6 +3632,33 @@ mod tests {
             expand_tilde("~other/x.iso".into()),
             PathBuf::from("~other/x.iso")
         );
+    }
+
+    #[test]
+    fn missing_iso_error_names_the_path_it_tried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("present.iso");
+        std::fs::write(&present, b"x").unwrap();
+        assert!(require_win_iso(&present).is_ok());
+        // A directory is not an ISO.
+        assert!(require_win_iso(tmp.path()).is_err());
+
+        let missing = tmp.path().join("Win11.iso");
+        let err = require_win_iso(&missing).unwrap_err().to_string();
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(!err.contains("quote-shielded"), "{err}");
+        assert!(!err.contains("unquoted"), "{err}");
+
+        // A literal `~` survives expand_tilde only when $HOME is unset (or
+        // the path is ~otheruser) — the hint must say that, not "quote it".
+        let err = require_win_iso(Path::new("~/Win11.iso"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$HOME"), "{err}");
+        let err = require_win_iso(Path::new("~other/x.iso"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("~otheruser"), "{err}");
     }
 
     #[test]
@@ -2352,5 +3711,236 @@ mod tests {
         // No virtio hash in the fixture → falls back to the ISO name.
         assert!(table.contains("virtio-win.iso"), "{table}");
         assert_eq!(epoch_to_date(1_758_600_000), "2025-09-23");
+    }
+
+    // --- boot failure screen classification -------------------------------
+
+    #[test]
+    fn boot_count_and_note_from_serial() {
+        let path = std::env::temp_dir().join(format!("wh-boot-count-{}.log", std::process::id()));
+        std::fs::write(
+            &path,
+            "BdsDxe: loading Boot0001 \"USB\"\n\
+             BdsDxe: starting Boot0001 \"USB\"\n\
+             BdsDxe: failed to load Boot0002 \"NVMe\": Not Found\n\
+             BdsDxe: starting Boot0003 \"Windows Boot Manager\"\n",
+        )
+        .unwrap();
+        assert_eq!(boot_count(path.to_str().unwrap()), 2);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(boot_count("/nonexistent/wh-no-serial.log"), 0);
+        // Narration: first boot, reboots, flat, and regressions.
+        assert_eq!(boot_note(0, 0), None);
+        assert_eq!(
+            boot_note(0, 1).as_deref(),
+            Some("guest booted (first firmware boot)")
+        );
+        assert_eq!(
+            boot_note(1, 3).as_deref(),
+            Some("guest rebooted (firmware boot #3 seen on serial)")
+        );
+        assert_eq!(boot_note(3, 3), None);
+        assert_eq!(boot_note(3, 2), None);
+    }
+
+    #[test]
+    fn screen_state_real_frames_classify_by_directory() {
+        // Integration over real screendumps through the k-NN classifier.
+        // The class directory IS the label: drop a capture in, rebuild
+        // the index, and both this test and the runtime pick it up with
+        // no filename list anywhere.
+        // Layout: tests/fixtures/<windows-version>/<class-dir>/*.png.
+        //
+        // Verdicts are snapshotted, not asserted at 100%: the corpus
+        // holds known-unlearnable twin pairs, so exact-fit is demanded
+        // nowhere. A changed verdict fails with a diff; bless it with
+        // `cargo insta review` (or `INSTA_UPDATE=always` as the
+        // auto-accept escape hatch).
+        // Single dir→label map: a new class dir touches one arm, never two.
+        let target_for_class = |class: &str| match class {
+            "dark" => ScreenState::Dark,
+            "flat-field" => ScreenState::FlatField,
+            "error-shell" => ScreenState::ErrorShell,
+            "error-recovery" => ScreenState::ErrorRecovery,
+            "error-bluescreen" | "error-modal" => ScreenState::ErrorScreen,
+            "oobe-step" => ScreenState::OobeStep,
+            "installer-step" => ScreenState::InstallerStep,
+            "firmware-boot" => ScreenState::FirmwareBoot,
+            "lockscreen" => ScreenState::Lockscreen,
+            // Unknown future class dirs: fail loudly here instead of
+            // silently absorbing into the snapshot.
+            _ => panic!("test map missing class dir: {class}"),
+        };
+        let root = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        // The shipped path, not a test-only twin: the baked artifact
+        // scores here exactly as the live tick scores in production.
+        let index = crate::screen_knn::bundled_index();
+        let mut checked = 0;
+        let mut lines = Vec::new();
+        let mut misses = Vec::new();
+        let mut ok_gap_sum = 0.0f64;
+        let mut versions: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        versions.sort();
+        for version in versions {
+            // Skip Finder noise (.DS_Store) and anything else that is
+            // not a version directory.
+            if !std::path::Path::new(&format!("{root}/{version}")).is_dir() {
+                continue;
+            }
+            let mut classes: Vec<_> = std::fs::read_dir(format!("{root}/{version}"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            classes.sort();
+            for class in classes {
+                let dir = format!("{root}/{version}/{class}");
+                if !std::path::Path::new(&dir).is_dir() {
+                    continue;
+                }
+                let mut names: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".png"))
+                    .collect();
+                names.sort();
+                for name in names {
+                    let key = format!("{version}/{class}/{name}");
+                    // Unknown class dirs fail loudly via the map (never
+                    // silently absorbed); misses group at the bottom under
+                    // their own header, so no horizontal hunt/peck. Gaps
+                    // print to stdout (not the snapshot: float formatting
+                    // must stay bit-exact everywhere, and the gap is a
+                    // tuning signal, not a verdict). Run with
+                    // `-- --nocapture` to score an index rebuild: wider
+                    // gaps bless new centers, narrower ones don't.
+                    let want = target_for_class(&class);
+                    let (got, gap, matched) = classify_fixture(&index, &key);
+                    println!("gap {gap:.4} {key} via {matched}");
+                    if got == want {
+                        ok_gap_sum += f64::from(gap);
+                        lines.push(format!("ok   {key} => {got:?}"));
+                    } else {
+                        misses.push(format!(
+                            "MISS {key} => got {got:?}, want {want:?} via {matched}"
+                        ));
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no fixtures found under tests/fixtures");
+        let ok_count = checked - misses.len();
+        let mean_ok = ok_gap_sum / f64::from(ok_count.max(1) as u32);
+        println!("mean ok-gap {mean_ok:.4} over {ok_count}/{checked}");
+        lines.push(format!("--- misses {}/{checked} ---", misses.len()));
+        lines.extend(misses);
+        insta::assert_snapshot!("screen_state_by_directory", lines.join("\n"));
+    }
+
+    /// Test-only fixture classification through the real live path:
+    /// [`crate::vision::classify_screen`] on the decoded frame. Returns
+    /// the state plus the matched exemplar name, so misses carry their
+    /// cause into the snapshot itself.
+    fn classify_fixture(
+        index: &crate::screen_knn::KnnIndex,
+        name: &str,
+    ) -> (ScreenState, f32, String) {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let (rgb, w, h) = crate::screen_knn::load_rgb_8bit(&path);
+        let q = crate::screen_knn::KnnIndex::embed_frame(&rgb, w, h);
+        let (got_class, gap, matched) = index.predict(&q, None).unwrap();
+        let got = match got_class {
+            crate::screen_knn::ScreenClass::Dark => ScreenState::Dark,
+            crate::screen_knn::ScreenClass::FlatField => ScreenState::FlatField,
+            crate::screen_knn::ScreenClass::ErrorShell => ScreenState::ErrorShell,
+            crate::screen_knn::ScreenClass::InstallerStep => ScreenState::InstallerStep,
+            crate::screen_knn::ScreenClass::Lockscreen => ScreenState::Lockscreen,
+            crate::screen_knn::ScreenClass::FirmwareBoot => ScreenState::FirmwareBoot,
+            crate::screen_knn::ScreenClass::OobeStep => ScreenState::OobeStep,
+            crate::screen_knn::ScreenClass::ErrorRecovery => ScreenState::ErrorRecovery,
+            crate::screen_knn::ScreenClass::ErrorScreen => ScreenState::ErrorScreen,
+        };
+        (got, gap, matched)
+    }
+
+    #[test]
+    fn vnc_password_command_is_exact() {
+        // Regression: the install path once sent "change vnc p.password",
+        // which QEMU ignores — VNC auth then failed with no error anywhere.
+        assert_eq!(
+            vnc_password_command(),
+            format!("change vnc password {PROVEN_VNC_PASSWORD}")
+        );
+    }
+
+    #[test]
+    fn run_chain_install_params_passes_cadence_through() {
+        // Regression: `run --win-iso --screenshots-every-secs 10` installed
+        // at 60s cadence because the chain hardcoded the default.
+        let args = RunArgs {
+            disk: None,
+            ssh_port: crate::qemu::PROVEN_SSH_PORT,
+            display: crate::qemu::Display::parse("vnc=127.0.0.1:10").unwrap(),
+            memory: 4096,
+            cpus: 4,
+            disk_size: 64,
+            vm_dir: None,
+            qemu_dir: None,
+            username: "u".into(),
+            password: "p".into(),
+            shell: false,
+            live: false,
+            win_iso: None,
+            install_timeout_secs: 60,
+            screenshots_every_secs: 10,
+            classify_every_secs: Some(5),
+        };
+        let p = run_chain_install_params(&args, PathBuf::from("w.iso"));
+        assert_eq!(p.screenshots_every_secs, 10);
+        assert_eq!(p.classify_every_secs, Some(5));
+        assert_eq!(p.install_timeout_secs, 60);
+        assert_eq!(p.memory_mb, 4096);
+        assert_eq!(p.cpus, 4);
+        assert_eq!(p.disk_size_gb, 64);
+    }
+
+    #[test]
+    fn failure_report_carries_frame_serial_vnc() {
+        let report = format_failure_report(
+            Some((
+                PathBuf::from("/vm/screenshots/screenshot-1.png"),
+                ScreenState::FlatField,
+            )),
+            "BdsDxe: starting Boot0003",
+            3,
+            Some((95, 12_582_912)),
+            &Some("vnc://127.0.0.1:5910".to_string()),
+        );
+        assert!(report.contains("solid color field"), "{report}");
+        assert!(report.contains("guest boots seen: 3"), "{report}");
+        assert!(
+            report.contains("/vm/screenshots/screenshot-1.png"),
+            "{report}"
+        );
+        assert!(
+            report.contains("last serial: BdsDxe: starting Boot0003"),
+            "{report}"
+        );
+        assert!(report.contains("vnc: vnc://127.0.0.1:5910"), "{report}");
+        assert!(report.contains("no I/O for 95s"), "{report}");
+    }
+
+    #[test]
+    fn failure_report_states_missing_parts() {
+        let report = format_failure_report(None, "", 0, None, &None);
+        assert!(
+            report.contains("no screenshot could be captured"),
+            "{report}"
+        );
+        assert!(!report.contains("last serial"), "{report}");
+        assert!(!report.contains("vnc:"), "{report}");
     }
 }

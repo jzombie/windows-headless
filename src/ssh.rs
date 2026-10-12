@@ -60,20 +60,74 @@ pub async fn wait_for_ssh(host: &str, port: u16, timeout_: Duration) -> Result<(
     }
 }
 
-// Readable PowerShell lives in templates/ (like autounattend.xml).
-const PROBE_TPL: &str = include_str!("../templates/probe-ready.ps1");
+/// Guest readiness probe as one `cmd` line: four `reg.exe` reads with
+/// marker-delimited sections. `&& echo YES || echo NO` keeps
+/// key-existence checks locale-independent; value parsing keys on the
+/// (never localized) `REG_DWORD` token.
+///
+/// Every query sends its stderr to `nul`: a missing value/key is a *verdict*
+/// here (OOBE not started, no servicing reboot pending), not a failure —
+/// letting it through logged "ERROR: The system was unable to find the
+/// specified registry key or value." twice on every healthy probe, which
+/// read like a broken install.
+fn reg_probe_command() -> String {
+    [
+        "echo [SETUP]",
+        "reg query \"HKLM\\SYSTEM\\Setup\" /v SetupType 2>nul",
+        "echo [OOBE]",
+        "reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2>nul",
+        "echo [CBS]",
+        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\" 2>nul && echo YES || echo NO",
+        "echo [WU]",
+        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\" 2>nul && echo YES || echo NO",
+        "echo [END]",
+    ]
+    .join(" & ")
+}
 
-/// Flatten the multiline probe asset into one exec-channel line:
-/// strip comments/blank lines, join statements with `; `, backslash-escape
-/// inner double quotes (Win32-OpenSSH routes exec through cmd, which strips
-/// bare inner quotes — regressed live as "'BUSY' is not recognized").
-fn flatten_probe(tpl: &str) -> String {
-    tpl.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("; ")
-        .replace('"', "\\\"")
+/// Split reg-probe output into its marker-delimited sections. Only the
+/// exact markers this probe emits are boundaries — anything else brackety
+/// in `reg` output is data, never structure.
+const KNOWN_MARKERS: &[&str] = &["SETUP", "OOBE", "CBS", "WU", "END"];
+
+fn probe_sections(text: &str) -> Option<std::collections::HashMap<&str, Vec<&str>>> {
+    let mut sections = std::collections::HashMap::new();
+    let mut current: Option<&str> = None;
+    let mut seen_marker = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            let name = &t[1..t.len() - 1];
+            if let Some(marker) = KNOWN_MARKERS.iter().find(|m| **m == name) {
+                current = Some(*marker);
+                if *marker != "END" {
+                    seen_marker = true;
+                }
+                sections.entry(*marker).or_insert_with(Vec::new);
+                continue;
+            }
+        }
+        if let Some(c) = current {
+            sections.entry(c).or_insert_with(Vec::new).push(t);
+        }
+    }
+    if seen_marker { Some(sections) } else { None }
+}
+
+/// DWORD value from a `reg query /v` section: `None` when the value (or
+/// key) is absent — absent OOBE counts as done, absent SetupType as busy.
+fn probe_dword(section: &[&str]) -> Option<u32> {
+    section
+        .iter()
+        .find(|l| l.contains("REG_DWORD"))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|hex| {
+            let clean = hex
+                .strip_prefix("0x")
+                .or_else(|| hex.strip_prefix("0X"))
+                .unwrap_or(hex);
+            u32::from_str_radix(clean, 16).ok()
+        })
 }
 
 /// Password-authenticated session (host key accepted blind — see
@@ -106,9 +160,17 @@ async fn authed_session(
 
 /// Run one command over SSH (password auth), returning stdout.
 /// Host key is accepted blind (loopback NAT to our own guest; the key
-/// changes on every reinstall, so TOFU is pointless). Stderr lines are
-/// echoed (PowerShell errors would otherwise vanish); the caller decides
+/// changes on every reinstall, so TOFU is pointless).
+///
+/// Stderr is not echoed unconditionally: healthy guests produce plenty of
+/// it (the readiness probe reads registry keys that legitimately don't
+/// exist yet), and printing every line made normal runs look broken. It is
+/// reported loudly only in the case that used to bite — empty stdout, where
+/// a broken command would otherwise masquerade as empty output — and
+/// otherwise at `tracing::debug!` (`RUST_LOG=debug`). The caller decides
 /// what stdout means.
+///
+/// NB: never log `cmd` itself — it may carry a password.
 pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) -> Result<String> {
     let session = authed_session(host, port, user, pass).await?;
     let mut ch = session.channel_open_session().await?;
@@ -116,23 +178,18 @@ pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) 
     // Bounded channel drain: PowerShell cold-start on a fresh boot can
     // stall tens of seconds, and a hung channel would otherwise burn the
     // caller's whole budget silently. Hard cap, then loud timeout.
-    let out = tokio::time::timeout(timeouts::SSH_EXEC_DRAIN, async {
+    let (out, err) = tokio::time::timeout(timeouts::SSH_EXEC_DRAIN, async {
         let mut out = Vec::new();
+        let mut err = Vec::new();
         while let Some(msg) = ch.wait().await {
             match msg {
                 russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
-                russh::ChannelMsg::ExtendedData { data, .. } => {
-                    // PowerShell parse errors land on stderr while stdout stays
-                    // empty — without this, a broken command masquerades as
-                    // empty output (observed live). Surface it loudly.
-                    // NB: never log `cmd` itself here — it may carry a password.
-                    eprintln!("ssh stderr: {}", String::from_utf8_lossy(&data).trim())
-                }
+                russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
                 russh::ChannelMsg::ExitStatus { .. } => break,
                 _ => {}
             }
         }
-        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out).into_owned())
+        Ok::<_, anyhow::Error>((out, err))
     })
     .await
     .map_err(|_| {
@@ -141,13 +198,60 @@ pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) 
             timeouts::SSH_EXEC_DRAIN.as_secs()
         )
     })??;
-    Ok(out)
+    match loud_stderr_message(&out, &err) {
+        Some(msg) => eprintln!("{msg}"),
+        None if !err.is_empty() => {
+            tracing::debug!("guest stderr: {}", String::from_utf8_lossy(&err).trim())
+        }
+        None => {}
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The one stderr report worth printing at the default level: `Some` only
+/// when stderr changes how the result reads (empty stdout = a broken
+/// command that would otherwise look like an empty answer). Routine stderr
+/// alongside real stdout is `None` here and goes to `RUST_LOG=debug`.
+fn loud_stderr_message(out: &[u8], err: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(err);
+    let text = text.trim();
+    if text.is_empty() || !out.iter().all(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(format!("guest command produced no stdout — stderr: {text}"))
+}
+
+/// One `bcdedit /enum` line check: `key ... want` (whitespace varies).
+fn bcdedit_value_verified(out: &str, key: &str, want: &str) -> bool {
+    out.lines().any(|l| {
+        let l = l.trim().to_ascii_lowercase();
+        l.starts_with(key) && l.ends_with(&want.to_ascii_lowercase())
+    })
+}
+
+/// Headless service diet + NLA profile, applied once over SSH after the
+/// guest reports Ready — deliberately NOT a specialize step: each list
+/// used to be its own synchronous PowerShell cold start serializing into
+/// Setup. One invocation here costs a single cold start off the critical
+/// path. Best-effort (warn, never fail): Setup is done, this is hygiene.
+/// Defender real-time monitoring is tamper-locked headless — not attempted.
+pub async fn apply_headless_diet(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    const SERVICES: &str = "'Spooler','WSearch','SysMain','DiagTrack','WerSvc','BITS','DoSvc','wisvc','RetailDemo','MapsBroker','Fax','WbioSrvc','PhoneSvc','RemoteRegistry','lfsvc','XblAuthManager','XblGameSave','dmwappushservice'";
+    let cmd = format!(
+        "powershell -NoProfile -Command \"Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; {SERVICES}|%{{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue}}\""
+    );
+    ssh_exec(host, port, user, pass, &cmd).await?;
+    Ok(())
 }
 
 /// Enable or disable Windows Automatic Repair ("Diagnosing your PC") on
 /// the guest. Disabled = boots fail fast instead of parking at recovery;
-/// snapshots are the safety net, not WinRE. Verified by reading the entry
-/// back (`bcdedit /enum`) — same trust-nothing rule as `set_auto_updates`.
+/// snapshots are the safety net, not WinRE. Toggles BOTH BCD switches:
+/// `recoveryenabled` gates WinRE invocation, while the "Diagnosing your
+/// PC" screen itself is the boot-status policy (`bootstatuspolicy`) —
+/// IgnoreAllFailures makes winload skip it after an unclean stop.
+/// Verified by reading the entry back (`bcdedit /enum`) — same
+/// trust-nothing rule as `set_auto_updates`.
 pub async fn set_recovery_enabled(
     host: &str,
     port: u16,
@@ -156,6 +260,11 @@ pub async fn set_recovery_enabled(
     enabled: bool,
 ) -> Result<()> {
     let val = if enabled { "Yes" } else { "No" };
+    let policy = if enabled {
+        "DisplayAllFailures"
+    } else {
+        "IgnoreAllFailures"
+    };
     ssh_exec(
         host,
         port,
@@ -164,17 +273,23 @@ pub async fn set_recovery_enabled(
         &format!("bcdedit /set {{current}} recoveryenabled {val}"),
     )
     .await?;
+    ssh_exec(
+        host,
+        port,
+        user,
+        pass,
+        &format!("bcdedit /set {{current}} bootstatuspolicy {policy}"),
+    )
+    .await?;
     let en = ssh_exec(host, port, user, pass, "bcdedit /enum {current}").await?;
-    // `recoveryenabled    Yes|No` (whitespace varies).
-    let ok = en.lines().any(|l| {
-        let l = l.trim().to_ascii_lowercase();
-        l.starts_with("recoveryenabled") && l.ends_with(&val.to_ascii_lowercase())
-    });
-    if !ok {
+    if !bcdedit_value_verified(&en, "recoveryenabled", val) {
         anyhow::bail!("recoveryenabled {val} unverified (bcdedit /enum): {en:?}");
     }
+    if !bcdedit_value_verified(&en, "bootstatuspolicy", policy) {
+        anyhow::bail!("bootstatuspolicy {policy} unverified (bcdedit /enum): {en:?}");
+    }
     eprintln!(
-        "recovery {val} (Automatic Repair {}, verified)",
+        "recovery {val} (Automatic Repair {}, boot status policy {policy}, verified)",
         if enabled { "kept" } else { "disabled" }
     );
     Ok(())
@@ -258,7 +373,7 @@ pub async fn change_guest_password(
     )
     .await
     .map_err(|_| anyhow::anyhow!("rotated-password login timed out"))??;
-    if !verified {
+    if !verified.is_ready() {
         anyhow::bail!("rotated password rejected by guest");
     }
     Ok(())
@@ -356,43 +471,158 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     Ok(())
 }
 
+/// Prove a usable interactive shell, not just an exec channel: open a
+/// real pty shell (the exact path a user login takes — profile, prompt,
+/// the lot), send a marker, and read it back. An exec `whoami` passing
+/// while interactive logon hangs is a real failure mode (profile load,
+/// shell startup); only a prompt answering proves the prompt exists.
+/// Bounded by [`timeouts::READINESS_PROBE_BUDGET`]: answers in milliseconds
+/// on a landed guest, loud error otherwise — never a hang.
+pub async fn prove_interactive_shell(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
+    const MARKER: &str = "GOLDEN_SHELL_PROBE_READY";
+    let session = authed_session(host, port, user, pass).await?;
+    let mut ch = session.channel_open_session().await?;
+    ch.request_pty(false, DEFAULT_PTY_TERM, 80, 24, 0, 0, &[])
+        .await?;
+    ch.request_shell(false).await?;
+    ch.data(format!("echo {MARKER}\r\n").as_bytes()).await?;
+    tokio::time::timeout(timeouts::READINESS_PROBE_BUDGET, async {
+        let mut seen = Vec::new();
+        loop {
+            match ch.wait().await {
+                Some(russh::ChannelMsg::Data { data })
+                | Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                    seen.extend_from_slice(&data);
+                    if seen.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                Some(russh::ChannelMsg::ExitStatus { .. }) | None => {
+                    anyhow::bail!("shell closed before answering");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "no shell prompt within {} s — interactive logon is not usable",
+            timeouts::READINESS_PROBE_BUDGET.as_secs()
+        )
+    })??;
+    Ok(())
+}
+
+/// What the guest itself reports about Setup: finished, or still working —
+/// with a human-readable description of what is pending. Callers narrate
+/// that description only when it changes, so a long install logs a handful
+/// of progress lines instead of one per probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestProgress {
+    Ready,
+    /// e.g. `Windows Setup in progress (SetupType=2), OOBE pending`.
+    Busy(String),
+}
+
+impl GuestProgress {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, GuestProgress::Ready)
+    }
+}
+
+/// The guest's answer could not be interpreted: a defect in our probe
+/// command or in parsing its output — NOT a guest reboot. Typed so waiters
+/// report it as what it is instead of narrating a reboot that never happened.
+#[derive(Debug)]
+pub struct ProbeOutputBroken(pub String);
+
+impl std::fmt::Display for ProbeOutputBroken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProbeOutputBroken {}
+
 /// Guest readiness probe over a real SSH login (password auth). Asks the
 /// guest itself whether Setup is finished instead of inferring it from
-/// banner timing:
+/// banner timing: four registry reads through `cmd`+`reg.exe` (millisecond
+/// startup, no PowerShell cold start per probe).
 ///
-/// - `HKLM\SYSTEM\Setup`: `SetupType == 0`, no `OOBEInProgress`.
-/// - No CBS `RebootPending`, no WindowsUpdate `RebootRequired`.
-///
-/// Returns `Ok(true)` = finished, `Ok(false)` = still working (with the
-/// reason echoed to stderr by the caller), `Err` = SSH/login/exec failure
+/// Returns [`GuestProgress::Ready`] = finished, [`GuestProgress::Busy`] =
+/// still working (with what is pending), `Err` = SSH/login/exec failure
 /// (caller treats as "not yet" — sshd may be mid-restart during reboots).
-pub async fn probe_setup_done(host: &str, port: u16, user: &str, pass: &str) -> Result<bool> {
-    // The asset stays human-readable multiline; the exec channel wants a
-    // single line — see flatten_probe() for the why behind each step.
-    let one_line = flatten_probe(PROBE_TPL);
-    let text = ssh_exec(
-        host,
-        port,
-        user,
-        pass,
-        &format!("powershell -NoProfile -Command \"{one_line}\""),
-    )
-    .await?;
-    let line = text
-        .lines()
-        .find(|l| l.contains("READY") || l.contains("BUSY"))
-        .unwrap_or("");
-    if line.contains("READY") {
-        return Ok(true);
+/// No marker lines at all means the probe command itself broke (quoting,
+/// channel) — a [`ProbeOutputBroken`] error, never a silent `Busy` limp.
+pub async fn probe_setup_done(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+) -> Result<GuestProgress> {
+    let text = ssh_exec(host, port, user, pass, &reg_probe_command()).await?;
+    let sections = probe_sections(&text).ok_or_else(|| {
+        anyhow::Error::new(ProbeOutputBroken(format!(
+            "unparseable probe output: {text:?}"
+        )))
+    })?;
+    progress_from_sections(&sections)
+}
+
+/// Verdict from already-parsed probe sections (pure — unit-tested; the SSH
+/// transport lives in [`probe_setup_done`]).
+fn progress_from_sections(
+    sections: &std::collections::HashMap<&str, Vec<&str>>,
+) -> Result<GuestProgress> {
+    let get = |name: &str| sections.get(name).map(Vec::as_slice).unwrap_or(&[]);
+    // Absent key/value: OOBE counts as done (not started), everything
+    // else as busy — matching the old PowerShell probe's verdicts.
+    let setup = probe_dword(get("SETUP"));
+    let oobe = probe_dword(get("OOBE")).unwrap_or(0);
+    let cbs = get("CBS").contains(&"YES");
+    let wu = get("WU").contains(&"YES");
+    // CBS/WU sections must resolve to an explicit verdict; a section with
+    // neither YES nor NO means the chain broke mid-command.
+    for (name, lines) in [("CBS", get("CBS")), ("WU", get("WU"))] {
+        if !lines.iter().any(|l| *l == "YES" || *l == "NO") {
+            return Err(anyhow::Error::new(ProbeOutputBroken(format!(
+                "probe section {name} has no verdict: {lines:?}"
+            ))));
+        }
     }
-    if line.contains("BUSY") {
-        eprintln!("guest busy: {}", line.trim());
-        return Ok(false);
+    if setup == Some(0) && oobe == 0 && !cbs && !wu {
+        return Ok(GuestProgress::Ready);
     }
-    // No verdict line at all: the probe itself is broken (quoting, asset
-    // drift), not the guest. Loud error — a silent Ok(false) here once
-    // let a broken probe limp on until a fluke READY declared victory.
-    anyhow::bail!("unparseable probe output: {text:?}");
+    // The raw tuple is diagnostic detail, not a progress report.
+    tracing::debug!("guest probe busy: setup={setup:?} oobe={oobe} cbs={cbs} wu={wu}");
+    Ok(GuestProgress::Busy(pending_description(
+        setup, oobe, cbs, wu,
+    )))
+}
+
+/// Phrasing for a not-ready verdict: exactly the four values the probe
+/// read, never a guess about what Windows is doing beyond them.
+fn pending_description(setup: Option<u32>, oobe: u32, cbs: bool, wu: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match setup {
+        Some(0) => {}
+        Some(v) => parts.push(format!("Windows Setup in progress (SetupType={v})")),
+        None => parts.push("Setup state unreadable".into()),
+    }
+    if oobe != 0 {
+        parts.push("OOBE pending".into());
+    }
+    if cbs {
+        parts.push("component-servicing reboot pending".into());
+    }
+    if wu {
+        parts.push("Windows Update reboot pending".into());
+    }
+    if parts.is_empty() {
+        parts.push("finishing up".into());
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -448,10 +678,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_probe_reports_state() {
-        let done = probe_setup_done("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
+        let state = probe_setup_done("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
             .await
             .unwrap();
-        eprintln!("guest setup done: {done}");
+        eprintln!("guest setup state: {state:?}");
     }
 
     /// Live exec check (read-only): same transport the password rotation
@@ -466,25 +696,110 @@ mod tests {
     }
 
     #[test]
-    fn probe_flattens_without_bare_quotes() {
-        // Regression: the templated probe once shipped unescaped inner
-        // quotes; cmd stripped them and PowerShell died with
-        // "'BUSY' is not recognized as the name of a cmdlet".
-        let flat = flatten_probe(PROBE_TPL);
-        assert!(!flat.contains('\n'), "newlines break exec parsing");
-        // Every double quote must be backslash-escaped (cmd strips bare
-        // inner quotes). Registry backslashes (HKLM:\...) are fine.
-        let mut prev = '\0';
-        for c in flat.chars() {
-            if c == '"' {
-                assert_eq!(prev, '\\', "bare double quote in flattened probe");
-            }
-            prev = c;
+    fn reg_probe_parses_sample_output() {
+        // Shaped like real `reg.exe` output: value sections carry
+        // REG_DWORD lines, key-existence sections resolve via YES/NO.
+        let text = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\nERROR: The system was unable to find the specified registry key or value.\n[CBS]\nERROR: The system was unable to find the specified registry key or value.\nNO\n[WU]\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\nYES\n[END]\n";
+        let sections = probe_sections(text).unwrap();
+        let get = |name: &str| sections.get(name).map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(probe_dword(get("SETUP")), Some(0));
+        assert_eq!(probe_dword(get("OOBE")), None);
+        assert!(get("CBS").contains(&"NO"));
+        assert!(get("WU").contains(&"YES"));
+        // Busy SetupType parses as decimal from hex.
+        let busy = "[SETUP]\n    SetupType    REG_DWORD    0x2\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x1\n[END]\n";
+        let s2 = probe_sections(busy).unwrap();
+        assert_eq!(
+            probe_dword(s2.get("SETUP").map(Vec::as_slice).unwrap_or(&[])),
+            Some(2)
+        );
+        // No markers at all: broken channel, not a verdict.
+        assert!(probe_sections("garbage\nmore garbage\n").is_none());
+        // The command itself is one &-chained line with all four queries.
+        let cmd = reg_probe_command();
+        assert!(!cmd.contains('\n'));
+        for marker in ["[SETUP]", "[OOBE]", "[CBS]", "[WU]", "[END]"] {
+            assert!(cmd.contains(marker), "missing {marker}");
         }
-        // Statements separated (space-join once merged them into one
-        // command: "positional parameter ... '='" parse error).
-        assert!(flat.contains("; "), "statements must join with '; '");
-        assert!(flat.contains("READY"), "flattening must keep the verdicts");
-        assert!(flat.contains("BUSY"), "flattening must keep the verdicts");
+    }
+
+    #[test]
+    fn probe_verdicts_read_as_progress_not_failure() {
+        // Ready: everything quiet.
+        let ready = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x0\n[CBS]\nNO\n[WU]\nNO\n[END]\n";
+        let sections = probe_sections(ready).unwrap();
+        assert!(progress_from_sections(&sections).unwrap().is_ready());
+
+        // Typical mid-install: one calm line naming exactly what was read.
+        let mid = "[SETUP]\n    SetupType    REG_DWORD    0x2\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x1\n[CBS]\nNO\n[WU]\nNO\n[END]\n";
+        let sections = probe_sections(mid).unwrap();
+        assert_eq!(
+            progress_from_sections(&sections).unwrap(),
+            GuestProgress::Busy("Windows Setup in progress (SetupType=2), OOBE pending".into())
+        );
+
+        // A section with no verdict means OUR probe broke: typed so waiters
+        // report a probe problem instead of narrating a guest reboot.
+        let broken = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\n[CBS]\n[WU]\nNO\n[END]\n";
+        let sections = probe_sections(broken).unwrap();
+        let err = progress_from_sections(&sections).unwrap_err();
+        assert!(
+            err.downcast_ref::<ProbeOutputBroken>().is_some(),
+            "want ProbeOutputBroken, got {err:#}"
+        );
+    }
+
+    #[test]
+    fn probe_command_suppresses_expected_stderr() {
+        // A missing value/key is a *verdict* here (OOBE not started, no
+        // servicing reboot), not an error: every query must redirect stderr
+        // or a healthy install logs "ERROR: unable to find ..." twice per
+        // probe and reads like a broken one.
+        let cmd = reg_probe_command();
+        let queries = cmd.matches("reg query").count();
+        assert_eq!(queries, 4, "expected four reg queries: {cmd}");
+        assert_eq!(cmd.matches("2>nul").count(), queries, "unsilenced: {cmd}");
+    }
+
+    #[test]
+    fn stderr_is_loud_only_when_it_changes_the_reading() {
+        let err = b"ERROR: the key does not exist\r\n";
+        // No stdout: without the loud report a broken command would masquer
+        // as an empty-but-successful answer (observed live).
+        assert!(loud_stderr_message(b"", err).is_some());
+        // Routine stderr beside real stdout: that is progress, not an error.
+        assert!(loud_stderr_message(b"HKEY_LOCAL_MACHINE\\...\r\n", err).is_none());
+        assert!(loud_stderr_message(b"ok", b"").is_none());
+    }
+
+    #[test]
+    fn bcdedit_enum_lines_verify_both_switches() {
+        // Shaped like real `bcdedit /enum {current}` output: variable
+        // whitespace, mixed value widths.
+        let enum_out = "Windows Boot Manager\n---------------------\nidentifier              {bootmgr}\n\nWindows Boot Loader\n-------------------\nidentifier              {current}\npath                    \\Windows\\System32\\winload.efi\ndescription             Windows 11\nrecoveryenabled         No\nbootstatuspolicy        IgnoreAllFailures\n";
+        assert!(bcdedit_value_verified(enum_out, "recoveryenabled", "No"));
+        assert!(bcdedit_value_verified(
+            enum_out,
+            "bootstatuspolicy",
+            "IgnoreAllFailures"
+        ));
+        // Wrong policy (default DisplayAllFailures) must NOT verify.
+        assert!(!bcdedit_value_verified(
+            enum_out,
+            "bootstatuspolicy",
+            "DisplayAllFailures"
+        ));
+        // Keys must anchor at line start: "nrecoveryenabled" fails.
+        assert!(!bcdedit_value_verified(
+            "nrecoveryenabled  No\n",
+            "recoveryenabled",
+            "No"
+        ));
+        // Missing key entirely: verify-never-guess.
+        assert!(!bcdedit_value_verified(
+            "garbage\n",
+            "recoveryenabled",
+            "No"
+        ));
     }
 }
