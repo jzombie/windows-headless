@@ -146,11 +146,14 @@ pub fn load_rgb_8bit(path: &str) -> (Vec<u8>, u32, u32) {
 /// std-only; the CLI maps it into `anyhow`.
 pub fn try_load_rgb_8bit(path: &str) -> Result<(Vec<u8>, u32, u32), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let decoder = png::Decoder::new(file);
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
     let mut reader = decoder
         .read_info()
         .map_err(|e| format!("read header: {e}"))?;
-    let mut buf = vec![0; reader.output_buffer_size()];
+    let size = reader
+        .output_buffer_size()
+        .ok_or("frame too large".to_string())?;
+    let mut buf = vec![0; size];
     let frame = reader
         .next_frame(&mut buf)
         .map_err(|e| format!("decode: {e}"))?;
