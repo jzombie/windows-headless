@@ -317,7 +317,7 @@ fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
     let file = std::fs::File::create(path)?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Best);
+    enc.set_compression(png::Compression::High);
     if fits {
         let flat: Vec<u8> = palette.iter().flatten().copied().collect();
         enc.set_color(png::ColorType::Indexed);

@@ -256,15 +256,37 @@ async fn fetch_to(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// GitHub API client (JSON + User-Agent), shared by the tag endpoints.
+/// Attaches `GITHUB_TOKEN`/`GH_TOKEN` as a bearer token when set:
+/// unauthenticated calls share 60 req/hr per egress IP (routinely
+/// exhausted on CI runners → flaky 403s), authenticated calls get 5,000.
+/// `GITHUB_TOKEN` is automatic in GitHub Actions; without it the client
+/// behaves exactly as before. The token lives only in the request
+/// headers and is never logged.
 fn github_client() -> Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().context("token header")?,
+        );
+    }
     reqwest::Client::builder()
         .user_agent(UA)
+        .default_headers(headers)
         .build()
         .context("reqwest client")
 }
 
 /// Unpack a `.tar.gz` / `.tar.xz` archive into `dest`, rejecting absolute
 /// paths and `..` components (defense in depth over `unpack_in`).
+// `inner_bin_dir` only feeds the `#[cfg(unix)]` chmod pass below; allow
+// the unused-variable lint where that block compiles out.
+#[cfg_attr(windows, allow(unused_variables))]
 fn extract(kind: AssetKind, archive: &Path, dest: &Path, inner_bin_dir: &str) -> Result<()> {
     // dest must already exist (created via the cache group); `unpack_in`
     // canonicalizes it as a traversal guard and fails otherwise.

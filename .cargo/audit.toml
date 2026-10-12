@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2023-0071: RSA Marvin timing side-channel in `rsa` (transitive
+# via russh). No fixed upgrade is available (rsa 0.9.10 and 0.10.0-rc.18
+# both still affected; tracking RustCrypto/RSA#626). Our SSH use is
+# loopback to our own guest with blind host-key acceptance, so there is
+# no remote timing oracle. Keep in sync with the ignore in deny.toml.
+ignore = ["RUSTSEC-2023-0071"]

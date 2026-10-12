@@ -14,24 +14,24 @@ pub const RELEASE_REPO: &str = "jzombie/lab-qemu-portable";
 // NOTE: the tag is used verbatim.
 
 /// Pinned portable QEMU release, as a full release tag in
-/// [`RELEASE_REPO`] (https://github.com/jzombie/lab-qemu-portable) —
+/// [`RELEASE_REPO`] (<https://github.com/jzombie/lab-qemu-portable>) —
 /// never an upstream version number. Rebuilds take `qemu-vX.Y.Z-<run>`
 /// while the proven tag stays intact, so the tag is the only unambiguous
 /// build identity (binaries, bundled libs, firmware as one unit).
 /// `run`/`install` use exactly this; `fetch-qemu` downloads exactly this
 /// unless `--qemu-tag` overrides for new-build testing.
-pub const QEMU_PORTABLE_TAG: &str = "qemu-v11.1.1-48";
+pub const QEMU_PORTABLE_TAG: &str = "qemu-v11.1.2";
 
 /// SHA-256 of the pinned QEMU portable archives at [`QEMU_PORTABLE_TAG`],
 /// per host-asset marker (see `MARKER_*` in [`crate::paths`]). Verified
-/// 2026-10-01 against the release `SHA256SUMS.txt`.
+/// 2026-10-12 against the release `SHA256SUMS.txt`.
 /// BUMP RULE: a new tag means new bytes — update all three alongside the tag.
 pub const QEMU_PORTABLE_SHA256_MACOS_ARM64: &str =
-    "5424a4b998a9dddc8b5c67c515e64d0d653f5e786068c86ec6bd70063ad4a9ec";
+    "27e4465f040f2d57ac6c3724c32a174e4147a7d018183ee6a33f99989629dc02";
 pub const QEMU_PORTABLE_SHA256_LINUX_X86_64: &str =
-    "ebf52e87cd5887c68d14ff5e4dac6549f38a671a37167b517e4502f8b0ac884e";
+    "c11f9b4e26cd1346f60bf8f80a3d26df2f0c8ecaf2220da52b253bcec6024ba4";
 pub const QEMU_PORTABLE_SHA256_LINUX_AARCH64: &str =
-    "530f871ccb7ed6da34367dbe9126ddc6660d2989555d0e913ec3dec179ed42bc";
+    "9e0087edb42ec71f20a534c50cfedcab93c2af592194e53c7aaf77c77b0f19cf";
 
 /// Pinned portable wimlib release, as a full release tag in
 /// [`RELEASE_REPO`] — never a bare version. Same contract as QEMU:
@@ -51,10 +51,11 @@ pub const WIMLIB_PORTABLE_SHA256_LINUX_AARCH64: &str =
     "6f549ce542667ffcbf368da4cde7349b5ae9edaf8f1d76d522d857ddaef1243a";
 
 /// Vendored virtio-win driver pack release tag.
-pub const DRIVERS_RELEASE_TAG: &str = "drivers-20260925";
+pub const DRIVERS_RELEASE_TAG: &str = "drivers-20261005";
 
 /// SHA-256 of `virtio-win.iso` at [`DRIVERS_RELEASE_TAG`]. Verified
-/// 2026-10-01 against the release `virtio-win.iso.sha256` sidecar.
+/// 2026-10-12 against the release `virtio-win.iso.sha256` sidecar
+/// (identical bytes to the previous pack — tag-only bump).
 /// BUMP RULE: a new drivers tag means new bytes — update alongside the tag.
 /// (The live sidecar is still fetched and must match this pin: a forged
 /// sidecar+ISO pair fails the pin check, closing the TOFU gap.)
@@ -63,7 +64,7 @@ pub const VIRTIO_WIN_SHA256: &str =
 
 /// Win32-OpenSSH release tag (note the four-part `10.0.0.0p2` — the
 /// three-part `v10.0.0p2` form 404s; tag list at
-/// https://github.com/PowerShell/Win32-OpenSSH/releases).
+/// <https://github.com/PowerShell/Win32-OpenSSH/releases>).
 pub const OPENSSH_RELEASE_TAG: &str = "10.0.0.0p2-Preview";
 
 /// SHA-256 of `OpenSSH-Win64.zip` at [`OPENSSH_RELEASE_TAG`], verified

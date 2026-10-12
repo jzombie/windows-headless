@@ -138,7 +138,7 @@ impl russh::client::Handler for AcceptAny {
     type Error = anyhow::Error;
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::PublicKey,
+        _key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         // Loopback NAT to our own guest: TOFU is pointless, and the
         // host key changes on every reinstall. Never prompt.
