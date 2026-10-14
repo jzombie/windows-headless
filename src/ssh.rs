@@ -548,26 +548,35 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     )
     .await?;
     ch.request_shell(false).await?;
-    // Raw mode guard: console mode restored on drop, even on panic.
-    struct RawGuard;
-    impl Drop for RawGuard {
+    // Shell owns the screen: alternate screen on entry (known blank state;
+    // host scrollback preserved underneath and restored on exit), raw mode
+    // alongside it. Both are torn down by the guard on every exit path,
+    // including panic. No other task writes to this terminal while the
+    // shell holds it, so the client is the sole renderer — ConPTY cursor
+    // addressing starts from a known screen instead of fighting host logs
+    // for cursor position.
+    struct ShellGuard;
+    impl Drop for ShellGuard {
         fn drop(&mut self) {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen
+            );
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
     crossterm::terminal::enable_raw_mode().map_err(|e| {
         anyhow::anyhow!("raw mode needs a terminal ({e:#}); refusing shell on piped stdio")
     })?;
-    let _guard = RawGuard;
+    let _guard = ShellGuard;
+    // Enter late (after raw mode proved a terminal exists); failure here
+    // is non-fatal — the shell still works on the main screen.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen
+    );
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    // Plain-text separator, deliberately NOT a clear-screen escape: the
-    // `\x1b[2J\x1b[H` version raced the notice line through multiplexer /
-    // ConPTY repaints and ate its first column live ("hell open"). Boot
-    // logs stay in scrollback above; the session starts below the rule.
-    eprintln!();
-    eprintln!("--- guest shell below (above this line is host log) ---");
-    eprintln!("shell open — Ctrl-D or `exit` to leave (Ctrl-C always goes to the guest)");
     // Settle barrier: do NOT forward keystrokes until the shell has spoken
     // first. Early input races the server's pump/PTY startup and arrives
     // corrupted (observed live: a first `exit` executed as `xit`). Forward
@@ -605,42 +614,13 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
             }
         }
     }
-    // Re-sync the guest console: ConPTY cursor addressing assumes a known
-    // screen, but our terminal holds host logs above it — prompts land
-    // mid-line with stray indentation ("all over the place"). One
-    // Clear-Host redraws from a blank buffer on both sides, so the first
-    // real prompt draws at a known position. PowerShell-only, which is all
-    // this path ever spawns; if these bytes ever hit the startup race,
-    // worst case is one error line, not a corrupt session.
-    ch.data(&b"Clear-Host\r\n"[..]).await?;
-    {
-        let cap = std::time::Duration::from_secs(5);
-        let quiet = std::time::Duration::from_millis(500);
-        let deadline = tokio::time::Instant::now() + cap;
-        let mut last_out: Option<tokio::time::Instant> = None;
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let wait_for = match last_out {
-                Some(t) if now.duration_since(t) >= quiet => break,
-                Some(t) => (quiet - now.duration_since(t)).min(deadline - now),
-                None => deadline - now,
-            };
-            match tokio::time::timeout(wait_for, ch.wait()).await {
-                Ok(Some(
-                    russh::ChannelMsg::Data { data }
-                    | russh::ChannelMsg::ExtendedData { data, .. },
-                )) => {
-                    stdout.write_all(&data).await?;
-                    stdout.flush().await?;
-                    last_out = Some(tokio::time::Instant::now());
-                }
-                _ => break,
-            }
-        }
-    }
+    // No Clear-Host (or any other guest-side command) here, deliberately:
+    // display is the client's job — borrowing the guest shell to fix our
+    // screen pollutes its history and clobbers $LASTEXITCODE for no lasting
+    // gain. PSReadLine redraws the input line on every keystroke, so any
+    // initial cursor offset self-heals the moment the user types. The
+    // settle barrier above (data integrity, not display) is the only
+    // guest-stream interaction this path needs.
     let mut inbuf = vec![0u8; 1024];
     // No escape hatch, deliberately: every byte — including Ctrl-C, no
     // matter how often — belongs to the guest. An earlier triple-ETX
