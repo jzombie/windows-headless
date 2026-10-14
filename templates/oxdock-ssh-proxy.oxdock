@@ -142,7 +142,7 @@ WHILE $run {
                 # `prove_interactive_shell` sends `echo MARKER` here and reads
                 # it back, the exact path a user login takes).
                 LET $pty: HANDLE = ASYNC {
-                    SSH_PTY_RUN($sess.session, ["powershell.exe", "-NoLogo", "-NoProfile"], 0, 0, $c_out, $c_in)
+                    SSH_PTY_RUN($sess.session, ["powershell.exe", "-NoProfile"], 0, 0, $c_out, $c_in)
                 }
 
                 LET $pump: HANDLE = ASYNC {
