@@ -1132,17 +1132,16 @@ async fn prove_landed_shell(port: u16, user: &str, password: &str) -> Result<()>
     // garbled section reads as busy/broken, which is transport noise, not
     // guest state. Re-prove a few times before failing, and name the last
     // verdict on failure (a bare "not READY" cost a debugging session).
-    let mut last = "no probe yet".to_string();
     for attempt in 1..=4 {
-        match crate::ssh::probe_setup_done(PROVEN_SSH_HOST, port, user, password).await {
-            Ok(g) if g.is_ready() => break,
-            Ok(g) => {
-                last = format!("guest busy: {}", g.describe());
-            }
-            Err(e) => {
-                last = format!("probe error: {e:#}");
-            }
-        }
+        let note = match crate::ssh::probe_setup_done(PROVEN_SSH_HOST, port, user, password).await
+        {
+            Ok(g) if g.is_ready() => None,
+            Ok(g) => Some(format!("guest busy: {}", g.describe())),
+            Err(e) => Some(format!("probe error: {e:#}")),
+        };
+        let Some(last) = note else {
+            break;
+        };
         if attempt == 4 {
             anyhow::bail!("guest not READY at snapshot time (last: {last})");
         }

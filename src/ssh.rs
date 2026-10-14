@@ -964,9 +964,11 @@ mod tests {
         let wide = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .unwrap();
-        let units: Vec<u16> = wide
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        let (chunks, rest) = wide.as_chunks::<2>();
+        assert!(rest.is_empty());
+        let units: Vec<u16> = chunks
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         assert_eq!(String::from_utf16(&units).unwrap(), script);
     }
