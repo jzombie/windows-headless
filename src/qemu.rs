@@ -797,25 +797,19 @@ impl HeadlessVm {
         q.send_keys(keys).await
     }
 
-    /// Graceful shutdown over SSH (`Stop-Computer -Force`), required before
-    /// offline `create_overlay` to avoid a dirty-NTFS `chkdsk` on next boot.
+    /// Graceful shutdown over SSH (built-in russh client, quote-free
+    /// command — no host `ssh` needed, no quoting to mangle), required
+    /// before offline `create_overlay` to avoid a dirty-NTFS `chkdsk` on
+    /// next boot.
     pub async fn shutdown_cleanly(&self) -> Result<()> {
-        let status = Command::new("ssh")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-p")
-            .arg(self.builder.ssh_port.to_string())
-            .arg(format!(
-                "{}@{}",
-                self.builder.config.username, self.builder.ssh_host
-            ))
-            .arg("powershell.exe -NoProfile -Command \"Stop-Computer -Force\"")
-            .status()
-            .await
-            .context("ssh shutdown")?;
-        if !status.success() {
-            anyhow::bail!("remote shutdown command failed");
-        }
+        crate::ssh::ssh_exec(
+            &self.builder.ssh_host,
+            self.builder.ssh_port,
+            &self.builder.config.username,
+            &self.builder.config.password,
+            "powershell -NoProfile -Command Stop-Computer -Force",
+        )
+        .await?;
         Ok(())
     }
 

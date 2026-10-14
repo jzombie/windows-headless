@@ -100,6 +100,20 @@ WHILE $run {
             # scope reverts variable writes on exit, so the argv cannot
             # be composed above and shared below.
             IF $sess.command != "" {
+                # argv passthrough, deliberately NOT via ENV: template
+                # interpolation applies DSL-unescape to values (`\x` -> `x`
+                # with quote-dependent behavior observed live), which eats
+                # the backslashes in registry paths and `C:\...` names. The
+                # argv join carries backslashes verbatim — at the cost of
+                # backslash-escaping double quotes (`"` -> `\"`), so host
+                # commands must avoid double quotes entirely (see ssh.rs:
+                # quote-free reg probe, unquoted powershell -Command,
+                # -EncodedCommand for the rest). Single quotes, pipes,
+                # `%`, parens all ride through.
+                # TODO: pass $sess.command however is faithful once
+                # rust-oxdock fixes both sides (verbatim argv join, no
+                # unescape on interpolation); then remove the quote-free
+                # contortions in ssh.rs and re-bump OXDOCK_RELEASE_TAG.
                 ENV SSH_COMMAND="{{ $sess.command }}"
                 LET $c_in: PIPE   # Bytes from PTY -> Wire
                 LET $c_out: PIPE  # Bytes from Wire -> PTY

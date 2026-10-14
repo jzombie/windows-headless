@@ -1128,11 +1128,26 @@ async fn prove_landed_shell(port: u16, user: &str, password: &str) -> Result<()>
     if banner_once(port).await.is_none() {
         anyhow::bail!("no SSH banner at snapshot time");
     }
-    if !crate::ssh::probe_setup_done(PROVEN_SSH_HOST, port, user, password)
-        .await
-        .is_ok_and(|g| g.is_ready())
-    {
-        anyhow::bail!("guest not READY at snapshot time");
+    // The probe crosses a ConPTY plus threaded pumps: a transiently
+    // garbled section reads as busy/broken, which is transport noise, not
+    // guest state. Re-prove a few times before failing, and name the last
+    // verdict on failure (a bare "not READY" cost a debugging session).
+    let mut last = "no probe yet".to_string();
+    for attempt in 1..=4 {
+        match crate::ssh::probe_setup_done(PROVEN_SSH_HOST, port, user, password).await {
+            Ok(g) if g.is_ready() => break,
+            Ok(g) => {
+                last = format!("guest busy: {}", g.describe());
+            }
+            Err(e) => {
+                last = format!("probe error: {e:#}");
+            }
+        }
+        if attempt == 4 {
+            anyhow::bail!("guest not READY at snapshot time (last: {last})");
+        }
+        eprintln!("snapshot probe {attempt}/4 inconclusive ({last}) — retrying ...");
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
     // LITERAL shell landing: a pty shell answering back, the exact path
     // a user login takes — not a banner read, not an exec probe.
@@ -1167,13 +1182,14 @@ async fn shutdown_guest_clean(host: &str, port: u16, user: &str, pass: &str) -> 
         timeouts::GUEST_SHUTDOWN_SECS
     );
     // Best-effort issue: if the guest is already dying, the banner wait
-    // below still does the real gating.
+    // below still does the real gating. Unquoted single cmdlet: no pipes,
+    // no quotes, nothing the argv join can mangle.
     let _ = crate::ssh::ssh_exec(
         host,
         port,
         user,
         pass,
-        "powershell -NoProfile -Command \"Stop-Computer -Force\"",
+        "powershell -NoProfile -Command Stop-Computer -Force",
     )
     .await;
     let deadline = std::time::Instant::now() + Duration::from_secs(timeouts::GUEST_SHUTDOWN_SECS);
@@ -2205,7 +2221,14 @@ pub async fn cmd_guest(a: GuestArgs) -> Result<()> {
         GuestOp::Probe => {
             let progress =
                 crate::ssh::probe_setup_done(host, a.ssh_port, &a.username, &a.password).await?;
-            eprintln!("{}", if progress.is_ready() { "READY" } else { "BUSY" });
+            eprintln!(
+                "{}",
+                if progress.is_ready() {
+                    "READY".to_string()
+                } else {
+                    format!("BUSY: {}", progress.describe())
+                }
+            );
         }
     }
     Ok(())

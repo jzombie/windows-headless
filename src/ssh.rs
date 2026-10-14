@@ -65,6 +65,18 @@ pub async fn wait_for_ssh(host: &str, port: u16, timeout_: Duration) -> Result<(
 /// key-existence checks locale-independent; value parsing keys on the
 /// (never localized) `REG_DWORD` token.
 ///
+/// WIRE RULE (OxDock transport): the guest builds the process command line
+/// by joining argv, which backslash-escapes every `"` and doubles every
+/// `%`. So this command must contain NO double quotes and NO `%%`:
+/// - Unquoted `HKLM\...` paths (no spaces in these four — the two spaced
+///   keys go through `set` variables + `call`, which needs single `%`).
+/// - `set K=<spaced key>` + `call reg query %K%`: `call` forces a second
+///   parse pass so the value (expanded then) is read correctly.
+///
+/// TODO: revert to plain quoted `reg query "HKLM\..."` paths once
+/// rust-oxdock joins argv Windows-style (no `\"` mangling) and the
+/// OXDOCK_RELEASE_TAG pin moves past the fix; then delete the `set`/`call`
+/// dance and re-prove with `guest probe` live.
 /// Every query sends its stderr to `nul`: a missing value/key is a *verdict*
 /// here (OOBE not started, no servicing reboot pending), not a failure —
 /// letting it through logged "ERROR: The system was unable to find the
@@ -73,45 +85,66 @@ pub async fn wait_for_ssh(host: &str, port: u16, timeout_: Duration) -> Result<(
 fn reg_probe_command() -> String {
     [
         "echo [SETUP]",
-        "reg query \"HKLM\\SYSTEM\\Setup\" /v SetupType 2>nul",
+        "reg query HKLM\\SYSTEM\\Setup /v SetupType 2>nul",
         "echo [OOBE]",
-        "reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2>nul",
+        "reg query HKLM\\SYSTEM\\Setup /v OOBEInProgress 2>nul",
         "echo [CBS]",
-        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\" 2>nul && echo YES || echo NO",
+        "set WHCBSK=HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending& call reg query %WHCBSK% 2>nul && echo YES || echo NO",
         "echo [WU]",
-        "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\" 2>nul && echo YES || echo NO",
+        "set WHWUK=HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired& call reg query %WHWUK% 2>nul && echo YES || echo NO",
         "echo [END]",
     ]
     .join(" & ")
 }
 
-/// Split reg-probe output into its marker-delimited sections. Only the
-/// exact markers this probe emits are boundaries — anything else brackety
-/// in `reg` output is data, never structure.
+/// Split reg-probe output into its marker-delimited sections. Markers are
+/// matched as SUBSTRINGS in fixed order, not as whole lines: the ConPTY
+/// sometimes glues a marker onto the previous line's tail (`0x0[OOBE]`
+/// observed live — reg's trailing newline lost in the pty), and a
+/// line-exact match would drop the whole section. Only the exact markers
+/// this probe emits are boundaries — anything else brackety in `reg`
+/// output is data, never structure.
+///
+/// TODO: back this to line-exact matching if the pty ever delivers
+/// intact line discipline; the glued-marker regression test pins the
+/// current behavior either way.
 const KNOWN_MARKERS: &[&str] = &["SETUP", "OOBE", "CBS", "WU", "END"];
 
 fn probe_sections(text: &str) -> Option<std::collections::HashMap<&str, Vec<&str>>> {
     let mut sections = std::collections::HashMap::new();
+    let mut rest = text;
     let mut current: Option<&str> = None;
-    let mut seen_marker = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') && t.ends_with(']') {
-            let name = &t[1..t.len() - 1];
-            if let Some(marker) = KNOWN_MARKERS.iter().find(|m| **m == name) {
-                current = Some(*marker);
-                if *marker != "END" {
-                    seen_marker = true;
-                }
-                sections.entry(*marker).or_insert_with(Vec::new);
-                continue;
-            }
+    let mut seen_any = false;
+    for marker in KNOWN_MARKERS {
+        let tag = format!("[{marker}]");
+        let Some(pos) = rest.find(&tag) else {
+            break;
+        };
+        seen_any = true;
+        if let Some(cur) = current {
+            sections
+                .entry(cur)
+                .or_insert_with(Vec::new)
+                .extend(rest[..pos].lines().map(str::trim));
         }
-        if let Some(c) = current {
-            sections.entry(c).or_insert_with(Vec::new).push(t);
+        if *marker != "END" {
+            sections.entry(*marker).or_insert_with(Vec::new);
         }
+        current = Some(*marker);
+        rest = &rest[pos + tag.len()..];
     }
-    if seen_marker { Some(sections) } else { None }
+    if !seen_any {
+        return None;
+    }
+    // Trailing bytes after the last marker belong to it (a missing [END]
+    // still leaves a parseable tail).
+    if let Some(cur) = current {
+        sections
+            .entry(cur)
+            .or_insert_with(Vec::new)
+            .extend(rest.lines().map(str::trim));
+    }
+    Some(sections)
 }
 
 /// DWORD value from a `reg query /v` section: `None` when the value (or
@@ -171,6 +204,19 @@ async fn authed_session(
 /// what stdout means.
 ///
 /// NB: never log `cmd` itself — it may carry a password.
+///
+/// WIRE RULE (OxDock transport): every exec runs as `cmd.exe /c <cmd>`
+/// where `<cmd>` crossed a CreateProcess argv join that backslash-escapes
+/// `"` and doubles `%`. Callers must therefore send commands with NO `"`
+/// and NO `%%` (see `reg_probe_command`, `ps_encoded_command`). What does
+/// NOT survive is fixed here, not per caller.
+///
+/// TODO: drop this rule (and the quote-free rewrites below) once rust-oxdock
+/// passes argv through verbatim; re-verify with `guest probe` + a spaced
+/// password rotation live after the pin bump.
+///
+/// ConPTY decor (cursor addressing, DSR replies, title sets) is stripped
+/// from both streams: parsers see command output, not terminal paint.
 pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) -> Result<String> {
     let session = authed_session(host, port, user, pass).await?;
     let mut ch = session.channel_open_session().await?;
@@ -198,6 +244,8 @@ pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) 
             timeouts::SSH_EXEC_DRAIN.as_secs()
         )
     })??;
+    let out = strip_ansi(&out);
+    let err = strip_ansi(&err);
     match loud_stderr_message(&out, &err) {
         Some(msg) => eprintln!("{msg}"),
         None if !err.is_empty() => {
@@ -206,6 +254,92 @@ pub async fn ssh_exec(host: &str, port: u16, user: &str, pass: &str, cmd: &str) 
         None => {}
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Strip ANSI/VT escape sequences from a byte stream: CSI (`ESC [ ...
+/// final`), OSC (`ESC ] ... BEL` / `ESC \`), charset designators, stray
+/// ESC and BEL. OxDock runs every exec under a ConPTY, so even `reg.exe`
+/// arrives wrapped in cursor addressing, DSR replies, and title sets —
+/// parsers (`probe_sections`, `bcdedit_value_verified`) must not see them.
+/// Plain text (including `\r\n`) passes through untouched.
+///
+/// TODO: drop this if the server ever offers pty-less exec (no terminal,
+/// no paint); until then every ssh_exec caller depends on it.
+fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Stray BEL (ConPTY title-set residue): never command output.
+            0x07 => {
+                i += 1;
+            }
+            0x1b if i + 1 < bytes.len() => match bytes[i + 1] {
+                // CSI: ESC [ params... final byte 0x40..=0x7E.
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < bytes.len() && !(0x40..=0x7E).contains(&bytes[j]) {
+                        j += 1;
+                    }
+                    i = (j + 1).min(bytes.len());
+                }
+                // OSC: ESC ] ... BEL or ESC \.
+                b']' => {
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x07 {
+                            j += 1;
+                            break;
+                        }
+                        if bytes[j] == 0x1b
+                            && j + 1 < bytes.len()
+                            && bytes[j + 1] == b'\\'
+                        {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+                // Charset designation / misc two-byte sequences.
+                b'(' | b')' | b'#' | b'=' | b'>' => {
+                    i = (i + 3).min(bytes.len());
+                }
+                // Lone ESC (truncated sequence at buffer end, etc.): drop.
+                _ => {
+                    i += 1;
+                }
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Wrap an arbitrary PowerShell script for the wire: `-EncodedCommand`
+/// takes base64 UTF-16LE, whose alphabet (`A–Z a–z 0–9 + / =`) contains
+/// no `"`, no `%`, no spaces — nothing the argv join can mangle. The
+/// decoded script may contain anything (quotes, spaces, `%`, `!`), so
+/// this is the channel for commands that cannot be written quote-free
+/// (password rotation, cmdlet pipelines).
+///
+/// TODO: revert diet/rotation to plain quoted `-Command` strings once the
+/// argv join is verbatim (see WIRE RULE above); keep one encoded call as
+/// the arbitrary-password path only if rotation still needs it.
+fn ps_encoded_command(script: &str) -> String {
+    use base64::Engine;
+    let wide: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    format!(
+        "powershell -NoProfile -EncodedCommand {}",
+        base64::engine::general_purpose::STANDARD.encode(&wide)
+    )
 }
 
 /// The one stderr report worth printing at the default level: `Some` only
@@ -232,15 +366,22 @@ fn bcdedit_value_verified(out: &str, key: &str, want: &str) -> bool {
 /// Headless service diet + NLA profile, applied once over SSH after the
 /// guest reports Ready — deliberately NOT a specialize step: each list
 /// used to be its own synchronous PowerShell cold start serializing into
-/// Setup. One invocation here costs a single cold start off the critical
-/// path. Best-effort (warn, never fail): Setup is done, this is hygiene.
+/// Setup. Two invocations here cost two cold starts off the critical
+/// path. `-EncodedCommand` throughout: cmdlet pipelines need `|` (fatal
+/// unquoted through `cmd`, fatal quoted through the argv join), so the
+/// scripts travel as base64 instead. Best-effort (warn, never fail):
+/// Setup is done, this is hygiene.
 /// Defender real-time monitoring is tamper-locked headless — not attempted.
 pub async fn apply_headless_diet(host: &str, port: u16, user: &str, pass: &str) -> Result<()> {
-    const SERVICES: &str = "'Spooler','WSearch','SysMain','DiagTrack','WerSvc','BITS','DoSvc','wisvc','RetailDemo','MapsBroker','Fax','WbioSrvc','PhoneSvc','RemoteRegistry','lfsvc','XblAuthManager','XblGameSave','dmwappushservice'";
-    let cmd = format!(
-        "powershell -NoProfile -Command \"Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; {SERVICES}|%{{Set-Service -Name $_ -StartupType Disabled -EA SilentlyContinue}}\""
-    );
-    ssh_exec(host, port, user, pass, &cmd).await?;
+    const SERVICES: &str = "Spooler,WSearch,SysMain,DiagTrack,WerSvc,BITS,DoSvc,wisvc,RetailDemo,MapsBroker,Fax,WbioSrvc,PhoneSvc,RemoteRegistry,lfsvc,XblAuthManager,XblGameSave,dmwappushservice";
+    for script in [
+        "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private",
+        &format!(
+            "Get-Service {SERVICES} | Set-Service -StartupType Disabled -ErrorAction SilentlyContinue"
+        ),
+    ] {
+        ssh_exec(host, port, user, pass, &ps_encoded_command(script)).await?;
+    }
     Ok(())
 }
 
@@ -355,15 +496,15 @@ pub async fn change_guest_password(
 ) -> Result<()> {
     // Hard budgets throughout: a stalled handshake must surface as an
     // error, never hang the caller (same lesson as the install wait loop).
+    // `-EncodedCommand`: the password is arbitrary text (spaces, quotes,
+    // `%`, `!`) that no amount of cmd-level quoting can carry intact, so
+    // it travels as base64 and only materializes inside PowerShell.
+    let script = format!(
+        "Set-LocalUser -Name \"{user}\" -Password (ConvertTo-SecureString \"{new_pass}\" -AsPlainText -Force)"
+    );
     tokio::time::timeout(
         timeouts::SSH_PASSWORD_ROTATION_BUDGET,
-        ssh_exec(
-            host,
-            port,
-            user,
-            old_pass,
-            &format!("net user {user} \"{new_pass}\""),
-        ),
+        ssh_exec(host, port, user, old_pass, &ps_encoded_command(&script)),
     )
     .await
     .map_err(|_| anyhow::anyhow!("password change timed out"))??;
@@ -529,6 +670,14 @@ impl GuestProgress {
     pub fn is_ready(&self) -> bool {
         matches!(self, GuestProgress::Ready)
     }
+
+    /// Human-readable verdict detail: `"ready"`, or what is pending.
+    pub fn describe(&self) -> &str {
+        match self {
+            GuestProgress::Ready => "ready",
+            GuestProgress::Busy(s) => s,
+        }
+    }
 }
 
 /// The guest's answer could not be interpreted: a defect in our probe
@@ -567,7 +716,17 @@ pub async fn probe_setup_done(
             "unparseable probe output: {text:?}"
         )))
     })?;
-    progress_from_sections(&sections)
+    progress_from_sections(&sections).map_err(|e| {
+        // Name the section AND show what the guest actually sent: a missing
+        // marker vs a missing verdict are different failures (ConPTY noise
+        // eats lines; a broken query eats values), and the raw bytes tell
+        // them apart instantly.
+        if e.downcast_ref::<ProbeOutputBroken>().is_some() {
+            anyhow::Error::new(ProbeOutputBroken(format!("{e:#} — raw: {text:?}")))
+        } else {
+            e
+        }
+    })
 }
 
 /// Verdict from already-parsed probe sections (pure — unit-tested; the SSH
@@ -724,6 +883,17 @@ mod tests {
     }
 
     #[test]
+    fn probe_sections_survive_glued_markers() {
+        // Live ConPTY output 2026-10-14: reg's trailing newline lost, so
+        // markers arrive glued to the previous value (`0x0[OOBE]`). A
+        // line-exact match drops the section and the probe goes blind
+        // ("CBS has no verdict") on a healthy guest.
+        let text = "[SETUP] \r\n\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\Setup\r\n    SetupType    REG_DWORD    0x0[OOBE] HKEY_LOCAL_MACHINE\\SYSTEM\\Setup\r\n    OOBEInProgress    REG_DWORD    0x0[CBS] \r\nNO \r\n[WU] \r\nNO \r\n[END]\r\n";
+        let sections = probe_sections(text).unwrap();
+        assert!(progress_from_sections(&sections).unwrap().is_ready());
+    }
+
+    #[test]
     fn probe_verdicts_read_as_progress_not_failure() {
         // Ready: everything quiet.
         let ready = "[SETUP]\n    SetupType    REG_DWORD    0x0\n[OOBE]\n    OOBEInProgress    REG_DWORD    0x0\n[CBS]\nNO\n[WU]\nNO\n[END]\n";
@@ -759,6 +929,61 @@ mod tests {
         let queries = cmd.matches("reg query").count();
         assert_eq!(queries, 4, "expected four reg queries: {cmd}");
         assert_eq!(cmd.matches("2>nul").count(), queries, "unsilenced: {cmd}");
+    }
+
+    /// Transport rule, pinned: the guest argv join backslash-escapes `"`
+    /// and doubles `%`, so NO guest command may contain `"` or `%%`
+    /// (single `%` for `call` deferred expansion is fine — the join
+    /// doubling is exactly what `call` needs). A `"` here means reg
+    /// looks up a `\"...`-prefixed key and the probe goes blind.
+    #[test]
+    fn guest_commands_are_wire_safe() {
+        let cmds = [
+            reg_probe_command(),
+            "powershell -NoProfile -Command Stop-Computer -Force".to_string(),
+            ps_encoded_command("Get-Service Spooler | Set-Service -StartupType Disabled"),
+            ps_encoded_command("Set-LocalUser -Name \"u\" -Password (ConvertTo-SecureString \"p@ss w%!\" -AsPlainText -Force)"),
+        ];
+        for cmd in &cmds {
+            assert!(!cmd.contains('"'), "double quote on the wire: {cmd}");
+            assert!(!cmd.contains("%%"), "doubled percent on the wire: {cmd}");
+            assert!(!cmd.contains('\n'), "multiline command: {cmd}");
+        }
+    }
+
+    #[test]
+    fn ps_encoded_command_round_trips_any_chars() {
+        // Passwords with spaces, quotes, %, ! survive: only base64 alphabet
+        // crosses the wire, the secret materializes inside PowerShell.
+        let script = "Set-LocalUser -Name \"AdminUser\" -Password (ConvertTo-SecureString \"P@ss w%!\\\"\" -AsPlainText -Force)";
+        let cmd = ps_encoded_command(script);
+        assert!(cmd.starts_with("powershell -NoProfile -EncodedCommand "));
+        let b64 = cmd.split_whitespace().last().unwrap();
+        assert!(!b64.contains(['"', '%', ' ', '&', '|']));
+        use base64::Engine;
+        let wide = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let units: Vec<u16> = wide
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), script);
+    }
+
+    #[test]
+    fn strip_ansi_keeps_text_drops_paint() {
+        // ConPTY framing observed live around real reg.exe output.
+        let painted = b"\x1b[6n\x1b[?9001hHKEY_LOCAL_MACHINE\\SYSTEM\x1b]0;C:\\WINDOWS\\system32\\cmd.exe\x07\r\n    SetupType    REG_DWORD    0x0\r\n\x1b[?9001l\x1b[1004l";
+        assert_eq!(
+            strip_ansi(painted),
+            b"HKEY_LOCAL_MACHINE\\SYSTEM\r\n    SetupType    REG_DWORD    0x0\r\n".to_vec()
+        );
+        // Plain text (incl. CR LF) is untouched; lone ESC/BEL never survive.
+        assert_eq!(strip_ansi(b"plain\r\ntext"), b"plain\r\ntext");
+        assert_eq!(strip_ansi(b"a\x1bb"), b"ab");
+        assert_eq!(strip_ansi(b"a\x07b"), b"ab");
+        assert_eq!(strip_ansi(b""), b"");
     }
 
     #[test]

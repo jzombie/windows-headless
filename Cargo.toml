@@ -52,6 +52,7 @@ downloader = [
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 cache-manager = { workspace = true, optional = true }
 clap.workspace = true
 crc32fast.workspace = true

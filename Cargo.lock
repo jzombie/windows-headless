@@ -3607,6 +3607,7 @@ name = "windows-headless"
 version = "0.2.0-alpha"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cache-manager",
  "clap",
  "crc32fast",

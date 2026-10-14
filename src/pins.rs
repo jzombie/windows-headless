@@ -66,6 +66,11 @@ pub const VIRTIO_WIN_SHA256: &str =
 /// come from this [rust-oxdock](https://github.com/jzombie/rust-oxdock)
 /// release instead of Win32-OpenSSH (the guest runs no OpenSSH at all).
 /// Verified 2026-10-14 against the release `SHA256SUMS` file.
+///
+/// TODO: bump past v0.28.0-alpha once upstream fixes verbatim argv join +
+/// no-unescape interpolation (see WIRE RULE in ssh.rs); then remove the
+/// quote-free command rewrites, the `-EncodedCommand` wrappers, and the
+/// ANSI stripper, and re-prove install→snapshot→run live end to end.
 pub const OXDOCK_RELEASE_TAG: &str = "v0.28.0-alpha";
 
 /// SHA-256 of `oxdock-x86_64-pc-windows-msvc.tar.gz` at
