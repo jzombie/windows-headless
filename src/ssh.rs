@@ -577,13 +577,7 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     );
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    // Settle barrier: do NOT forward keystrokes until the shell has spoken
-    // first. Early input races the server's pump/PTY startup and arrives
-    // corrupted (observed live: a first `exit` executed as `xit`). Forward
-    // everything meanwhile so the banner/prompt still display; stop at the
-    // first quiet gap after output starts, or the cap. Inline (twice, with
-    // different budgets): russh's channel type is private, so the loop
-    // cannot live in a shared helper.
+    // Settle: hold keystrokes until the shell has spoken, then bridge.
     {
         let cap = std::time::Duration::from_secs(15);
         let quiet = std::time::Duration::from_millis(700);
@@ -608,8 +602,8 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
                     stdout.flush().await?;
                     last_out = Some(tokio::time::Instant::now());
                 }
-                // Closed/exit-status during settle: enter the main loop and
-                // let it terminate promptly instead of hanging here.
+                // Closed/exit-status mid-drain: enter the main loop and let
+                // it terminate promptly instead of hanging here.
                 _ => break,
             }
         }
@@ -900,6 +894,74 @@ mod tests {
             .await
             .unwrap();
         eprintln!("guest setup state: {state:?}");
+    }
+
+    /// Live shell cross-talk probe: needs the proven VM up (SSH on 2232
+    /// with default creds). Opens a real pty shell, lets it settle, sends
+    /// exactly ONE marker line, then listens. Fails if the shell executes
+    /// anything unsent (`>>` continuation, command-not-found text) — the
+    /// signature of server-side output→input leakage, where prompt bytes
+    /// loop back into the input and the next Enter runs garbage. Catches
+    /// spurious execution, not silent byte swaps.
+    /// `cargo test -- --ignored live_shell_crosstalk`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_shell_crosstalk() {
+        const MARKER: &str = "CROSSTALK_PROBE_7F3A9C";
+        let session = authed_session("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
+            .await
+            .unwrap();
+        let mut ch = session.channel_open_session().await.unwrap();
+        ch.request_pty(false, DEFAULT_PTY_TERM, 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        ch.request_shell(false).await.unwrap();
+        let mut transcript = Vec::new();
+        // Settle: drain startup output (logo, first prompt).
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(6) {
+            match tokio::time::timeout(Duration::from_millis(500), ch.wait()).await {
+                Ok(Some(
+                    russh::ChannelMsg::Data { data }
+                    | russh::ChannelMsg::ExtendedData { data, .. },
+                )) => transcript.extend_from_slice(&data),
+                // Quiet tick: keep waiting out the budget.
+                Err(_) => {}
+                _ => break,
+            }
+        }
+        // Exactly one line sent for the rest of the session.
+        ch.data(format!("echo {MARKER}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(6) {
+            match tokio::time::timeout(Duration::from_millis(500), ch.wait()).await {
+                Ok(Some(
+                    russh::ChannelMsg::Data { data }
+                    | russh::ChannelMsg::ExtendedData { data, .. },
+                )) => transcript.extend_from_slice(&data),
+                Err(_) => {}
+                _ => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&transcript);
+        eprintln!("shell transcript:\n{text}");
+        assert!(text.contains(MARKER), "marker never echoed — shell dead");
+        assert!(
+            !text.contains(">>"),
+            "continuation prompt with nothing left open"
+        );
+        for bad in [
+            "not recognized",
+            "CommandNotFoundException",
+            "FullyQualifiedErrorId",
+        ] {
+            assert!(
+                !text.contains(bad),
+                "shell executed something unsent: {bad}"
+            );
+        }
     }
 
     /// Live exec check (read-only): same transport the password rotation
