@@ -132,25 +132,32 @@
           <Path>cmd /c (for %L in (C D E F) do @if exist %L:\drivers\NetKVM pnputil /add-driver %L:\drivers\NetKVM\w11\{arch}\netkvm.inf /install)</Path>
           <Description>Install NetKVM network driver (specialize)</Description>
         </RunSynchronousCommand>
+        <!-- OxDock is the only SSH server: no zip to expand, no server
+             install script, no ssh service to register. The media stages
+             tools/oxdock/oxdock.exe (guest-arch release binary from
+             https://github.com/jzombie/rust-oxdock) plus the rendered
+             tools/oxdock/ssh-proxy.oxdock script; order 8 copies both
+             offline from the USB, order 9 registers a SYSTEM scheduled
+             task (onstart: every boot, no logon needed — the previous
+             server ran headless the same way) and starts it NOW so SSH answers on
+             this boot without waiting for a reboot. The 0.0.0.0 bind is
+             load-bearing: a bare `-p 22:ssh-server` listens on loopback
+             only, unreachable from the QEMU slirp forward. Every Path
+             stays under the ~256 char WCM limit like the orders above. -->
         <RunSynchronousCommand wcm:action="add">
           <Order>8</Order>
-          <Path>cmd /c (for %L in (C D E F) do @if exist %L:\tools\{sshzip} powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%L:\tools\{sshzip}' -DestinationPath 'C:\Program Files\OpenSSH' -Force")</Path>
-          <Description>Expand OpenSSH Server zip offline from USB</Description>
+          <Path>cmd /c (mkdir C:\OxDock 2&gt;nul &amp; for %L in (C D E F) do @if exist %L:\tools\oxdock\oxdock.exe copy %L:\tools\oxdock\* C:\OxDock\ /y &amp; exit 0)</Path>
+          <Description>Stage OxDock SSH server offline from USB</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
           <Order>9</Order>
-          <Path>cmd /c (pushd "C:\Program Files\OpenSSH\{sshdir}" &amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File install-sshd.ps1 > C:\ssh-install.log 2>&amp;1 &amp; exit 0)</Path>
-          <Description>Install OpenSSH Server service offline (cwd-safe, logged)</Description>
+          <Path>cmd /c (schtasks /create /tn OxDockSsh /tr "C:\OxDock\oxdock.exe -p 0.0.0.0:22:ssh-server C:\OxDock\ssh-proxy.oxdock" /sc onstart /ru SYSTEM /rl highest /f &amp; schtasks /run /tn OxDockSsh &amp; exit 0)</Path>
+          <Description>Register and start OxDock SSH task (SYSTEM, onstart)</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
           <Order>10</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service -Name sshd"</Path>
-          <Description>Configure SSHD Automatic Startup</Description>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>11</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
-          <Description>Configure Firewall for SSH</Description>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "New-NetFirewallRule -Name 'OxDock-SSH-In-TCP' -DisplayName 'OxDock SSH (Inbound)' -Enabled True -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any"</Path>
+          <Description>Configure Firewall for OxDock SSH</Description>
         </RunSynchronousCommand>
         <!-- Headless hard stops (Ctrl-C, SIGKILL, QEMU crash) dirty the
              guest; the next boot must NOT park at "Diagnosing your PC" /
@@ -160,46 +167,46 @@
              step applies the same policy but only when Setup reaches
              Ready, which an early stop never does. -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>12</Order>
+          <Order>11</Order>
           <Path>cmd /c bcdedit /set {current} bootstatuspolicy IgnoreAllFailures</Path>
           <Description>Skip "Diagnosing your PC" after unclean stops</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>13</Order>
+          <Order>12</Order>
           <Path>cmd /c bcdedit /set {current} recoveryenabled No</Path>
           <Description>WinRE off by default (fail fast, not repair)</Description>
         </RunSynchronousCommand>
         <!-- Firewall off here (measured live 2026-10-04): with it on,
-             inbound SSH sat blocked ~27s AFTER sshd was already listening;
+             inbound SSH sat blocked ~27s AFTER the server was already listening;
              off, the banner answers within seconds of bind. Slirp NAT is
              the real gate — only the SSH port is forwarded — so in-guest
              inbound filtering is pure latency here. The NLA profile force
              and the service diet live post-READY (one SSH call) instead of
              serializing PowerShell cold starts into specialize. -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>14</Order>
+          <Order>13</Order>
           <Path>cmd /c netsh advfirewall set allprofiles state off</Path>
           <Description>Firewall off (slirp NAT is the gate; saves ~30s to SSH)</Description>
         </RunSynchronousCommand>
         <!-- Pre-SSH workload trim (reg writes only: no PowerShell cold
              start, same cost class as orders 1-6). wuauserv, WSearch, and
-             SysMain contend for CPU/disk through first boot while sshd
-             waits to start; disabling here moves relief before first SSH
+             SysMain contend for CPU/disk through first boot while the SSH
+             server waits to start; disabling here moves relief before first SSH
              instead of after. End states stay owned post-READY (wuauserv
              by the updates flag, the rest by the headless diet), so these
              are timing, never policy. -->
         <RunSynchronousCommand wcm:action="add">
-          <Order>15</Order>
+          <Order>14</Order>
           <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\wuauserv" /v Start /t REG_DWORD /d 4 /f</Path>
           <Description>Windows Update off until post-READY owns the end state</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>16</Order>
+          <Order>15</Order>
           <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\WSearch" /v Start /t REG_DWORD /d 4 /f</Path>
           <Description>Search indexing off until the headless diet re-asserts</Description>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
-          <Order>17</Order>
+          <Order>16</Order>
           <Path>cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Services\SysMain" /v Start /t REG_DWORD /d 4 /f</Path>
           <Description>SysMain prefetch off until the headless diet re-asserts</Description>
         </RunSynchronousCommand>

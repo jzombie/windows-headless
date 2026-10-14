@@ -58,32 +58,35 @@ impl Architecture {
         }
     }
 
-    /// Win32-OpenSSH release zip for this guest arch
-    /// (`OpenSSH-Win64.zip` vs `OpenSSH-ARM64.zip`; both extract to a
-    /// same-named subdir holding `install-sshd.ps1`).
-    pub fn openssh_zip_name(&self) -> &'static str {
+    /// OxDock release tarball for this guest arch
+    /// (`oxdock-x86_64-pc-windows-msvc.tar.gz` vs
+    /// `oxdock-aarch64-pc-windows-msvc.tar.gz`; both unpack to a single
+    /// `oxdock.exe`). Replaces the Win32-OpenSSH zip slot: the guest runs
+    /// no OpenSSH at all.
+    pub fn oxdock_asset_name(&self) -> &'static str {
         match self {
-            Architecture::Amd64 => "OpenSSH-Win64.zip",
-            Architecture::Arm64 => "OpenSSH-ARM64.zip",
+            Architecture::Amd64 => "oxdock-x86_64-pc-windows-msvc.tar.gz",
+            Architecture::Arm64 => "oxdock-aarch64-pc-windows-msvc.tar.gz",
         }
     }
 
-    /// Expected SHA-256 of [`Self::openssh_zip_name`] at
-    /// [`crate::pins::OPENSSH_RELEASE_TAG`]. Strict per-arch mapping — no
+    /// Expected SHA-256 of [`Self::oxdock_asset_name`] at
+    /// [`crate::pins::OXDOCK_RELEASE_TAG`]. Strict per-arch mapping — no
     /// fallback, no caller-side `if`: the wrong hash for the wrong arch is
     /// a guaranteed mismatch, which is exactly what we want.
-    pub fn openssh_sha256(&self) -> &'static str {
+    pub fn oxdock_sha256(&self) -> &'static str {
         match self {
-            Architecture::Amd64 => crate::pins::OPENSSH_SHA256_WIN64,
-            Architecture::Arm64 => crate::pins::OPENSSH_SHA256_ARM64,
+            Architecture::Amd64 => crate::pins::OXDOCK_SHA256_WIN64,
+            Architecture::Arm64 => crate::pins::OXDOCK_SHA256_ARM64,
         }
     }
 
-    pub fn openssh_extract_dir(&self) -> &'static str {
-        match self {
-            Architecture::Amd64 => "OpenSSH-Win64",
-            Architecture::Arm64 => "OpenSSH-ARM64",
-        }
+    /// ISO-cache slot for the extracted guest `oxdock.exe`
+    /// (`oxdock-amd64.exe` vs `oxdock-arm64.exe`): `setup`/`fetch`
+    /// download the release tarball, verify it, and unpack the exe here;
+    /// `build-media` stages it onto the installer USB.
+    pub fn oxdock_exe_cache_name(&self) -> String {
+        format!("oxdock-{}.exe", self.as_xml_str())
     }
 
     /// NetKVM driver dir inside virtio-win.iso (`NetKVM/w11/<this>`).
@@ -226,8 +229,6 @@ impl VmConfig {
 
         let tpl = include_str!("../templates/autounattend.xml");
         tpl.replace("{arch}", arch)
-            .replace("{sshzip}", self.arch.openssh_zip_name())
-            .replace("{sshdir}", self.arch.openssh_extract_dir())
             .replace("{pkt}", PUBLIC_KEY_TOKEN)
             .replace("{locale}", &locale)
             .replace("{user}", &user)
@@ -235,6 +236,35 @@ impl VmConfig {
             .replace("{tz}", &tz)
             .replace("{auto_logon_xml}", &auto_logon_xml)
     }
+
+    // TODO: Use OxDock templating
+    /// Render the guest SSH-proxy script (`templates/oxdock-ssh-proxy.oxdock`)
+    /// with this config's credentials. The `{user}`/`{pass}` slots sit
+    /// inside DSL double-quoted strings, so values are escaped for that
+    /// syntax: backslash first (a lone `\x` escape drops the backslash),
+    /// then `"`. The default password needs no escaping; custom values
+    /// with quotes/backslashes stay intact through this.
+    pub fn render_oxdock_proxy_script(&self) -> String {
+        let tpl = include_str!("../templates/oxdock-ssh-proxy.oxdock");
+        tpl.replace("{user}", &escape_oxdock_string(&self.username))
+            .replace("{pass}", &escape_oxdock_string(&self.password))
+    }
+}
+
+// TODO: Import from OxDock; no mirroring
+/// Escape a value for a double-quoted OxDock DSL string: `\` doubles
+/// (else the next char's escape would eat it), `"` gains a backslash.
+/// Mirrors the DSL's `\"` / `\'` rule (any other `\x` keeps `x`, drops `\`).
+pub fn escape_oxdock_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -268,9 +298,14 @@ mod tests {
             "DisablePrivacyExperience",
             "BypassNRO",
             "HideOEMRegistrationScreen",
-            "install-sshd.ps1",
-            "OpenSSH-Win64",
-            "OpenSSH-Win64.zip",
+            // OxDock is the only SSH server: no OpenSSH zip, no
+            // install-sshd.ps1, no sshd service anywhere in the file.
+            "OxDock",
+            "oxdock.exe",
+            "ssh-proxy.oxdock",
+            "schtasks",
+            "0.0.0.0:22:ssh-server",
+            "OxDock-SSH-In-TCP",
             "New-NetFirewallRule",
             // SSH must be reachable regardless of NLA's profile verdict
             // (the profile wait is EventLog's gpsvc stall).
@@ -286,12 +321,21 @@ mod tests {
             "recoveryenabled No",
             // Headless diet lives post-READY (one SSH call), not here:
             // firewall off only (slirp NAT gates inbound; the firewall sat
-            // on port 22 ~27s after sshd bound — measured).
+            // on port 22 ~27s after the SSH server bound — measured).
             "netsh advfirewall set allprofiles state off",
             "NetworkLocation",
             "TimeZone",
         ] {
             assert!(xml.contains(marker), "missing {marker}");
+        }
+        for absent in [
+            "OpenSSH",
+            "install-sshd.ps1",
+            "sshd",
+            "{sshzip}",
+            "{sshdir}",
+        ] {
+            assert!(!xml.contains(absent), "OpenSSH leftover: {absent}");
         }
         assert!(xml.contains(r#"processorArchitecture="amd64""#));
         assert!(!xml.contains("<DiskConfiguration>"));
@@ -314,8 +358,8 @@ mod tests {
         // ERROR_INVALID_DATA (observed live). NB: DiskConfiguration
         // partitions also use <Order>; only RunSynchronous counts here.
         // Both command passes are checked: specialize carries the gpsvc
-        // repair, the SSH firewall commands, the recovery policy, and
-        // firewall-off (orders 1..=14; pre-SSH trim is 15..=17, the rest
+        // repair, the OxDock firewall commands, the recovery policy, and
+        // firewall-off (orders 1..=13; pre-SSH trim is 14..=16, the rest
         // of the service diet moved post-READY).
         for arch in [Architecture::Amd64, Architecture::Arm64] {
             let xml = VmConfig {
@@ -411,43 +455,79 @@ mod tests {
         assert!(!xml.contains("viostor"));
         assert!(!xml.contains("offlineServicing"));
         assert!(xml.contains("<AutoLogon>"));
-        // Arch-parameterized inputs: no placeholders leak, names match arch.
-        assert!(xml.contains("OpenSSH-ARM64.zip"));
-        assert!(xml.contains(r#"OpenSSH\OpenSSH-ARM64"#));
+        // SSH slot is OxDock, never OpenSSH: no zip/dir placeholders leak.
+        assert!(xml.contains("oxdock.exe"));
+        assert!(xml.contains("ssh-proxy.oxdock"));
+        assert!(!xml.contains("OpenSSH"));
+        assert!(!xml.contains("sshd"));
         assert!(!xml.contains("{sshzip}"));
         assert!(!xml.contains("{sshdir}"));
         assert!(!xml.contains("Win64"));
     }
 
     #[test]
-    fn openssh_names_follow_arch() {
-        for (arch, zip, dir) in [
-            (Architecture::Amd64, "OpenSSH-Win64.zip", "OpenSSH-Win64"),
-            (Architecture::Arm64, "OpenSSH-ARM64.zip", "OpenSSH-ARM64"),
+    fn oxdock_asset_names_follow_arch() {
+        for (arch, asset) in [
+            (Architecture::Amd64, "oxdock-x86_64-pc-windows-msvc.tar.gz"),
+            (Architecture::Arm64, "oxdock-aarch64-pc-windows-msvc.tar.gz"),
         ] {
-            let xml = VmConfig {
-                arch,
-                ..VmConfig::default()
-            }
-            .generate_unattend_xml();
-            assert!(xml.contains(zip), "missing {zip} for {arch:?}");
-            assert!(xml.contains(dir), "missing {dir} for {arch:?}");
+            assert_eq!(arch.oxdock_asset_name(), asset);
         }
     }
 
     #[test]
-    fn openssh_hashes_are_arch_strict() {
+    fn oxdock_hashes_are_arch_strict() {
         // Strict per-arch pins: distinct, 64 lowercase hex each, matching
         // the constants in pins.rs (bump rule: tag change updates both).
-        let win64 = Architecture::Amd64.openssh_sha256();
-        let arm64 = Architecture::Arm64.openssh_sha256();
-        assert_eq!(win64, crate::pins::OPENSSH_SHA256_WIN64);
-        assert_eq!(arm64, crate::pins::OPENSSH_SHA256_ARM64);
-        assert_ne!(win64, arm64);
-        for h in [win64, arm64] {
+        let x64 = Architecture::Amd64.oxdock_sha256();
+        let arm64 = Architecture::Arm64.oxdock_sha256();
+        assert_eq!(x64, crate::pins::OXDOCK_SHA256_WIN64);
+        assert_eq!(arm64, crate::pins::OXDOCK_SHA256_ARM64);
+        assert_ne!(x64, arm64);
+        for h in [x64, arm64] {
             assert_eq!(h.len(), 64, "not 64 hex chars: {h}");
             assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {h}");
         }
+    }
+
+    #[test]
+    fn oxdock_proxy_script_renders_credentials() {
+        let cfg = VmConfig::default();
+        let script = cfg.render_oxdock_proxy_script();
+        assert!(script.contains(&format!("username: \"{}\"", cfg.username)));
+        assert!(script.contains(&format!("password: \"{}\"", cfg.password)));
+        assert!(!script.contains("{user}"));
+        assert!(!script.contains("{pass}"));
+        // Proto structure survived the adaptation: admission control,
+        // exec/shell branching, ConPTY runners, audit lines.
+        for marker in [
+            "SSH_SERVE(",
+            "SEMAPHORE_NEW",
+            "SSH_DEQUEUE",
+            "SSH_PTY_RUN",
+            "SSH_PUMP_CHANNEL",
+            "cmd.exe",
+            "powershell.exe",
+            "[AUDIT]",
+        ] {
+            assert!(script.contains(marker), "missing {marker}");
+        }
+        assert!(!script.contains("orb"));
+    }
+
+    #[test]
+    fn oxdock_string_escaping_round_trips() {
+        assert_eq!(escape_oxdock_string("plain"), "plain");
+        assert_eq!(escape_oxdock_string("a\"b"), "a\\\"b");
+        assert_eq!(escape_oxdock_string("a\\b"), "a\\\\b");
+        // Rendered credentials with specials stay inside one DSL string.
+        let cfg = VmConfig {
+            username: "AdminUser".to_string(),
+            password: "P@ss\"\\word".to_string(),
+            ..VmConfig::default()
+        };
+        let script = cfg.render_oxdock_proxy_script();
+        assert!(script.contains("password: \"P@ss\\\"\\\\word\""));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //!
 //! Deliberately NOT here: socket names (already in [`crate::ipc`]),
 //! version pins ([`crate::pins`]), guest-arch mappings like firmware and
-//! OpenSSH zip names (data belonging with the arch table in
+//! OxDock asset names (data belonging with the arch table in
 //! [`crate::unattend`]), and `include_str!` source paths (must stay
 //! literal). Tests keep literals on purpose: they guard these values.
 //! Help text in `main.rs` repeats names for humans; those are docs.
@@ -24,6 +24,14 @@ pub const UNATTEND_XML: &str = "autounattend.xml";
 pub const PART_TXT_PATH: &str = "setup/part.txt";
 /// Driver/tools dir inside the installer USB tree.
 pub const TOOLS_DIR: &str = "tools";
+/// SSH server slot inside the installer USB tree: the guest-arch OxDock
+/// release binary (`oxdock.exe`, extracted from the release tarball) plus
+/// the rendered proxy script (`ssh-proxy.oxdock`).
+pub const OXDOCK_STAGE_DIR: &str = "tools/oxdock";
+/// Guest SSH server binary name inside [`OXDOCK_STAGE_DIR`].
+pub const OXDOCK_EXE_NAME: &str = "oxdock.exe";
+/// Rendered proxy script name inside [`OXDOCK_STAGE_DIR`] (and in `gen` output dirs).
+pub const OXDOCK_PROXY_SCRIPT: &str = "ssh-proxy.oxdock";
 /// Stage subdir for an explicit `--drivers-dir` tree.
 pub const DRIVERS_STAGE_DIR: &str = "drivers";
 

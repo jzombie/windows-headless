@@ -62,18 +62,21 @@ pub const DRIVERS_RELEASE_TAG: &str = "drivers-20261005";
 pub const VIRTIO_WIN_SHA256: &str =
     "303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d";
 
-/// Win32-OpenSSH release tag (note the four-part `10.0.0.0p2` — the
-/// three-part `v10.0.0p2` form 404s; tag list at
-/// <https://github.com/PowerShell/Win32-OpenSSH/releases>).
-pub const OPENSSH_RELEASE_TAG: &str = "10.0.0.0p2-Preview";
+/// OxDock release tag backing the guest SSH server: the Windows binaries
+/// come from this [rust-oxdock](https://github.com/jzombie/rust-oxdock)
+/// release instead of Win32-OpenSSH (the guest runs no OpenSSH at all).
+/// Verified 2026-10-14 against the release `SHA256SUMS` file.
+pub const OXDOCK_RELEASE_TAG: &str = "v0.28.0-alpha";
 
-/// SHA-256 of `OpenSSH-Win64.zip` at [`OPENSSH_RELEASE_TAG`], verified
-/// 2026-10-01 from the upstream release asset (valid zip, expected layout).
+/// SHA-256 of `oxdock-x86_64-pc-windows-msvc.tar.gz` at
+/// [`OXDOCK_RELEASE_TAG`], verified 2026-10-14 from the upstream release
+/// asset (valid tarball, single `oxdock.exe` inside).
 /// BUMP RULE: updating the tag MUST update both hashes.
-pub const OPENSSH_SHA256_WIN64: &str =
-    "23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5";
+pub const OXDOCK_SHA256_WIN64: &str =
+    "dc08e2c825c685473ae34254e31a4870ad961b41fde132029856e8d08a486e50";
 
-/// SHA-256 of `OpenSSH-ARM64.zip` at [`OPENSSH_RELEASE_TAG`], verified
-/// 2026-10-01 from the upstream release asset. Same bump rule as above.
-pub const OPENSSH_SHA256_ARM64: &str =
-    "698c6aec31c1dd0fb996206e8741f4531a97355686b5431ef347d531b07fcd42";
+/// SHA-256 of `oxdock-aarch64-pc-windows-msvc.tar.gz` at
+/// [`OXDOCK_RELEASE_TAG`], verified 2026-10-14 from the upstream release
+/// asset. Same bump rule as above.
+pub const OXDOCK_SHA256_ARM64: &str =
+    "3b1c8f66d122639a2e9181832c7e2b1a7a60e7c43bf69ea8d8df0b1bc63d2d57";

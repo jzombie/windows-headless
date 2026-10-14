@@ -174,6 +174,12 @@ pub fn cmd_gen(a: GenArgs) -> Result<()> {
     if let Some(dir) = a.unattend_dir {
         let f = DiskManager::ensure_unattend_dir(&dir, &xml)?;
         eprintln!("wrote {}", f.display());
+        // The guest SSH server needs its proxy script next to the answer
+        // file: same credentials, rendered from the same config.
+        let script = cfg.render_oxdock_proxy_script();
+        let script_path = dir.join(crate::paths::OXDOCK_PROXY_SCRIPT);
+        std::fs::write(&script_path, script)?;
+        eprintln!("wrote {}", script_path.display());
     } else {
         println!("{xml}");
     }
@@ -189,7 +195,9 @@ pub struct BuildMediaArgs {
     pub arch: Option<Architecture>,
     pub virtio_iso: Option<PathBuf>,
     pub drivers_dir: Option<PathBuf>,
-    pub openssh_zip: Option<PathBuf>,
+    /// Guest SSH server binary (Windows `oxdock.exe` for `--arch`).
+    /// Default: `<iso-cache>/oxdock-<arch>.exe` (`setup` fetches it).
+    pub oxdock_exe: Option<PathBuf>,
     pub out: Option<PathBuf>,
     pub wimlib_bin: Option<PathBuf>,
     pub username: String,
@@ -211,6 +219,7 @@ pub struct BuildArgs {
     pub locale: String,
     pub out: Option<PathBuf>,
     pub force: bool,
+    pub oxdock_exe: Option<PathBuf>,
 }
 
 #[cfg(feature = "downloader")]
@@ -227,7 +236,7 @@ pub async fn cmd_build(a: BuildArgs) -> Result<PathBuf> {
         arch: a.arch,
         virtio_iso: None,
         drivers_dir: None,
-        openssh_zip: None,
+        oxdock_exe: a.oxdock_exe,
         out: Some(out.clone()),
         wimlib_bin: None,
         username: a.username,
@@ -288,19 +297,19 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
     eprintln!("building installer media from {} ...", win_iso.display());
     // Driver inputs default to the ISO cache (`setup` fetches them):
     // explicit flags win, else `<iso-cache>/virtio-win.iso` and the
-    // per-arch OpenSSH zip. Missing files bail with the fix
+    // per-arch OxDock exe. Missing files bail with the fix
     // (`setup`), not a bare NotFound.
     #[cfg(feature = "downloader")]
     let iso_cache = crate::downloader::iso_cache_dir()?;
-    let openssh_zip = match a.openssh_zip.map(expand_tilde) {
+    let oxdock_exe = match a.oxdock_exe.map(expand_tilde) {
         Some(p) => p,
         None => {
             #[cfg(feature = "downloader")]
             {
-                let p = iso_cache.join(arch.openssh_zip_name());
+                let p = iso_cache.join(arch.oxdock_exe_cache_name());
                 if !p.exists() {
                     anyhow::bail!(
-                        "{} missing (run `setup` first, or pass --openssh-zip)",
+                        "{} missing (run `setup` first, or pass --oxdock-exe)",
                         p.display()
                     );
                 }
@@ -309,18 +318,28 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
             }
             #[cfg(not(feature = "downloader"))]
             {
-                anyhow::bail!("pass --openssh-zip <zip>");
+                anyhow::bail!("pass --oxdock-exe <exe>");
             }
         }
     };
-    let xml = VmConfig {
+    let cfg = VmConfig {
         username: a.username.clone(),
         password: a.password.clone(),
         locale: a.locale.clone(),
         arch,
         ..VmConfig::default()
-    }
-    .generate_unattend_xml();
+    };
+    let xml = cfg.generate_unattend_xml();
+    // The guest SSH server is OxDock: stage the release exe plus the
+    // rendered proxy script (same credentials as the answer file) under
+    // tools/oxdock/. The exe bytes are hashed for the provenance sidecar.
+    let oxdock_bytes =
+        std::fs::read(&oxdock_exe).with_context(|| format!("read {}", oxdock_exe.display()))?;
+    let oxdock_sha256 = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(&oxdock_bytes))
+    };
+    let proxy_script = cfg.render_oxdock_proxy_script();
     // Drivers: explicit tree wins; else extract NetKVM from the
     // virtio ISO in-crate (pure Rust, no host tools). Remember which
     // ISO was used for the provenance sidecar (`None` = --drivers-dir).
@@ -332,8 +351,20 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
             PART_TXT.as_bytes().to_vec(),
         ),
         (
-            format!("{}/{}", crate::paths::TOOLS_DIR, arch.openssh_zip_name()),
-            std::fs::read(&openssh_zip)?,
+            format!(
+                "{}/{}",
+                crate::paths::OXDOCK_STAGE_DIR,
+                crate::paths::OXDOCK_EXE_NAME
+            ),
+            oxdock_bytes,
+        ),
+        (
+            format!(
+                "{}/{}",
+                crate::paths::OXDOCK_STAGE_DIR,
+                crate::paths::OXDOCK_PROXY_SCRIPT
+            ),
+            proxy_script.into_bytes(),
         ),
     ];
     match (
@@ -422,6 +453,7 @@ pub async fn cmd_build_media(a: BuildMediaArgs) -> Result<()> {
         virtio_used.as_deref(),
         &a.username,
         &a.locale,
+        &oxdock_sha256,
     )?;
     std::fs::remove_file(&wim_path)?;
     // List ISO tree paths without reading content — files are streamed
@@ -1433,7 +1465,7 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
                     arch: None,
                     virtio_iso: None,
                     drivers_dir: None,
-                    openssh_zip: None,
+                    oxdock_exe: None,
                     out: Some(usb_image.clone()),
                     wimlib_bin: None,
                     username: p.username.clone(),
@@ -2330,11 +2362,29 @@ pub struct FetchArgs {
     pub virtio_iso_url: Option<String>,
     pub dir: Option<PathBuf>,
     pub virtio_sha256: Option<String>,
-    pub openssh: bool,
     pub arch: Option<Architecture>,
     /// Re-download even valid cache entries (for URL-rotated artifacts
     /// like the Eval ISO, whose slot name can't see upstream changes).
     pub force: bool,
+}
+
+/// Fetch the guest SSH server tarball for `arch` into `dir`, verify it
+/// against the arch-strict pin, and unpack `oxdock.exe` into the cache
+/// exe slot `build-media` stages onto the installer USB.
+#[cfg(feature = "downloader")]
+pub async fn fetch_oxdock_exe(dir: &Path, arch: Architecture, force: bool) -> Result<PathBuf> {
+    use crate::downloader;
+    let tarball = dir.join(arch.oxdock_asset_name());
+    fetch_one(
+        &downloader::oxdock_asset_url(arch),
+        &tarball,
+        Some(arch.oxdock_sha256()),
+        force,
+    )
+    .await?;
+    let exe = dir.join(arch.oxdock_exe_cache_name());
+    downloader::extract_oxdock_exe(&tarball, &exe)?;
+    Ok(exe)
 }
 
 #[cfg(feature = "downloader")]
@@ -2383,17 +2433,11 @@ pub async fn cmd_fetch(a: FetchArgs) -> Result<()> {
         }
     };
     items.push((virtio_url, crate::paths::VIRTIO_ISO, virtio_hash));
-    if a.openssh {
-        let arch = resolve_arch(a.arch);
-        items.push((
-            downloader::openssh_zip_url(arch),
-            arch.openssh_zip_name(),
-            Some(arch.openssh_sha256().to_string()),
-        ));
-    }
     for (url, name, hash) in items {
         fetch_one(&url, &dir.join(name), hash.as_deref(), a.force).await?;
     }
+    // Guest SSH server (required input, like virtio): no flag, no skip.
+    fetch_oxdock_exe(&dir, resolve_arch(a.arch), a.force).await?;
     Ok(())
 }
 
@@ -2425,13 +2469,7 @@ pub async fn cmd_setup(virtio_iso_url: Option<String>, arch: Option<Architecture
         false,
     )
     .await?;
-    fetch_one(
-        &downloader::openssh_zip_url(arch),
-        &dir.join(arch.openssh_zip_name()),
-        Some(arch.openssh_sha256()),
-        false,
-    )
-    .await?;
+    fetch_oxdock_exe(&dir, arch, false).await?;
     eprintln!("setup complete (Windows ISO still yours: pass --win-iso to build-media)");
     Ok(())
 }
@@ -2449,13 +2487,14 @@ pub async fn cmd_fetch_wimlib(
 }
 
 /// Verify every pinned external artifact WITHOUT downloading archives or
-/// installing anything (CI-friendly: KBs of metadata, plus two ~5 MB OpenSSH
-/// zips). Checks, per artifact:
+/// installing anything (CI-friendly: KBs of metadata, plus two OxDock
+/// guest-server tarballs). Checks, per artifact:
 /// 1. the release asset exists (availability for that environment), and
 /// 2. its hash matches the code-pinned expectation.
 ///
 /// Hash-only sources are preferred wherever they exist (`SHA256SUMS.txt`,
-/// virtio `.sha256` sidecar); only OpenSSH (no upstream sums) downloads the
+/// virtio `.sha256` sidecar); only OxDock (small tarballs, and the check
+/// additionally proves each one unpacks to `oxdock.exe`) downloads the
 /// payload itself. Prints one line per check; returns an error summarizing
 /// all failures so a single CI run reports everything at once.
 #[cfg(feature = "downloader")]
@@ -2551,22 +2590,29 @@ pub async fn cmd_verify_pins() -> Result<()> {
         }
         Err(e) => failures.push(format!("virtio-win.iso: release lookup failed: {e:#}")),
     }
-    // OpenSSH: no upstream sums — download both zips (~5 MB) to a tempdir
-    // and hash against the arch-strict pins.
+    // OxDock guest server: download both arch tarballs to a tempdir, hash
+    // against the arch-strict pins, and prove each one unpacks to oxdock.exe.
     let tmp = tempfile::tempdir().context("verify-pins tempdir")?;
     for arch in [crate::Architecture::Amd64, crate::Architecture::Arm64] {
-        let label = format!("{} ({})", arch.openssh_zip_name(), arch.as_xml_str());
-        let dest = tmp.path().join(arch.openssh_zip_name());
-        match downloader::download(&downloader::openssh_zip_url(arch), &dest).await {
+        let label = format!("{} ({})", arch.oxdock_asset_name(), arch.as_xml_str());
+        let dest = tmp.path().join(arch.oxdock_asset_name());
+        match downloader::download(&downloader::oxdock_asset_url(arch), &dest).await {
             Ok(actual) => {
-                let _ = std::fs::remove_file(&dest);
-                if actual.eq_ignore_ascii_case(arch.openssh_sha256()) {
-                    ok(&label);
-                } else {
+                if !actual.eq_ignore_ascii_case(arch.oxdock_sha256()) {
                     failures.push(format!(
                         "{label}: downloaded hash {actual} != pinned {}",
-                        arch.openssh_sha256()
+                        arch.oxdock_sha256()
                     ));
+                    continue;
+                }
+                let exe = tmp.path().join(arch.oxdock_exe_cache_name());
+                match downloader::extract_oxdock_exe(&dest, &exe) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&dest);
+                        let _ = std::fs::remove_file(&exe);
+                        ok(&label);
+                    }
+                    Err(e) => failures.push(format!("{label}: no oxdock.exe inside: {e:#}")),
                 }
             }
             Err(e) => failures.push(format!("{label}: download failed: {e:#}")),
@@ -3690,8 +3736,9 @@ mod tests {
                     wimlib_tag: "wimlib-v1.14.5-27".to_string(),
                     virtio_iso_name: "virtio-win.iso".to_string(),
                     virtio_sha256: None,
-                    openssh_zip_name: "OpenSSH-ARM64.zip".to_string(),
-                    openssh_release_tag: "t".to_string(),
+                    oxdock_asset: "oxdock-aarch64-pc-windows-msvc.tar.gz".to_string(),
+                    oxdock_release_tag: "t".to_string(),
+                    oxdock_exe_sha256: "e".to_string(),
                 },
                 guest: GuestParams {
                     arch: "arm64".to_string(),

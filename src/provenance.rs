@@ -71,8 +71,18 @@ pub struct DependencyPins {
     pub wimlib_tag: String,
     pub virtio_iso_name: String,
     pub virtio_sha256: Option<String>,
-    pub openssh_zip_name: String,
-    pub openssh_release_tag: String,
+    /// Guest SSH server release tarball (per guest arch), from
+    /// <https://github.com/jzombie/rust-oxdock>. The guest runs no
+    /// OpenSSH at all — this is the only SSH software in the pipeline.
+    /// `#[serde(default)]` keeps pre-OxDock log lines parsing.
+    #[serde(default)]
+    pub oxdock_asset: String,
+    #[serde(default)]
+    pub oxdock_release_tag: String,
+    /// SHA-256 of the exact `oxdock.exe` bytes staged onto the installer
+    /// USB (extracted from the tarball above).
+    #[serde(default)]
+    pub oxdock_exe_sha256: String,
 }
 
 /// Answer-file parameters (usernames/locales only — never the password).
@@ -249,7 +259,7 @@ impl Provenance {
     /// extracted `install.wim` (queried via `wimlib-imagex info`, then the
     /// caller deletes it). Slow steps (ISO hash) print progress.
     /// Best-effort sub-steps degrade to `None`/empty — only hard I/O
-    /// errors propagate. Nine params is the honest shape (every input is
+    /// errors propagate. Ten params is the honest shape (every input is
     /// recorded); grouping them would hide what the sidecar captures.
     #[allow(clippy::too_many_arguments)]
     pub fn gather(
@@ -262,6 +272,7 @@ impl Provenance {
         virtio_iso: Option<&Path>,
         username: &str,
         locale: &str,
+        oxdock_exe_sha256: &str,
     ) -> Result<Self> {
         let meta = std::fs::metadata(win_iso)?;
         let file_name = win_iso
@@ -301,8 +312,9 @@ impl Provenance {
                 wimlib_tag: wimlib_tag.to_string(),
                 virtio_iso_name,
                 virtio_sha256,
-                openssh_zip_name: arch.openssh_zip_name().to_string(),
-                openssh_release_tag: crate::pins::OPENSSH_RELEASE_TAG.to_string(),
+                oxdock_asset: arch.oxdock_asset_name().to_string(),
+                oxdock_release_tag: crate::pins::OXDOCK_RELEASE_TAG.to_string(),
+                oxdock_exe_sha256: oxdock_exe_sha256.to_string(),
             },
             guest: GuestParams {
                 arch: arch.as_xml_str().to_string(),
@@ -412,8 +424,9 @@ mod tests {
                 wimlib_tag: "wimlib-v1.14.5-27".to_string(),
                 virtio_iso_name: "virtio-win.iso".to_string(),
                 virtio_sha256: Some("def".to_string()),
-                openssh_zip_name: "OpenSSH-ARM64.zip".to_string(),
-                openssh_release_tag: crate::pins::OPENSSH_RELEASE_TAG.to_string(),
+                oxdock_asset: "oxdock-aarch64-pc-windows-msvc.tar.gz".to_string(),
+                oxdock_release_tag: crate::pins::OXDOCK_RELEASE_TAG.to_string(),
+                oxdock_exe_sha256: "abc123".to_string(),
             },
             guest: GuestParams {
                 arch: "arm64".to_string(),

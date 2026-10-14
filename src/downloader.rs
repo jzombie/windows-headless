@@ -8,14 +8,48 @@ use std::path::Path;
 pub const VIRTIO_RELEASE_REPO: &str = crate::pins::RELEASE_REPO;
 pub const VIRTIO_RELEASE_TAG: &str = crate::pins::DRIVERS_RELEASE_TAG;
 pub const VIRTIO_RELEASE_ASSET: &str = crate::paths::VIRTIO_ISO;
-/// Offline SSH installer, Microsoft release asset (documented source;
-/// candidate for our own releases later). Per guest arch: Win64 vs ARM64.
-pub fn openssh_zip_url(arch: crate::unattend::Architecture) -> String {
+/// Guest SSH server tarball: OxDock release asset from
+/// <https://github.com/jzombie/rust-oxdock> (per guest arch: x86_64 vs
+/// aarch64 Windows MSVC). The guest runs no OpenSSH at all — this is the
+/// only SSH software in the pipeline.
+pub fn oxdock_asset_url(arch: crate::unattend::Architecture) -> String {
     format!(
-        "https://github.com/PowerShell/Win32-OpenSSH/releases/download/{}/{}",
-        crate::pins::OPENSSH_RELEASE_TAG,
-        arch.openssh_zip_name()
+        "https://github.com/jzombie/rust-oxdock/releases/download/{}/{}",
+        crate::pins::OXDOCK_RELEASE_TAG,
+        arch.oxdock_asset_name()
     )
+}
+
+/// Unpack the single `oxdock.exe` out of a verified release tarball into
+/// `dest` (the ISO-cache exe slot `build-media` stages onto the USB).
+/// Fails closed when the tarball holds no such entry — a wrong-asset
+/// download must never stage a half-named binary.
+pub fn extract_oxdock_exe(tarball: &Path, dest: &Path) -> Result<()> {
+    use std::ffi::OsStr;
+    let file =
+        std::fs::File::open(tarball).with_context(|| format!("open {}", tarball.display()))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let entries = archive
+        .entries()
+        .with_context(|| format!("read tar index of {}", tarball.display()))?;
+    for entry in entries {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.file_name() == Some(OsStr::new("oxdock.exe")) {
+            entry
+                .unpack(dest)
+                .with_context(|| format!("unpack oxdock.exe to {}", dest.display()))?;
+            eprintln!(
+                "oxdock: {} -> {} ({} bytes)",
+                tarball.display(),
+                dest.display(),
+                std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
+            );
+            return Ok(());
+        }
+    }
+    anyhow::bail!("oxdock.exe not found in {}", tarball.display())
 }
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 

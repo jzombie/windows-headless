@@ -40,7 +40,7 @@ enum Cmd {
         autologon: bool,
         #[arg(long)]
         unattend_dir: Option<PathBuf>,
-        /// Guest arch (default: host arch). Selects the OpenSSH zip names.
+        /// Guest arch (default: host arch). Selects the OxDock asset names.
         #[arg(long)]
         arch: Option<Architecture>,
     },
@@ -197,7 +197,7 @@ enum Cmd {
         #[arg(long)]
         win_iso: PathBuf,
         /// Guest arch (default: host arch — HVF/KVM require host == guest).
-        /// Selects the OpenSSH zip, NetKVM driver dir, and answer-file arch.
+        /// Selects the OxDock asset, NetKVM driver dir, and answer-file arch.
         #[arg(long)]
         arch: Option<Architecture>,
         /// virtio-win ISO (NetKVM drivers extracted in-crate, pure Rust).
@@ -208,10 +208,10 @@ enum Cmd {
         /// preserved under `drivers/`). Wins over `--virtio-iso`.
         #[arg(long)]
         drivers_dir: Option<PathBuf>,
-        /// OpenSSH zip path (offline SSH install; Win64 vs ARM64 by --arch).
-        /// Default: `<iso-cache>/<name>` (`setup` fetches it).
+        /// Guest SSH server binary (Windows `oxdock.exe` for --arch).
+        /// Default: `<iso-cache>/oxdock-<arch>.exe` (`setup` fetches it).
         #[arg(long)]
-        openssh_zip: Option<PathBuf>,
+        oxdock_exe: Option<PathBuf>,
         /// Output image (default: project cache `media/winusb.dmg`).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -308,7 +308,7 @@ enum Cmd {
         readme: Option<PathBuf>,
     },
     /// One-shot host setup: portable QEMU + portable wimlib + virtio-win
-    /// ISO + OpenSSH zip, all into the project cache. After this,
+    /// ISO + OxDock guest-server exe, all into the project cache. After this,
     /// `build-media` needs only `--win-iso` (the user-supplied Windows ISO).
     /// Re-runs are cheap (everything already-cached is skipped).
     #[cfg(feature = "downloader")]
@@ -318,7 +318,7 @@ enum Cmd {
         #[arg(long)]
         virtio_iso_url: Option<String>,
         /// Guest arch (default: host arch — HVF/KVM require host == guest).
-        /// Selects the OpenSSH zip (Win64 vs ARM64) and NetKVM driver dir.
+        /// Selects the OxDock asset (x86_64 vs aarch64 Windows) and NetKVM driver dir.
         #[arg(long)]
         arch: Option<Architecture>,
     },
@@ -348,6 +348,10 @@ enum Cmd {
         password: String,
         #[arg(long, default_value = "en-US")]
         locale: String,
+        /// Guest SSH server binary (Windows `oxdock.exe` for --arch).
+        /// Default: `<iso-cache>/oxdock-<arch>.exe` (`setup` fetches it).
+        #[arg(long)]
+        oxdock_exe: Option<PathBuf>,
     },
     /// Download a portable QEMU release into the project cache.
     #[cfg(feature = "downloader")]
@@ -368,7 +372,7 @@ enum Cmd {
     },
     /// Download ISOs into the cache dir, skipping what is already present.
     /// virtio-win.iso comes from our own releases (no Fedora bot-wall);
-    /// OpenSSH-ARM64.zip from Microsoft. If Fedora's bot-wall blocks
+    /// oxdock-*.tar.gz from the OxDock releases. If Fedora's bot-wall blocks
     /// scripted downloads, fetch the file in a real browser and save it
     /// as `<dir>/virtio-win.iso` (or pass any mirror via --virtio-iso-url)
     /// — `fetch` validates and keeps it.
@@ -393,10 +397,7 @@ enum Cmd {
         /// (default: the release `.sha256` sidecar).
         #[arg(long)]
         virtio_sha256: Option<String>,
-        /// Also fetch the OpenSSH zip (Microsoft release asset, per --arch).
-        #[arg(long, default_value_t = true)]
-        openssh: bool,
-        /// Guest arch (default: host arch). Selects the OpenSSH zip.
+        /// Guest arch (default: host arch). Selects the OxDock asset.
         #[arg(long)]
         arch: Option<Architecture>,
         /// Re-download even valid cache entries (needed when a time-limited
@@ -406,7 +407,7 @@ enum Cmd {
     },
     /// Verify every pinned external artifact (availability + hash) WITHOUT
     /// downloading archives or installing anything. CI-friendly: KBs of
-    /// release metadata, plus two ~5 MB OpenSSH zips. Covers ALL platforms
+    /// release metadata, plus two OxDock guest-server tarballs. Covers ALL platforms
     /// (macos-arm64, linux-x86_64, linux-aarch64) from any single runner —
     /// no per-OS matrix needed. Fails non-zero listing every mismatch so one
     /// run reports everything.
@@ -480,6 +481,7 @@ async fn async_main() -> Result<()> {
             username,
             password,
             locale,
+            oxdock_exe,
         } => {
             // Full chain with proven defaults: media, then install, settle,
             // golden snapshot — then exit. Never a shell here: `build` must
@@ -493,6 +495,7 @@ async fn async_main() -> Result<()> {
                 username: username.clone(),
                 password: password.clone(),
                 locale,
+                oxdock_exe,
             })
             .await?;
             cmd_install(
@@ -537,7 +540,7 @@ async fn async_main() -> Result<()> {
             arch,
             virtio_iso,
             drivers_dir,
-            openssh_zip,
+            oxdock_exe,
             out,
             force,
             wimlib_bin,
@@ -550,7 +553,7 @@ async fn async_main() -> Result<()> {
                 arch,
                 virtio_iso,
                 drivers_dir,
-                openssh_zip,
+                oxdock_exe,
                 out,
                 wimlib_bin,
                 username,
@@ -682,7 +685,6 @@ async fn async_main() -> Result<()> {
             virtio_iso_url,
             dir,
             virtio_sha256,
-            openssh,
             arch,
             force,
         } => {
@@ -692,7 +694,6 @@ async fn async_main() -> Result<()> {
                 virtio_iso_url,
                 dir,
                 virtio_sha256,
-                openssh,
                 arch,
                 force,
             })

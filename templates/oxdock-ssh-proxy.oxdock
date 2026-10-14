@@ -1,0 +1,151 @@
+# windows-headless OxDock SSH server (PROTOTYPE).
+#
+# Modified from https://github.com/jzombie/rust-oxdock/blob/main/scripts/proto.ssh-proxy.oxdock
+# to run INSIDE the Windows guest as a replacement for Win32-OpenSSH:
+# it IS the SSH server the host's QEMU slirp forward (host:2232 -> guest:22)
+# connects to. No sshd, no install-sshd.ps1, no OpenSSH firewall rule.
+#
+# Differences from the proto script:
+# - Credentials are build-time placeholders ({user} / {pass}), rendered by
+#   `VmConfig::render_oxdock_proxy_script` (same convention as
+#   templates/autounattend.xml). Never commit a rendered copy: it carries
+#   the guest password.
+# - No `key_path`: the host key is ephemeral in-memory. The host client
+#   (src/ssh.rs) accepts it blind (loopback NAT to our own guest), so a
+#   per-boot key is fine and leaves no key file on disk.
+# - No proxy hop to another host. Each session spawns a LOCAL process under
+#   a ConPTY (portable-pty; SSH_PTY_RUN handles Windows consoles):
+#   - exec sessions ($sess.command non-empty: `reg query ...`, `bcdedit`,
+#     `sc ...`, `net user ...` from the host probes) run through
+#     `cmd.exe /c`, which is the syntax those commands are written in.
+#     The command is also relayed as SSH_COMMAND for observability.
+#   - shell sessions (interactive logins, `prove_interactive_shell`) get
+#     `powershell.exe -NoLogo -NoProfile`.
+#   Branching (not one shared argv mutated in an IF) is structural:
+#   braced blocks snapshot variables and revert them on exit, so an
+#   IF-assigned argv would not survive to the PTY_RUN below it. Each
+#   branch therefore owns its PTY_RUN + PUMP_CHANNEL + AWAITs, with the
+#   block-scoped ENV relay at the worker top (an IF branch would revert
+#   it on exit — same reason as in the proto).
+# - Admission control, audit lines, and the intentionally-commented
+#   TIMEOUT are verbatim from the proto.
+#
+# Guest launch (registered as a SYSTEM scheduled task at specialize time,
+# see templates/autounattend-oxdock.xml). The 0.0.0.0 host is load-bearing:
+# a bare `-p 22:ssh-server` binds loopback only, which the QEMU slirp
+# forward (guest NIC 10.0.2.15) can never reach:
+#   C:\OxDock\oxdock.exe -p 0.0.0.0:22:ssh-server C:\OxDock\ssh-proxy.oxdock
+
+IMPORT [STD, SSH]
+WORKSPACE LOCAL
+
+# 1. Ephemeral server setup. {user} / {pass} are replaced at media-build
+# time; the surrounding double quotes are DSL string syntax, so rendered
+# credentials are escaped for it (see render_oxdock_proxy_script).
+LET $server: SSH_SERVE_INFO = SSH_SERVE(
+    "ssh-server", {
+        username: "{user}",
+        password: "{pass}"
+    }
+)
+
+ECHO "SSH proxy listening on {{ $server.addr }}"
+
+# Admission control: a counting semaphore replaces the racy
+# check-then-act counter. Permits release on worker return through
+# ordinary scope teardown, so no decrement code exists or is needed.
+# Never CANCEL/TIMEOUT a permit-holding worker: surviving the worker
+# is the only slow-leak path, and the TIMEOUT below stays commented.
+LET $max_conns: INT = 10
+LET $sem: SEMAPHORE = SEMAPHORE_NEW($max_conns)
+
+# 2. Master Accept Loop
+LET $run: BOOL = true
+WHILE $run {
+    # Dequeue authenticated session metadata
+    LET $deq_task: HANDLE = ASYNC { SSH_DEQUEUE($server.server) }
+    LET $sess: SSH_DEQUEUE_INFO = AWAIT $deq_task
+
+    # Non-blocking admission: a miss carries no permit key, so branch
+    # on held. Counts below derive from the semaphore (observability
+    # only); nothing here checks then acts.
+    LET $acq: MAP<held: BOOL, permit?: PERMIT> = SEMAPHORE_TRY_ACQUIRE($sem)
+    IF !$acq.held {
+        LET $avail: INT = SEMAPHORE_AVAILABLE($sem)
+        LET $active: INT = $max_conns - $avail
+        ECHO "[REJECT] Capacity reached ({{ $active }}/{{ $max_conns }}). Dropping connection from {{ $sess.addr }}"
+        # Dropping $sess without invoking SSH_PUMP_CHANNEL closes the channel wire cleanly
+    } ELSE {
+        LET $permit: PERMIT = $acq.permit
+
+        # Spawn isolated handler task per active session. The permit
+        # rides scope capture into the worker; the parent's clone drops
+        # at this iteration's end, the worker's on task return.
+        ASYNC {
+            # Relay session identity to the child: block-scoped ENV
+            # rides into SSH_PTY_RUN's spawn and reverts at block exit.
+            # (ENV must sit in this scope: an IF branch would revert it
+            # on exit.)
+            ENV SSH_USER="{{ $sess.username }}"
+            ENV SSH_CLIENT="{{ $sess.addr }}"
+            ENV SSH_SERVER="{{ $server.addr }}"
+
+            LET $avail: INT = SEMAPHORE_AVAILABLE($sem)
+            LET $active: INT = $max_conns - $avail
+            ECHO "[AUDIT] Connected: {{ $sess.username }} from {{ $sess.addr }} (active: {{ $active }}/{{ $max_conns }})"
+
+            # Exec sessions carry the host's command (cmd.exe syntax:
+            # `reg query ... & echo ...`, `bcdedit`, `sc`, `net user`);
+            # shells carry an empty command. One branch per shape: block
+            # scope reverts variable writes on exit, so the argv cannot
+            # be composed above and shared below.
+            IF $sess.command != "" {
+                ENV SSH_COMMAND="{{ $sess.command }}"
+                LET $c_in: PIPE   # Bytes from PTY -> Wire
+                LET $c_out: PIPE  # Bytes from Wire -> PTY
+
+                # Runs the requested command under a ConPTY; output drains
+                # through the channel pump below.
+                LET $pty: HANDLE = ASYNC {
+                    SSH_PTY_RUN($sess.session, ["cmd.exe", "/c", $sess.command], 0, 0, $c_out, $c_in)
+                }
+
+                LET $pump: HANDLE = ASYNC {
+                    # Enforces a 30-minute max session limit to reap idle or abandoned connections
+                    # [INTENTIONALLY-COMMENTED-OUT] TIMEOUT 1800s {
+                        SSH_PUMP_CHANNEL($sess.session, $c_in, $c_out)
+                    # }
+                }
+
+                # Wait for session teardown or timeout
+                AWAIT $pty
+                AWAIT $pump
+            } ELSE {
+                LET $c_in: PIPE   # Bytes from PTY -> Wire
+                LET $c_out: PIPE  # Bytes from Wire -> PTY
+
+                # Interactive shell under a ConPTY (profile, prompt, the lot:
+                # `prove_interactive_shell` sends `echo MARKER` here and reads
+                # it back, the exact path a user login takes).
+                LET $pty: HANDLE = ASYNC {
+                    SSH_PTY_RUN($sess.session, ["powershell.exe", "-NoLogo", "-NoProfile"], 0, 0, $c_out, $c_in)
+                }
+
+                LET $pump: HANDLE = ASYNC {
+                    # Enforces a 30-minute max session limit to reap idle or abandoned connections
+                    # [INTENTIONALLY-COMMENTED-OUT] TIMEOUT 1800s {
+                        SSH_PUMP_CHANNEL($sess.session, $c_in, $c_out)
+                    # }
+                }
+
+                # Wait for session teardown or timeout
+                AWAIT $pty
+                AWAIT $pump
+            }
+
+            LET $avail_end: INT = SEMAPHORE_AVAILABLE($sem)
+            LET $active_end: INT = ($max_conns - $avail_end) - 1
+            ECHO "[AUDIT] Disconnected: {{ $sess.username }} from {{ $sess.addr }} (active: {{ $active_end }}/{{ $max_conns }})"
+        }
+    }
+}
