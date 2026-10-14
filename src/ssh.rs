@@ -291,10 +291,7 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
                             j += 1;
                             break;
                         }
-                        if bytes[j] == 0x1b
-                            && j + 1 < bytes.len()
-                            && bytes[j + 1] == b'\\'
-                        {
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
                             j += 2;
                             break;
                         }
@@ -558,10 +555,8 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     struct ShellGuard;
     impl Drop for ShellGuard {
         fn drop(&mut self) {
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::LeaveAlternateScreen
-            );
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
@@ -571,10 +566,7 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
     let _guard = ShellGuard;
     // Enter late (after raw mode proved a terminal exists); failure here
     // is non-fatal — the shell still works on the main screen.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     // Settle: hold keystrokes until the shell has spoken, then bridge.
@@ -595,8 +587,7 @@ pub async fn interactive_shell(host: &str, port: u16, user: &str, pass: &str) ->
             };
             match tokio::time::timeout(wait_for, ch.wait()).await {
                 Ok(Some(
-                    russh::ChannelMsg::Data { data }
-                    | russh::ChannelMsg::ExtendedData { data, .. },
+                    russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. },
                 )) => {
                     stdout.write_all(&data).await?;
                     stdout.flush().await?;
@@ -995,7 +986,9 @@ mod tests {
             reg_probe_command(),
             "powershell -NoProfile -Command Stop-Computer -Force".to_string(),
             ps_encoded_command("Get-Service Spooler | Set-Service -StartupType Disabled"),
-            ps_encoded_command("Set-LocalUser -Name \"u\" -Password (ConvertTo-SecureString \"p@ss w%!\" -AsPlainText -Force)"),
+            ps_encoded_command(
+                "Set-LocalUser -Name \"u\" -Password (ConvertTo-SecureString \"p@ss w%!\" -AsPlainText -Force)",
+            ),
         ];
         for cmd in &cmds {
             assert!(!cmd.contains('"'), "double quote on the wire: {cmd}");
@@ -1019,10 +1012,7 @@ mod tests {
             .unwrap();
         let (chunks, rest) = wide.as_chunks::<2>();
         assert!(rest.is_empty());
-        let units: Vec<u16> = chunks
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
+        let units: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes(*c)).collect();
         assert_eq!(String::from_utf16(&units).unwrap(), script);
     }
 
