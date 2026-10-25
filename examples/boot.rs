@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
         .ssh_port(PROVEN_SSH_PORT)
         .build_and_start(
             "win11.qcow2",
-            "iso/Win11_Enterprise_Eval.iso",
+            "iso/Windows11_Client.iso",
             "iso/virtio-win.iso",
         )
         .await?;

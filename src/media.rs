@@ -204,9 +204,9 @@ fn write_mbr_partition_table(img: &mut File, size_bytes: u64) -> Result<u64> {
     Ok(part_off)
 }
 
-/// What to build: the Eval ISO in, a bootable raw image out.
+/// What to build: the retail Windows ISO in, a bootable raw image out.
 pub struct MediaSpec {
-    /// Source Eval ISO (UDF).
+    /// Source retail Windows ISO (UDF).
     pub iso: PathBuf,
     /// Output raw image path (created/truncated).
     pub out: PathBuf,
@@ -339,7 +339,7 @@ pub fn build_installer_media(spec: &MediaSpec) -> Result<()> {
     //
     // hadris-udf rejects some images with `invalid Information Control
     // Block` (observed inside an OrbStack Linux VM when extracting
-    // sources/install.wim from the ARM64 Eval ISO; x86_64 Linux and macOS
+    // sources/install.wim from the ARM64 retail ISO; x86_64 Linux and macOS
     // hosts parse with hadris).  isomage auto-detects ISO9660/UDF and
     // tolerates those images, so every hadris failure falls back to it —
     // per file when the volume opened, wholesale when even the open fails.
@@ -621,7 +621,7 @@ fn navigate_and_read(udf: &SyncUdf, dir: &UdfDir, parts: &[&str]) -> Result<Vec<
 // ---------------------------------------------------------------------------
 // isomage fallback (ISO9660/UDF auto-detect)
 //
-// hadris-udf is strict UDF and rejects some genuine Eval ISOs with
+// hadris-udf is strict UDF and rejects some genuine retail ISOs with
 // `invalid Information Control Block`.  isomage already parses those
 // (it is the reader used for the ISO9660 virtio-win image), so every
 // hadris entry point above retries here before surfacing an error.

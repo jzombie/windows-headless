@@ -166,7 +166,7 @@ pub const RUNTIME_EXIT_GRACE: Duration = Duration::from_secs(1);
 // Tests and examples — intentionally their own budgets
 // ---------------------------------------------------------------------------
 
-/// Weekly canary: latest Eval ISO end-to-end, bounded by one deadline used
+/// Weekly canary: latest retail Windows ISO end-to-end, bounded by one deadline used
 /// both as the outer `timeout` and the inner `wait_for_ssh` budget.
 pub const CANARY_SSH_DEADLINE: Duration = Duration::from_secs(25 * 60);
 

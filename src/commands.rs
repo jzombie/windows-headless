@@ -2265,7 +2265,7 @@ pub async fn cmd_stop(vm_dir: Option<PathBuf>, qmp_sock: Option<String>) -> Resu
 /// Download one file into place (skip when cached and valid). Shared by
 /// `fetch` and `setup` so both print the same `cached|downloaded` lines.
 /// `force` re-downloads even a valid cache entry (for URL-rotated
-/// artifacts like the Eval ISO); `setup` always passes false.
+/// artifacts like the Windows ISO); `setup` always passes false.
 #[cfg(feature = "downloader")]
 pub async fn fetch_one(
     url: &str,
@@ -2333,7 +2333,7 @@ pub struct FetchArgs {
     pub openssh: bool,
     pub arch: Option<Architecture>,
     /// Re-download even valid cache entries (for URL-rotated artifacts
-    /// like the Eval ISO, whose slot name can't see upstream changes).
+    /// like the Windows ISO, whose slot name can't see upstream changes).
     pub force: bool,
 }
 
@@ -2345,17 +2345,17 @@ pub async fn cmd_fetch(a: FetchArgs) -> Result<()> {
         None => downloader::iso_cache_dir()?,
     };
     // Explicit flag wins; else a pre-fetched time-limited link via env.
-    // No page scraper: EvalCenter links require the interactive form.
-    // Absent entirely: skip the Eval ISO (e.g. you already have one
+    // No page scraper: Microsoft links require the interactive form.
+    // Absent entirely: skip the Windows ISO (e.g. you already have one
     // on disk and only need virtio-win.iso).
     let mut items: Vec<(String, &str, Option<String>)> = Vec::new();
-    match downloader::resolve_eval_iso_url(a.win_iso_url) {
+    match downloader::resolve_win_iso_url(a.win_iso_url) {
         Ok(u) => {
-            // Explicit flag wins, else $WIN11_EVAL_ISO_SHA256; absent = TLS only.
-            let eval_hash = a
+            // Explicit flag wins, else $WIN11_ISO_SHA256; absent = TLS only.
+            let win_hash = a
                 .win_iso_sha256
-                .or_else(|| std::env::var("WIN11_EVAL_ISO_SHA256").ok());
-            items.push((u, crate::paths::EVAL_ISO_NAME, eval_hash))
+                .or_else(|| std::env::var("WIN11_ISO_SHA256").ok());
+            items.push((u, crate::paths::WIN11_ISO_NAME, win_hash))
         }
         Err(e) => eprintln!("skipping Windows ISO: {e:#}"),
     }

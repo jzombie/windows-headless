@@ -21,6 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
   `webpki-root-certs` 1.0.9 → 1.0.11 (RUSTSEC-2026-0383).
 - Yanked `yoke-derive` 0.8.3 → 0.8.4.
 
+### Fixed
+
+- Windows ISO naming is retail-only: the fetch cache slot is now
+  `Windows11_Client.iso`, `examples/boot.rs` uses it, and the env vars are
+  `WIN11_ISO_URL` / `WIN11_ISO_SHA256`. Non-retail (Enterprise/OEM) media
+  remains untested; proven installs are retail.
+
 ## [0.2.0-alpha] - 10-12-2026
 
 ### Changed

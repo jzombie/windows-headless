@@ -30,7 +30,7 @@ pub struct Provenance {
     pub guest: GuestParams,
 }
 
-/// Identity of the user-supplied Eval ISO.
+/// Identity of the user-supplied retail Windows ISO.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsoIdentity {
     pub file_name: String,
