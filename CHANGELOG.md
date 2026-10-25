@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [UNRELEASED]
+
+### Changed
+
+- Runtime `tokio` 1.53.2 → 1.53.3 (plus transitive `windows-sys` 0.52.0 → 0.61.2).
+- JSON `serde_json` 1.0.151 → 1.0.154.
+- Hashing `sha2` 0.11.0 → 0.11.1.
+
 ## [0.2.0-alpha] - 10-12-2026
 
 ### Changed
