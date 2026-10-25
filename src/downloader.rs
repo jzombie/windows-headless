@@ -48,7 +48,7 @@ pub async fn download(url: &str, dest: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Throttled stderr progress for multi-MB downloads (Eval ISOs are GBs;
+/// Throttled stderr progress for multi-MB downloads (Windows ISOs are GBs;
 /// without this the CLI sits silent for minutes). Dependency-free: byte
 /// counting + one line at most per second, plus a final line. Status goes
 /// to stderr per the crate stream rule — never stdout.
@@ -151,7 +151,7 @@ fn fmt_size(bytes: u64) -> String {
 ///
 /// Eviction is intentionally **disabled**: the group is ensured with no
 /// `EvictPolicy` (no `max_bytes`, no `max_files`, no `max_age`). ISOs are
-/// multi-GB and the Eval URLs are time-limited, so size-capped eviction
+/// multi-GB and the Windows ISO URLs are time-limited, so size-capped eviction
 /// would force surprise re-downloads.
 pub fn iso_cache_dir() -> Result<std::path::PathBuf> {
     let root = crate::cache::resolve_cache_root(None, "WINDOWS_HEADLESS_ISO_DIR")?;
@@ -176,10 +176,10 @@ pub enum DownloadStatus {
 /// - File exists with `expected_sha256`: re-downloaded only on hash mismatch.
 /// - Missing or empty: downloaded (parent dirs created).
 /// - `force`: skip all of the above and re-download unconditionally (for
-///   URL-rotated artifacts like the Eval ISO, where the cache slot name
+///   URL-rotated artifacts like the Windows ISO, where the cache slot name
 ///   can't see that the upstream bytes changed).
 ///
-/// Note: Eval-ISO URLs are time-limited, so callers should only pass
+/// Note: Windows ISO URLs are time-limited, so callers should only pass
 /// `expected_sha256` for stable artifacts like `virtio-win.iso`.
 pub async fn download_if_missing(
     url: &str,
@@ -376,19 +376,21 @@ pub fn validate_iso_image(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-/// Resolve the concrete Eval ISO URL: explicit `--win-iso-url` wins, else
-/// `$WIN11_EVAL_ISO_URL`. There is intentionally no page scraper — the
-/// EvalCenter issues links behind an interactive, bot-guarded form, so the
-/// only reliable source is a fresh, time-limited link copied from a browser
-/// (or a community fetcher like Fido/Mido.sh — see README).
-pub fn resolve_eval_iso_url(cli_url: Option<String>) -> Result<String> {
+/// Resolve the concrete Windows 11 retail ISO URL: explicit `--win-iso-url`
+/// wins, else `$WIN11_ISO_URL`.
+/// There is intentionally no page scraper — Microsoft issues links behind an
+/// interactive, bot-guarded form, so the only reliable source is a fresh,
+/// time-limited link copied from a browser (or a community fetcher like
+/// Fido/Mido.sh — see README). Proven media is retail; non-retail
+/// (Enterprise/OEM) media is untested.
+pub fn resolve_win_iso_url(cli_url: Option<String>) -> Result<String> {
     if let Some(u) = cli_url {
         return Ok(u);
     }
-    std::env::var("WIN11_EVAL_ISO_URL").map_err(|_| {
+    std::env::var("WIN11_ISO_URL").map_err(|_| {
         anyhow::anyhow!(
-            "no Eval ISO URL: pass --win-iso-url <url> or set WIN11_EVAL_ISO_URL.\n\
-             Get a fresh link in your browser (EvalCenter -> Windows 11 Enterprise -> download; links are time-limited).\n\
+            "no Windows ISO URL: pass --win-iso-url <url> or set WIN11_ISO_URL.\n\
+             Get a fresh link in your browser (Microsoft -> Windows 11 -> download; links are time-limited).\n\
              See README for Fido/Mido.sh alternatives."
         )
     })
@@ -533,24 +535,24 @@ mod tests {
     }
 
     #[test]
-    fn eval_url_resolution_prefers_flag_then_env() {
+    fn win_iso_url_resolution_prefers_flag_then_env() {
         unsafe {
-            std::env::remove_var("WIN11_EVAL_ISO_URL");
+            std::env::remove_var("WIN11_ISO_URL");
         }
-        assert!(resolve_eval_iso_url(None).is_err());
+        assert!(resolve_win_iso_url(None).is_err());
         unsafe {
-            std::env::set_var("WIN11_EVAL_ISO_URL", "https://example.invalid/env.iso");
+            std::env::set_var("WIN11_ISO_URL", "https://example.invalid/env.iso");
         }
         assert_eq!(
-            resolve_eval_iso_url(None).unwrap(),
+            resolve_win_iso_url(None).unwrap(),
             "https://example.invalid/env.iso"
         );
         assert_eq!(
-            resolve_eval_iso_url(Some("https://example.invalid/flag.iso".into())).unwrap(),
+            resolve_win_iso_url(Some("https://example.invalid/flag.iso".into())).unwrap(),
             "https://example.invalid/flag.iso"
         );
         unsafe {
-            std::env::remove_var("WIN11_EVAL_ISO_URL");
+            std::env::remove_var("WIN11_ISO_URL");
         }
     }
 

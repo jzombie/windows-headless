@@ -380,7 +380,7 @@ enum Cmd {
         win_iso_url: Option<String>,
         /// Expected SHA-256 for the Windows ISO (default: none — URLs are
         /// time-limited/rotating, so TLS + ISO magic only; also read from
-        /// $WIN11_EVAL_ISO_SHA256 when the flag is absent).
+        /// $WIN11_ISO_SHA256 when the flag is absent).
         #[arg(long)]
         win_iso_sha256: Option<String>,
         /// VirtIO ISO URL override (default: vendored release asset).

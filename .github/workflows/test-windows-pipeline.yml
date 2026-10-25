@@ -17,8 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No ISO in CI: Eval media lives behind Microsoft's interactive
-      # EvalCenter form, so no job here boots a VM. The signal is unit
+      # No ISO in CI: retail media lives behind Microsoft's interactive
+      # download form, so no job here boots a VM. The signal is unit
       # tests plus live pin verification (release metadata + hashes only).
       - name: Unit tests (no VM)
         run: cargo test --lib

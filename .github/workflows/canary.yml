@@ -17,7 +17,8 @@ jobs:
   # download URL is resolved here. Only the URL crosses the job boundary —
   # the ISO bytes are never stored on GitHub infra (no redistribution:
   # the Linux job downloads straight from Microsoft, and the links expire).
-  # Eval media is evaluation-licensed, which covers installer testing.
+  # Retail media (Fido default: Home/Pro/Edu) is what the canary proves;
+  # non-retail media (Enterprise/OEM) is untested (see README "Not tested").
   #
   # Single arch by design: everything arch-specific lives in early boot
   # (firmware, storage/NIC drivers, answer-file arch), already proven per

@@ -16,8 +16,10 @@
 pub const VIRTIO_ISO: &str = "virtio-win.iso";
 /// Hash sidecar next to the virtio release asset.
 pub const VIRTIO_ISO_SHA256: &str = "virtio-win.iso.sha256";
-/// Eval ISO filename used by the `fetch` chain.
-pub const EVAL_ISO_NAME: &str = "Win11_Enterprise_Eval.iso";
+/// Windows 11 retail ISO filename used by the `fetch` chain.
+/// Proven media is retail (`Windows11_Client_*`); non-retail
+/// (Enterprise/OEM) media has never been exercised (see README "Not tested").
+pub const WIN11_ISO_NAME: &str = "Windows11_Client.iso";
 /// Answer file at the installer USB root and in `gen` output dirs.
 pub const UNATTEND_XML: &str = "autounattend.xml";
 /// Partition script inside the installer USB tree.

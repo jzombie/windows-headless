@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [0.3.0-alpha] - 10-25-2026
+
+### Changed
+
+- Runtime `tokio` 1.53.2 → 1.53.3 (plus transitive `windows-sys` 0.52.0 → 0.61.2).
+- JSON `serde_json` 1.0.151 → 1.0.154.
+- Hashing `sha2` 0.11.0 → 0.11.1.
+- IPC `interprocess` 2.4.4 → 2.4.6.
+- Security (transitive via `russh` / `reqwest`, `cargo deny` clean again):
+  `crypto-bigint` 0.7.5 → 0.7.8 (RUSTSEC-2026-0387),
+  `ctutils` 0.4.3 → 0.4.5 (RUSTSEC-2026-0385),
+  `rustls` 0.23.45 → 0.23.46 (RUSTSEC-2026-0346/0347/0348/0349),
+  `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382),
+  `webpki-root-certs` 1.0.9 → 1.0.11 (RUSTSEC-2026-0383).
+- Yanked `yoke-derive` 0.8.3 → 0.8.4.
+
+### Fixed
+
+- Windows ISO naming is retail-only: the fetch cache slot is now
+  `Windows11_Client.iso`, `examples/boot.rs` uses it, and the env vars are
+  `WIN11_ISO_URL` / `WIN11_ISO_SHA256`. Non-retail (Enterprise/OEM) media
+  remains untested; proven installs are retail.
+
 ## [0.2.0-alpha] - 10-12-2026
 
 ### Changed
