@@ -13,6 +13,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - JSON `serde_json` 1.0.151 → 1.0.154.
 - Hashing `sha2` 0.11.0 → 0.11.1.
 - IPC `interprocess` 2.4.4 → 2.4.6.
+- Security (transitive via `russh` / `reqwest`, `cargo deny` clean again):
+  `crypto-bigint` 0.7.5 → 0.7.8 (RUSTSEC-2026-0387),
+  `ctutils` 0.4.3 → 0.4.5 (RUSTSEC-2026-0385),
+  `rustls` 0.23.45 → 0.23.46 (RUSTSEC-2026-0346/0347/0348/0349),
+  `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382),
+  `webpki-root-certs` 1.0.9 → 1.0.11 (RUSTSEC-2026-0383).
+- Yanked `yoke-derive` 0.8.3 → 0.8.4.
 
 ## [0.2.0-alpha] - 10-12-2026
 
