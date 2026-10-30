@@ -9,12 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ### Changed
 
-- Runtime `tokio` 1.53.3 → 1.54.1. Resolver side effect of that bump (produced by
-  `cargo update -p tokio --precise 1.54.1`, not hand-edited): the transitive Windows-only
-  bindings `errno`, `quinn-udp`, `rustix`, `rustls-platform-verifier`, `tempfile`, and
-  `winapi-util` now unify on the `windows-sys` 0.52.0 line instead of 0.61.2. All of them
-  declare `>=0.52, <0.62`, and 0.61.2 stays in the graph for `tokio`, `mio`, and others.
-  These are Windows-only FFI bindings with no effect on non-Windows builds.
+- Runtime `tokio` 1.53.3 → 1.54.1 (plus transitive `windows-sys` re-resolution on
+  Windows-only bindings: `quinn-udp`, `rustix`, `rustls-platform-verifier`, `tempfile`,
+  and `winapi-util` move 0.61.2 → 0.52.0, while `errno`, `tokio`, and `mio` stay on
+  0.61.2; both lines remain in the graph. Windows-only, no effect on other platforms).
 - Compression `liblzma` 0.4.8 → 0.4.9.
 - Checksums `crc32fast` 1.5.2 → 1.5.3.
 
