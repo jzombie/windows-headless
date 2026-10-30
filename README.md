@@ -1,6 +1,6 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)): it downloads portable QEMU, wimlib, virtio-driver, and OpenSSH binaries (no Docker, no containers, nothing installed on your host) then builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI, no host packages.
+Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), get an SSH shell. One command, no server, no GUI, no host packages.
 
 **STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported, and Windows hosts are not yet tested. See [Troubleshooting](#troubleshooting) if anything goes wrong.**
 
