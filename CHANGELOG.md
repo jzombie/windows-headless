@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [0.3.1-alpha] - 10-30-2026
+
+### Changed
+
+- Runtime `tokio` 1.53.3 → 1.54.1 (plus transitive `windows-sys` re-resolution on
+  Windows-only bindings: `quinn-udp`, `rustix`, `rustls-platform-verifier`, `tempfile`,
+  and `winapi-util` move 0.61.2 → 0.52.0, while `errno`, `tokio`, and `mio` stay on
+  0.61.2; both lines remain in the graph. Windows-only, no effect on other platforms).
+- Compression `liblzma` 0.4.8 → 0.4.9.
+- Checksums `crc32fast` 1.5.2 → 1.5.3.
+
 ## [0.3.0-alpha] - 10-25-2026
 
 ### Changed

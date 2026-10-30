@@ -1,14 +1,15 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), it builds the installer, boots the VM, and hands you SSH. One command, no server, no GUI, no host packages.
+Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), get an SSH shell. One command brings up a real VM; no server, no GUI, no host packages, no Docker, nothing nested.
 
 **STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported, and Windows hosts are not yet tested. See [Troubleshooting](#troubleshooting) if anything goes wrong.**
 
 > Prerequisite: A recent Rust toolchain (`cargo`, 1.85+; any stable via
 > [rustup](https://rustup.rs)). Everything else ([QEMU, wimlib, virtio
 > drivers](https://github.com/jzombie/lab-qemu-portable/releases),
-> [OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases)) is fetched
-> automatically, so a vanilla host with just Rust is enough. No prebuilt
+> [OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases)) is downloaded
+> as portable binaries and run from the cache — nothing is installed on the
+> host — so a vanilla host with just Rust is enough. No prebuilt
 > binaries yet: every command below builds from source first.
 >
 > **Highly recommended:** Run your first install with all defaults (no overridden
@@ -76,6 +77,12 @@ user cache dir. Layout:
 
 Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
 `$WINDOWS_HEADLESS_MEDIA_DIR`, `$WINDOWS_HEADLESS_VM_DIR`.
+
+Uninstall is deleting that one directory: the portable hypervisor (QEMU),
+the Windows disk, snapshots, installer media, and downloads all live under
+the cache root, so removing it removes everything. Nothing else on the host
+is touched — no packages, no drivers, no services. (If you set per-group
+overrides above, delete each of those directories instead.)
 
 ## Drivers
 
@@ -164,6 +171,7 @@ Proven installs, logged automatically by `install` to [tested-isos.jsonl](./test
 <!-- TESTED-BEGIN -->
 | Date | ISO | Arch | Accel | Host | QEMU | wimlib | virtio | Commit | Result |
 |---|---|---|---|---|---|---|---|---|---|
+| 2026-10-30 | Windows11_Client_x64_en-us_26300_9457.iso | amd64 | kvm | linux Ubuntu 24.04.5 LTS | [qemu-v11.1.2](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.2) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20261005) | [e99a722](https://github.com/jzombie/windows-headless/commit/e99a722fca00) | ssh-banner |
 | 2026-10-25 | Windows11_Client_x64_en-us_26300_9457.iso | amd64 | kvm | linux Ubuntu 24.04.5 LTS | [qemu-v11.1.2](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.2) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20261005) | [1970285](https://github.com/jzombie/windows-headless/commit/197028595f20) | ssh-banner |
 | 2026-10-25 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | hvf | macos 26.6.2 | [qemu-v11.1.2](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.2) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20261005) | [eb8575e](https://github.com/jzombie/windows-headless/commit/eb8575e51b04) | ssh-banner |
 | 2026-10-12 | Windows11_Client_arm64_en-us_26300_9457.iso | arm64 | hvf | macos 26.6.2 | [qemu-v11.1.2](https://github.com/jzombie/lab-qemu-portable/releases/tag/qemu-v11.1.2) | [wimlib-v1.14.5-39](https://github.com/jzombie/lab-qemu-portable/releases/tag/wimlib-v1.14.5-39) | [303f7ae](https://github.com/jzombie/lab-qemu-portable/releases/tag/drivers-20261005) | [77c796b](https://github.com/jzombie/windows-headless/commit/77c796b0466f) | ssh-banner |
