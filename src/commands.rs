@@ -518,8 +518,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // is the ground truth (pidfile alone may be stale).
     if banner_once(a.ssh_port).await.is_some() {
         eprintln!(
-            "already running — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})",
-            a.ssh_port, a.username, a.password
+            "already running — ssh -p {} <username>@{PROVEN_SSH_HOST}",
+            a.ssh_port
         );
         if a.shell {
             crate::ssh::interactive_shell(PROVEN_SSH_HOST, a.ssh_port, &a.username, &a.password)
