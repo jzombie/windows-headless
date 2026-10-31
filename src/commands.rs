@@ -935,8 +935,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "ready — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})",
-        a.ssh_port, a.username, a.password,
+        "ready — ssh -p {} <user>@{PROVEN_SSH_HOST} (you will be prompted for credentials)",
+        a.ssh_port,
     );
     // Cooked mode, SIGINT/SIGTERM via shutdown_signal — the term-wm way.
     // Raw mode was tried here (Ctrl-C as byte 0x03): under a multiplexer
