@@ -681,7 +681,8 @@ mod tests {
         let state = probe_setup_done("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
             .await
             .unwrap();
-        eprintln!("guest setup state: {state:?}");
+        let _ = state;
+        eprintln!("guest setup state retrieved");
     }
 
     /// Live exec check (read-only): same transport the password rotation
