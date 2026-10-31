@@ -93,8 +93,8 @@ Remainder inbox:
 - **GPU: none.** `ramfb` framebuffer for VNC and screenshots. No virtio-gpu,
   QXL, or vendor driver. Software rendering only.
 
-No automated driver upgrades. New drivers require a media rebuild and a
-reinstall from scratch.
+No automated driver upgrades; update manually in the guest if needed. Adopting
+newly pinned drivers requires a media rebuild and a reinstall from scratch.
 
 Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): absent from `--help`, invocable by name for stage-by-stage forensics.
 
