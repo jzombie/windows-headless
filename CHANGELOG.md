@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [0.3.3-alpha] - 10-31-2026
+
+### Changed
+
+- README: clarified prerequisites, install flow, and driver behavior.
+- Crate description updated.
+
 ## [0.3.2-alpha] - 10-31-2026
 
 ### Security

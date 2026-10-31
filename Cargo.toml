@@ -2,7 +2,7 @@
 [package]
 name = "windows-headless"
 authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
-version = "0.3.2-alpha"
+version = "0.3.3-alpha"
 edition = "2024"
 description = "Microsoft ISO to SSH-ready Windows 11 VM in one command. Unattended install, portable QEMU, no Docker. Quick dev environments."
 license = "MIT OR Apache-2.0"
