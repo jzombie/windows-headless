@@ -1,6 +1,6 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless.
+Turn a Microsoft ISO into an SSH-ready Windows 11 VM in one command.
 
 Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
 
