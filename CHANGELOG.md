@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [0.3.2-alpha] - 10-31-2026
+
+### Security
+
+- SSH credentials are no longer printed to stderr. The `ready` and
+  `already running` messages now show `ssh -p <port> <user>@127.0.0.1` and
+  tell you to expect a credential prompt, instead of echoing the username and
+  password in cleartext; test diagnostics in `src/ssh.rs` no longer dump probe
+  or exec output either (GitHub code scanning alerts 6, 8, 9, 10, 11 —
+  "Cleartext logging of sensitive information"). The `--shell` path is
+  unchanged; only the logging changed.
+- CI hardening: `.github/workflows/rust-lint.yml` and
+  `.github/workflows/test-windows-pipeline.yml` now declare
+  `permissions: contents: read` (least privilege; code scanning alerts 2, 3, 4,
+  5, 12 — "Workflow does not contain permissions").
+
+### Changed
+
+- SSH stack `russh` 0.64.1 → 0.65.0 (plus transitive `pageant` 0.2.4 → 0.2.5
+  and `errno`'s `windows-sys` re-resolution 0.61.2 → 0.52.0; Windows-only, no
+  effect on other platforms).
+
 ## [0.3.1-alpha] - 10-30-2026
 
 ### Changed

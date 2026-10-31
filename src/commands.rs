@@ -518,8 +518,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
     // is the ground truth (pidfile alone may be stale).
     if banner_once(a.ssh_port).await.is_some() {
         eprintln!(
-            "already running — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})",
-            a.ssh_port, a.username, a.password
+            "already running — ssh -p {} <username>@{PROVEN_SSH_HOST}",
+            a.ssh_port
         );
         if a.shell {
             crate::ssh::interactive_shell(PROVEN_SSH_HOST, a.ssh_port, &a.username, &a.password)
@@ -935,8 +935,8 @@ pub async fn cmd_run(a: RunArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "ready — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})",
-        a.ssh_port, a.username, a.password,
+        "ready — ssh -p {} <user>@{PROVEN_SSH_HOST} (you will be prompted for credentials)",
+        a.ssh_port,
     );
     // Cooked mode, SIGINT/SIGTERM via shutdown_signal — the term-wm way.
     // Raw mode was tried here (Ctrl-C as byte 0x03): under a multiplexer
@@ -1727,7 +1727,10 @@ async fn install_to_ready(p: InstallParams) -> Result<InstallSession> {
                 }
                 Err(e) => eprintln!("warning: no sidecar, skipping test record: {e:#}"),
             }
-            eprintln!("ready — ssh -p {} {}@{PROVEN_SSH_HOST} (password: {})", PROVEN_SSH_PORT, p.username, p.password);
+            eprintln!(
+                "ready — ssh -p {} <user>@{PROVEN_SSH_HOST} (credentials not shown)",
+                PROVEN_SSH_PORT
+            );
         }
         _ = shutdown_signal() => {
             eprintln!("interrupted; stopping guest...");

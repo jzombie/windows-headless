@@ -2,7 +2,7 @@
 [package]
 name = "windows-headless"
 authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 edition = "2024"
 description = "Headless Windows 11 VMs from a Microsoft ISO: downloads portable QEMU binaries (no Docker, no host install) and hands you SSH."
 license = "MIT OR Apache-2.0"
@@ -29,7 +29,7 @@ liblzma = "0.4"
 png = "0.18"
 quick-xml = "0.42"
 reqwest = { version = "0.13.5", features = ["rustls", "stream", "json"] }
-russh = "0.64"
+russh = "0.65"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = { version = "0.11" }

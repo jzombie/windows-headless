@@ -628,6 +628,7 @@ fn pending_description(setup: Option<u32>, oobe: u32, cbs: bool, wu: bool) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unattend::{DEFAULT_PASSWORD, DEFAULT_USERNAME};
 
     #[tokio::test]
     async fn fast_fail_on_closed_port() {
@@ -678,10 +679,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_probe_reports_state() {
-        let state = probe_setup_done("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!")
+        let state = probe_setup_done("127.0.0.1", 2232, DEFAULT_USERNAME, DEFAULT_PASSWORD)
             .await
             .unwrap();
-        eprintln!("guest setup state: {state:?}");
+        let _ = state;
+        eprintln!("guest setup state retrieved");
     }
 
     /// Live exec check (read-only): same transport the password rotation
@@ -689,10 +691,16 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_exec_whoami() {
-        let out = ssh_exec("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!", "whoami")
-            .await
-            .unwrap();
-        assert!(out.contains("adminuser"), "unexpected whoami: {out:?}");
+        let out = ssh_exec(
+            "127.0.0.1",
+            2232,
+            DEFAULT_USERNAME,
+            DEFAULT_PASSWORD,
+            "whoami",
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("adminuser"), "unexpected whoami output");
     }
 
     #[test]
