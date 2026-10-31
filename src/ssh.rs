@@ -693,7 +693,7 @@ mod tests {
         let out = ssh_exec("127.0.0.1", 2232, "AdminUser", "P@ssw0rd123!", "whoami")
             .await
             .unwrap();
-        assert!(out.contains("adminuser"), "unexpected whoami: {out:?}");
+        assert!(out.contains("adminuser"), "unexpected whoami output");
     }
 
     #[test]
