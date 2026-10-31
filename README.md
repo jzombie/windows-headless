@@ -1,6 +1,12 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless. Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)). Output: SSH shell. One command provisions a real VM in-process. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
+Build Windows 11 VM images and run them headless.
+
+Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
+
+Output: SSH shell.
+
+One command provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
 
 **STATUS: EXPERIMENTAL.** Tested on macOS (Apple Silicon) and Linux (amd64, arm64): see [Tested](#tested). Intel Macs unsupported. Windows hosts untested. See [Troubleshooting](#troubleshooting) on failure.
 
