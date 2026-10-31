@@ -18,6 +18,11 @@ Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd6
 > start tuning. Custom values on a first run entangle your settings
 > with setup problems and make failures much harder to diagnose. See [Where things live](#where-things-live) in this README for where artifacts are stored.
 
+Portable QEMU, wimlib, and virtio-win builds come from
+[lab-qemu-portable](https://github.com/jzombie/lab-qemu-portable) — portable,
+zero-install binaries for Windows, Linux, and macOS — which this crate
+downloads and SHA-256-verifies into its cache on first run.
+
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
 # --release throughout: debug builds are slower across the board and
