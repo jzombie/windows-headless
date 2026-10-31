@@ -108,7 +108,7 @@ state. Every later `run` rewinds first. Dirty stops (Ctrl-C) cannot leave the
 next boot in Recovery.
 
 ```sh
-# Terminal 1: `run` blocks, so boot and leave it running.
+# Terminal 1: boot and leave it running (`run` blocks).
 cargo run --release -- run
 ```
 
@@ -223,7 +223,7 @@ Run `cargo run --release --bin windows-headless -- verify-pins` to check every p
 
 **Check [Not tested](#not-tested)**
 
-Unsupported platforms, archs, and media live there.
+Unsupported platforms, archs, and media are listed there.
 
 **Something else?**
 
