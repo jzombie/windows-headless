@@ -700,7 +700,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.contains("adminuser"), "unexpected whoami: {out:?}");
+        assert!(out.contains("adminuser"), "unexpected whoami output");
     }
 
     #[test]
