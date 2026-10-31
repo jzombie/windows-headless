@@ -8,7 +8,7 @@ description = "Microsoft ISO to SSH-ready Windows 11 VM in one command. Unattend
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jzombie/windows-headless"
 categories = ["virtualization", "command-line-utilities"]
-keywords = ["windows", "qemu", "headless", "vm", "provisioning"]
+keywords = ["windows", "qemu", "ssh", "unattended-installer", "provisioning"]
 default-run = "windows-headless"
 [workspace]
 resolver = "2"
