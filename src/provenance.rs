@@ -417,13 +417,16 @@ mod tests {
             },
             guest: GuestParams {
                 arch: "arm64".to_string(),
-                username: "AdminUser".to_string(),
+                username: crate::unattend::DEFAULT_USERNAME.to_string(),
                 locale: "en-US".to_string(),
                 accel: "hvf".to_string(),
             },
         };
         let json = serde_json::to_string(&prov).unwrap();
-        assert!(!json.contains("P@ss"), "no secrets in provenance");
+        assert!(
+            !json.contains(crate::unattend::DEFAULT_PASSWORD),
+            "no secrets in provenance"
+        );
         let back: Provenance = serde_json::from_str(&json).unwrap();
         assert_eq!(back.source_iso.file_name, "Win11.iso");
         assert_eq!(back.deps.qemu_tag, "qemu-v11.1.1");
