@@ -1,39 +1,43 @@
 # windows-headless
 
-Build Windows 11 VM images and run them headless. Give it a Microsoft ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)), get an SSH shell. One command brings up a real VM; no server, no GUI, no host packages, no Docker, nothing nested.
+Turn a Microsoft ISO into an SSH-ready Windows 11 VM in one command.
 
-**STATUS EXPERIMENTAL: [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64 + arm64) hosts. Intel Macs are not supported, and Windows hosts are not yet tested. See [Troubleshooting](#troubleshooting) if anything goes wrong.**
+Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
 
-> Prerequisite: A recent Rust toolchain (`cargo`, 1.85+; any stable via
-> [rustup](https://rustup.rs)). Everything else ([QEMU, wimlib, virtio
-> drivers](https://github.com/jzombie/lab-qemu-portable/releases),
-> [OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases)) is downloaded
-> as portable binaries and run from the cache — nothing is installed on the
-> host — so a vanilla host with just Rust is enough. No prebuilt
-> binaries yet: every command below builds from source first.
+Output: SSH shell.
+
+One command provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
+
+**STATUS: EXPERIMENTAL.** Tested on macOS (Apple Silicon) and Linux (amd64, arm64): see [Tested](#tested). Intel Macs unsupported. Windows hosts untested. See [Troubleshooting](#troubleshooting) on failure.
+
+> Requires a Rust toolchain (`cargo` 1.85+ via [rustup](https://rustup.rs)).
+> Remaining dependencies download automatically on first run and execute from
+> the cache. Host stays clean. Source-only distribution: commands below build
+> via `cargo` first.
 >
-> **Highly recommended:** Run your first install with all defaults (no overridden
-> `--memory`, `--cpus`, `--username`, `--password`, etc.). A green
-> default install proves the pipeline works on your machine; only then
-> start tuning. Custom values on a first run entangle your settings
-> with setup problems and make failures much harder to diagnose. See [Where things live](#where-things-live) in this README for where artifacts are stored.
+> First install: use all defaults. A green default install separates pipeline
+> faults from configuration faults. Tune after. Artifact locations:
+> [Where things live](#where-things-live).
+
+QEMU, wimlib, and virtio-win builds come from
+[lab-qemu-portable](https://github.com/jzombie/lab-qemu-portable): portable
+zero-install binaries for Windows, Linux, and macOS. Downloaded and
+SHA-256-verified into the cache on first run.
 
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
-# --release throughout: debug builds are slower across the board and
-# stretch every status tick.
+# Always --release. Debug builds slow every status tick.
 cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
 
-# ...or in two steps: build once, boot any time.
+# Or split: build once, boot on demand.
 cargo run --release -- build --win-iso <PATH_TO_WIN_ISO>
 cargo run --release -- run
 ```
 
-Sizing is Docker-style: `--memory 8g --cpus 8 --disk-size 128g`
-(defaults `4g`, `4`, `64g`). Bare digits keep the old integer meaning
-(MB for memory, GB for disk); floors are 2g RAM and 32g disk.
-`--smp` still works as an alias of `--cpus`.
-Sizing applies to installs too, so `run --win-iso` honors the same flags.
+Docker-style sizing: `--memory 8g --cpus 8 --disk-size 128g`
+(defaults `4g`, `4`, `64g`). Bare digits use legacy units (memory MB, disk
+GB). Floors: 2g RAM, 32g disk. `--smp` aliases `--cpus`. Applies to installs;
+`run --win-iso` honors the same flags.
 
 Connect:
 - SSH: `ssh -p 2232 AdminUser@127.0.0.1`, password `P@ssw0rd123!`
@@ -42,25 +46,23 @@ Connect:
 - VNC: `vnc://127.0.0.1:5910`, password `demo2026`.
 
 Watch:
-- Screenshots land in `<cache>/vms/win11/screenshots/` every 60s
+- Screenshots to `<cache>/vms/win11/screenshots/` every 60s
   (`--screenshots-every-secs`, `0` disables).
-- Between saves, a tiny on-device nearest-exemplar match classifies the
-  screen in memory every 10s on hardware accel (30s on TCG;
-  `--classify-every-secs`, `0` disables). States: installer progress, OOBE, firmware boot art,
-  lock/idle, plus error states (modal dialog, UEFI shell, recovery).
-- Warnings fire only on the conjunction (error state AND flat guest:
-  no disk I/O, no growth). A moving guest never alarms. The classifier
-  misreads; motion sensing (pixel change between captures) tracks
-  aliveness independently of classification.
-- Dead boots end with a diagnosis block: latest frame path, screen
+- In-memory screen classification between saves: nearest-exemplar match every
+  10s on hardware accel, 30s on TCG (`--classify-every-secs`, `0` disables).
+  States: installer progress, OOBE, firmware boot art, lock/idle, plus error
+  states (modal dialog, UEFI shell, recovery).
+- Alerts require error state AND idle guest (no disk I/O, no growth). Active
+  guests never alert. Classification misreads; pixel-change motion sensing
+  tracks aliveness independently.
+- Dead boots terminate with a diagnosis block: latest frame path, screen
   state, last serial line, firmware reboot count.
 
 ## Where things live
 
-Everything lives under one cache root, announced at startup as
-`cache: <path> (<source>)`. Resolution order: `$WINDOWS_HEADLESS_*_DIR`
-env override, then `<project>/.cache` (project discovery), then the OS
-user cache dir. Layout:
+Single cache root, reported at startup as `cache: <path> (<source>)`.
+Resolution: `$WINDOWS_HEADLESS_*_DIR` override, `<project>/.cache`, OS user
+cache dir. Layout:
 
 ```text
 <cache>/
@@ -78,53 +80,51 @@ user cache dir. Layout:
 Per-group overrides: `$WINDOWS_HEADLESS_QEMU_DIR`, `$WINDOWS_HEADLESS_ISO_DIR`,
 `$WINDOWS_HEADLESS_MEDIA_DIR`, `$WINDOWS_HEADLESS_VM_DIR`.
 
-Uninstall is deleting that one directory: the portable hypervisor (QEMU),
-the Windows disk, snapshots, installer media, and downloads all live under
-the cache root, so removing it removes everything. Nothing else on the host
-is touched — no packages, no drivers, no services. (If you set per-group
-overrides above, delete each of those directories instead.)
+Uninstall: delete the cache root. Hypervisor, disk, snapshots, media, and
+downloads all live under it. Host untouched: no packages, drivers, or
+services. (With per-group overrides set, delete each directory instead.)
 
 ## Drivers
 
-One third-party driver, installed from the pinned virtio-win ISO:
+One third-party driver, from the pinned virtio-win ISO. Installed automatically
+during Setup: the specialize pass runs `pnputil /add-driver ... /install` off
+the staged media.
 
-- **Network: Red Hat VirtIO NetKVM** (`NetKVM/w11/<arch>`). The guest NIC
-  is `virtio-net-pci`, so without it there is no network (and no SSH).
+- **Network: Red Hat VirtIO NetKVM** (`NetKVM/w11/<arch>`). Guest NIC is
+  `virtio-net-pci`; without this driver the guest has no network, hence no SSH.
 
-Everything else is inbox Windows:
+Remainder inbox:
 
-- **Storage: none.** The disk is NVMe, driven by Windows' built-in
-  `stornvme`. No `viostor` needed or installed.
-- **GPU: none.** Display is `ramfb` (a plain framebuffer for VNC and
-  installer screenshots). No virtio-gpu, QXL, or vendor GPU driver: expect
-  software rendering only.
+- **Storage: none.** NVMe disk on Windows' built-in `stornvme`. No `viostor`.
+- **GPU: none.** `ramfb` framebuffer for VNC and screenshots. No virtio-gpu,
+  QXL, or vendor driver. Software rendering only.
 
-> There is no automated driver upgrade path. To pick up newer drivers, rebuild
-the installer and reinstall from scratch with the latest media.
+No automated driver upgrades; update manually in the guest if needed. Adopting
+newly pinned drivers requires a media rebuild and a reinstall from scratch.
 
-Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): omitted from `--help`, invocable by name for stage-by-stage forensics.
+Hidden debug tier (`install`, `setup`, `build-media`, `fetch-*`, `gen`, `report`, `overlay`, `stop`, `guest`): absent from `--help`, invocable by name for stage-by-stage forensics.
 
-> Also a Rust library: the CLI is thin, and `VmConfig`, `HeadlessVmBuilder`, `DiskManager`, and friends are all exported for programmatic use from your own projects.
+> Also a Rust library: thin CLI over exported `VmConfig`, `HeadlessVmBuilder`, `DiskManager`.
 
 ## Snapshots
 
-Golden rewind is the default. The first golden snapshot is automatic: `build`
-(and likewise `run --win-iso`, which installs when the disk is missing) proves
-the shell, then saves that disk state. Every `run` afterward rewinds to it
-first, so a dirty stop (Ctrl-C) can't leave the next boot in Recovery.
+Golden rewind is the default. First golden snapshot is automatic: `build`
+(and `run --win-iso` on a missing disk) verifies the shell, then saves disk
+state. Every later `run` rewinds first. Dirty stops (Ctrl-C) cannot leave the
+next boot in Recovery.
 
 ```sh
-# Terminal 1: `run` blocks, so boot and leave it running.
+# Terminal 1: boot and leave it running (`run` blocks).
 cargo run --release -- run
 ```
 
 ```sh
-# Terminal 2: re-take golden from the running guest (proves shell,
-# shuts down cleanly, snapshots). The next `run` resumes the new state.
+# Terminal 2: re-take golden from the running guest (verifies shell, clean
+# shutdown, snapshot). Next `run` resumes the new state.
 cargo run --release -- snapshot
 ```
 
-Live resume (experimental) also saves RAM, so `run --live` restores the
+Live resume (experimental) also saves RAM: `run --live` restores the
 running guest with no boot.
 
 ```sh
@@ -144,25 +144,24 @@ cargo run --release -- snapshot --live
 cargo run --release -- run --live
 ```
 
-Golden and live coexist (separate sidecars) and `run` selects by flag, so you
-can alternate between them. Plain `run` rewinds to golden and drops any
-orphaned live overlay out loud; `run --live` skips the rewind and requires
-every live piece or refuses. A new install voids both. Re-taking either
-overwrites that type only; run one `snapshot` at a time (the [QMP](https://www.qemu.org/docs/master/interop/qmp-spec.html) control
-channel to the running VM allows a single client).
+Golden and live coexist as separate sidecars; `run` selects by flag. Plain
+`run` rewinds to golden and loudly drops orphaned live overlays. `run --live`
+skips the rewind and requires every live piece, else refuses. New installs
+void both. Re-taking overwrites that type only. One `snapshot` at a time
+(the [QMP](https://www.qemu.org/docs/master/interop/qmp-spec.html) control
+channel admits a single client).
 
-Storage: golden is a single named snapshot inside `disk.qcow2` (re-taking it
-replaces it, so nothing accumulates). Live state is separate files beside the
-disk that are consumed or dropped on resume, never merged. See
-[Where things live](#where-things-live) for the exact filenames.
+Storage: golden is one named snapshot inside `disk.qcow2` (re-taking replaces
+it; nothing accumulates). Live state is separate files beside the disk,
+consumed or dropped on resume, never merged. Filenames:
+[Where things live](#where-things-live).
 
-Rewind is CPU-bound (full firmware + Windows boot); live is I/O-bound (2–3 GB
-stream + settle). On Apple Silicon with the cache on external USB, rewind wins:
-~19s spawn-to-SSH vs ~23s live, since the boot is fast and the USB stream is
-slow. On an older Intel i7 with an internal SSD the balance flips: the boot is
-much slower while the 2–3 GB stream off SSD is fast, so live wins. Live also
-costs multi-GB sidecars. Time `run` vs `run --live` on your hardware; default
-to the rewind unless live is faster.
+Rewind is CPU-bound (firmware + Windows boot); live is I/O-bound (2-3 GB
+stream + settle). Apple Silicon, cache on external USB: rewind wins (~19s
+spawn-to-SSH vs ~23s live; fast boot, slow USB stream). Older Intel i7,
+internal SSD: live wins (slow boot, fast stream). Live costs multi-GB
+sidecars. Benchmark `run` vs `run --live` on your hardware; default to rewind
+unless live measures faster.
 
 ## Tested
 
@@ -196,17 +195,17 @@ Proven installs, logged automatically by `install` to [tested-isos.jsonl](./test
 
 ## Not tested
 
-Proven so far: English retail ISO on macOS Apple Silicon, linux/amd64, and linux/arm64 (see table above). Everything below is untested. It may work, fail loudly, or fail silently. Reports with logs welcome.
+Proven: English retail ISO on macOS Apple Silicon, linux/amd64, linux/arm64 (table above). Below is untested. It may work, fail loudly, or fail silently. Reports with logs welcome.
 
-- **Non-English installs.** Only `en-US` media has been tested. The `run --win-iso` / `install --win-iso` chain rebuilds media as `en-US`, the answer file selects the `Windows 11 Pro` image name, and parts of guest verification parse English command output.
-- **Other hosts.** `macos / aarch64`, `linux / amd64`, and `linux / aarch64` have logged installs (see table above). The `linux / aarch64` runs to date were evaluated inside an OrbStack Linux VM (nested virtualization), not on bare metal. Accel is recorded per run in the table.
-- **Windows hosts.** No proven install has been logged on a Windows host yet (see table above). The portable tree ships a Windows QEMU build, but the install path there is unexercised.
-- **No mixed archs.** Guest arch must match host arch (ARM Windows on macOS Apple Silicon, x64 Windows on x64 Linux). HVF/KVM require it. Cross-arch guests (x64 Windows on macOS) are untested and unsupported; they fall back to TCG emulation at a 5x to 15x slowdown if they boot at all.
-- **Non-retail media.** Proven installs used retail ISOs (see table above). Enterprise, OEM, and other non-retail media have never been exercised against this [answer file](./templates/autounattend.xml).
+- **Non-English installs.** Only `en-US` media tested. The install chain rebuilds media as `en-US`, the answer file selects the `Windows 11 Pro` image, and guest verification parses English command output.
+- **Other hosts.** Logged installs exist for `macos / aarch64`, `linux / amd64`, `linux / aarch64` (table above). The `linux / aarch64` runs executed inside an OrbStack Linux VM (nested), not bare metal. Accel recorded per run.
+- **Windows hosts.** No proven install on a Windows host (table above). The portable tree ships a Windows QEMU build; the install path there is unexercised.
+- **No mixed archs.** Guest arch matches host arch (ARM Windows on Apple Silicon, x64 Windows on x64 Linux). HVF/KVM require it. Cross-arch guests (x64 Windows on macOS) are untested and unsupported: TCG fallback at 5x to 15x slowdown, if they boot.
+- **Non-retail media.** Proven installs used retail ISOs (table above). Enterprise, OEM, and other non-retail media never exercised against this [answer file](./templates/autounattend.xml).
 
 ## Download Integrity & Security
 
-The provisioning pipeline downloads third-party binaries. Hash verification is enforced as follows:
+Provisioning downloads third-party binaries. Hash enforcement:
 
 | Artifact | Source | Hash Enforced? | Security Guarantee |
 |---|---|---|---|
@@ -215,9 +214,9 @@ The provisioning pipeline downloads third-party binaries. Hash verification is e
 | **OpenSSH Archive** | Auto-download ([releases](https://github.com/PowerShell/Win32-OpenSSH/releases)) | **YES (Pinned)** | The downloaded bytes are strictly verified against hardcoded SHA-256 pins in `src/pins.rs`. |
 | **Windows 11 ISO** | User-supplied | **NO (Opt-in)** | Microsoft URLs rotate. Validated via TLS and ISO9660 magic bytes only, unless pinned explicitly via `--win-iso-sha256`. |
 
-*Security Note:* For all auto-downloaded components, the trust root is the source code (`src/pins.rs`). The tool will immediately abort if a downloaded payload does not match its hardcoded hash. If you choose to override default downloads using custom URLs (such as `--virtio-iso-url`), those payloads rely solely on TLS unless you explicitly provide their matching hash flags.
+*Trust root for auto-downloaded components: `src/pins.rs`.* Hash mismatch aborts. Custom URLs (e.g. `--virtio-iso-url`) rely on TLS alone unless hash flags are provided.
 
-Run `cargo run --release --bin windows-headless -- verify-pins` to check every pin without installing anything. It covers all platforms (macos-arm64, linux-x86_64, linux-aarch64) from any single runner: release metadata is platform-independent, so one CI job verifies every arch.
+Run `cargo run --release --bin windows-headless -- verify-pins` to check every pin without installing. Covers all platforms (macos-arm64, linux-x86_64, linux-aarch64) from any single runner: release metadata is platform-independent, so one CI job verifies every arch.
 
 ## Troubleshooting
 
@@ -225,17 +224,17 @@ Run `cargo run --release --bin windows-headless -- verify-pins` to check every p
 
 **If SSH prompt is never reached**
 
-- If the installer screenshots show that you're sitting on a lockscreen and SSH was never reached, it *should* eventually come online.  Typically, on macOS, SSH will be reached within 10 - 15 minutes of QEMU first booting and starting the Windows install, but I've seen it wait for 18 minutes (this is not typical).
-- On non-virtualized, or older, hardware (including running in [OrbStack](https://orbstack.dev/) on macOS), it can take *much longer* to reach that initial stable prompt.  Once it *is* reached, saving a [live snapshot](#snapshots) is **highly recommended** and a subsequent launch via `run --live` should load that live snapshot within seconds.
+- Lockscreen in screenshots with no SSH is normal mid-install. Typical time to SSH on macOS: 10-15 minutes from first boot. Observed outliers to 18 minutes.
+- Slow or virtualized hardware (older machines, [OrbStack](https://orbstack.dev/) on macOS) takes considerably longer. After the first stable prompt, take a [live snapshot](#snapshots); subsequent `run --live` restores in seconds.
 
-**Refer to what hasn't yet been tested**
+**Check [Not tested](#not-tested)**
 
-The [not tested](#not-tested) section shows some platforms/archs/releases/spins that have not yet been tested.
+Unsupported platforms, archs, and media are listed there.
 
 **Something else?**
 
-- Did you try to install with non-default params, such as a custom username/password, or system config params?  Try using the default as a canary run to see if it even works.
-- [Open an issue](https://github.com/jzombie/windows-headless/issues/new) if something else just doesn't work.
+- Failing on non-default params (custom user/password, sizing)? Re-run defaults as a canary first.
+- Otherwise [open an issue](https://github.com/jzombie/windows-headless/issues/new).
 
 ## License
 
