@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [UNRELEASED]
+
+### Changed
+
+- SSH stack `russh` 0.65.0 → 0.65.1 (plus transitive cleanup: drops the
+  `generic-array` 0.14.7 shim and `untrusted` pins).
+- IPC `interprocess` 2.4.6 → 2.4.7 (plus `windows-sys` re-resolution on
+  Windows-only paths 0.52.0 → 0.61.2; no effect on other platforms).
+- Compression `flate2` 1.1.10 → 1.1.11.
+- Checksums `crc32fast` 1.5.3 → 1.5.4.
+
 ## [0.3.3-alpha] - 10-31-2026
 
 ### Changed
