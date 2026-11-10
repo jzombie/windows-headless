@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
   Windows-only paths 0.52.0 → 0.61.2; no effect on other platforms).
 - Compression `flate2` 1.1.10 → 1.1.11.
 - Checksums `crc32fast` 1.5.3 → 1.5.4.
+- Portable QEMU `qemu-v11.1.2` → `qemu-v11.1.3` (SHA-256 pins refreshed).
+- Portable wimlib `wimlib-v1.14.5-39` → `wimlib-v1.14.5-50` (SHA-256 pins refreshed).
+- virtio-win driver pack `drivers-20261005` → `drivers-20261109` (identical ISO bytes, tag-only bump).
 
 ## [0.3.3-alpha] - 10-31-2026
 

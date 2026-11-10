@@ -54,7 +54,7 @@ pub const WIMLIB_PORTABLE_SHA256_LINUX_AARCH64: &str =
 pub const DRIVERS_RELEASE_TAG: &str = "drivers-20261109";
 
 /// SHA-256 of `virtio-win.iso` at [`DRIVERS_RELEASE_TAG`]. Verified
-/// 2026-10-12 against the release `virtio-win.iso.sha256` sidecar
+/// 2026-11-10 against the release `virtio-win.iso.sha256` sidecar
 /// (identical bytes to the previous pack — tag-only bump).
 /// BUMP RULE: a new drivers tag means new bytes — update alongside the tag.
 /// (The live sidecar is still fetched and must match this pin: a forged
