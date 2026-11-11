@@ -6,7 +6,7 @@ Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-do
 
 Output: SSH shell.
 
-One command provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
+[One command](#commands) provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
 
 | Installer 16% | Installer 56% | Installer 94% | Reboot (TianoCore) | Lock/idle (SSH-ready) |
 |---|---|---|---|---|
@@ -29,6 +29,8 @@ QEMU, wimlib, and virtio-win builds come from
 [lab-qemu-portable](https://github.com/jzombie/lab-qemu-portable): portable
 zero-install binaries for Windows, Linux, and macOS. Downloaded and
 SHA-256-verified into the cache on first run.
+
+## Commands
 
 ```sh
 # One command: build the installer, boot the VM, land at a Command Prompt.
