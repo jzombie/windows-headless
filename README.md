@@ -8,6 +8,12 @@ Output: SSH shell.
 
 One command provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
 
+| Installer 16% | Installer 56% | Installer 94% | Reboot (TianoCore) | Lock/idle (SSH-ready) |
+|---|---|---|---|---|
+| ![installer progress](assets/installer-16pct.png) | ![installer progress](assets/installer-56pct.png) | ![installer progress](assets/installer-94pct.png) | ![firmware boot art](assets/reboot-tianocore.png) | ![lock/idle](assets/lock-idle.png) |
+
+<sub>A [kNN classifier](./src/screen_knn.rs) labels each frame (installer progress, OOBE, firmware boot art, lock/idle, error states) with limited accuracy. It can misread. Motion sensing tracks aliveness on its own.</sub>
+
 **STATUS: EXPERIMENTAL.** Tested on macOS (Apple Silicon) and Linux (amd64, arm64): see [Tested](#tested). Intel Macs unsupported. Windows hosts untested. See [Troubleshooting](#troubleshooting) on failure.
 
 > Requires a Rust toolchain (`cargo` 1.85+ via [rustup](https://rustup.rs)).
@@ -47,14 +53,8 @@ Connect:
 
 Watch:
 - Screenshots to `<cache>/vms/win11/screenshots/` every 60s
-  (`--screenshots-every-secs`, `0` disables).
-
-  | Installer progress (16%) | Installer progress (56%) | Installer progress (94%) | Reboot (TianoCore) | Lock/idle (SSH-ready) |
-  |---|---|---|---|---|
-  | <img src="assets/installer-16pct.png" alt="installer progress" width="100%"> | <img src="assets/installer-56pct.png" alt="installer progress" width="100%"> | <img src="assets/installer-94pct.png" alt="installer progress" width="100%"> | <img src="assets/reboot-tianocore.png" alt="firmware boot art" width="100%"> | <img src="assets/lock-idle.png" alt="lock/idle" width="100%"> |
-
-  Live frames from a local install. See [Troubleshooting](#troubleshooting) when frames stall.
-- In-memory screen classification between saves: nearest-exemplar match every
+  (`--screenshots-every-secs`, `0` disables). Frames shown above.
+- In-memory screen classification between saves: kNN nearest-exemplar match every
   10s on hardware accel, 30s on TCG (`--classify-every-secs`, `0` disables).
   States: installer progress, OOBE, firmware boot art, lock/idle, plus error
   states (modal dialog, UEFI shell, recovery).
