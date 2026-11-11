@@ -8,7 +8,7 @@ description = "Provision an SSH-ready headless Windows 11 VM from a retail insta
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jzombie/windows-headless"
 categories = ["virtualization", "command-line-utilities"]
-keywords = ["windows", "qemu", "ssh", "unattended-installer", "provisioning"]
+keywords = ["windows", "qemu", "ssh", "unattended-installer", "headless"]
 default-run = "windows-headless"
 [workspace]
 resolver = "2"
