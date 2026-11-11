@@ -49,9 +49,9 @@ Watch:
 - Screenshots to `<cache>/vms/win11/screenshots/` every 60s
   (`--screenshots-every-secs`, `0` disables).
 
-  | Installer progress (16%) | Installer progress (56%) | Lock/idle (SSH-ready) |
-  |---|---|---|
-  | <img src="assets/installer-16pct.png" alt="installer progress" width="100%"> | <img src="assets/installer-56pct.png" alt="installer progress" width="100%"> | <img src="assets/lock-idle.png" alt="lock/idle" width="100%"> |
+  | Installer progress (16%) | Installer progress (56%) | Installer progress (94%) | Reboot (TianoCore) | Lock/idle (SSH-ready) |
+  |---|---|---|---|---|
+  | <img src="assets/installer-16pct.png" alt="installer progress" width="100%"> | <img src="assets/installer-56pct.png" alt="installer progress" width="100%"> | <img src="assets/installer-94pct.png" alt="installer progress" width="100%"> | <img src="assets/reboot-tianocore.png" alt="firmware boot art" width="100%"> | <img src="assets/lock-idle.png" alt="lock/idle" width="100%"> |
 
   Live frames from a local install. See [Troubleshooting](#troubleshooting) when frames stall.
 - In-memory screen classification between saves: nearest-exemplar match every
