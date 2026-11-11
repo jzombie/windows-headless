@@ -1,5 +1,7 @@
 # windows-headless
 
+[![Made with Rust](https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust)](https://www.rust-lang.org/) [![crates.io](https://img.shields.io/crates/v/windows-headless.svg?style=flat-square)](https://crates.io/crates/windows-headless) [![Documentation](https://docs.rs/windows-headless/badge.svg)](https://docs.rs/windows-headless) [![build](https://img.shields.io/github/actions/workflow/status/jzombie/windows-headless/test-windows-pipeline.yml?style=flat-square&label=build)](https://github.com/jzombie/windows-headless/actions/workflows/test-windows-pipeline.yml) [![MIT licensed](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE-MIT) [![Apache 2.0 licensed](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](./LICENSE-APACHE)
+
 Turn a Microsoft ISO into an SSH-ready Windows 11 VM in one command.
 
 Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
