@@ -5,14 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
-## [0.3.3-alpha] - 10-31-2026
+## [0.3.4-alpha] - 2026-11-10
+
+### Changed
+
+- SSH stack `russh` 0.65.0 → 0.65.1 (plus transitive cleanup: drops the
+  `generic-array` 0.14.7 shim and `untrusted` pins).
+- IPC `interprocess` 2.4.6 → 2.4.7 (plus `windows-sys` re-resolution on
+  Windows-only paths 0.52.0 → 0.61.2; no effect on other platforms).
+- Compression `flate2` 1.1.10 → 1.1.11.
+- Checksums `crc32fast` 1.5.3 → 1.5.4.
+- Portable QEMU `qemu-v11.1.2` → `qemu-v11.1.3` (SHA-256 pins refreshed).
+- Portable wimlib `wimlib-v1.14.5-39` → `wimlib-v1.14.5-50` (SHA-256 pins refreshed).
+- virtio-win driver pack `drivers-20261005` → `drivers-20261109` (identical ISO bytes, tag-only bump).
+
+## [0.3.3-alpha] - 2026-10-31
 
 ### Changed
 
 - README: clarified prerequisites, install flow, and driver behavior.
 - Crate description updated.
 
-## [0.3.2-alpha] - 10-31-2026
+## [0.3.2-alpha] - 2026-10-31
 
 ### Security
 
@@ -34,7 +48,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
   and `errno`'s `windows-sys` re-resolution 0.61.2 → 0.52.0; Windows-only, no
   effect on other platforms).
 
-## [0.3.1-alpha] - 10-30-2026
+## [0.3.1-alpha] - 2026-10-30
 
 ### Changed
 
@@ -45,7 +59,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - Compression `liblzma` 0.4.8 → 0.4.9.
 - Checksums `crc32fast` 1.5.2 → 1.5.3.
 
-## [0.3.0-alpha] - 10-25-2026
+## [0.3.0-alpha] - 2026-10-25
 
 ### Changed
 
@@ -68,7 +82,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
   `WIN11_ISO_URL` / `WIN11_ISO_SHA256`. Non-retail (Enterprise/OEM) media
   remains untested; proven installs are retail.
 
-## [0.2.0-alpha] - 10-12-2026
+## [0.2.0-alpha] - 2026-10-12
 
 ### Changed
 
@@ -79,7 +93,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - Portable QEMU `qemu-v11.1.1-48` → `qemu-v11.1.2` (SHA-256 pins refreshed).
 - virtio-win driver pack `drivers-20260925` → `drivers-20261005` (identical ISO bytes, tag-only bump).
 
-## [0.1.0-alpha] - 10-11-2026
+## [0.1.0-alpha] - 2026-10-11
 
 First public shape (`0.1.0-alpha`): one command takes a Microsoft ISO and
 hands back SSH into a headless Windows 11 VM. Tested on macOS (Apple
