@@ -18,7 +18,7 @@ Output: SSH shell running Windows 11.
 
 Frames are captured headless by the installer itself, only during install. See [Where things live](#where-things-live).
 
-**STATUS: EXPERIMENTAL.** Tested on macOS (Apple Silicon) and Linux (amd64, arm64): see [Tested](#tested). Intel Macs unsupported. Windows hosts untested. See [Troubleshooting](#troubleshooting) on failure.
+**STATUS: ALPHA (rock-solid and very performant on macOS [Apple Silicon M1+]; older Intel processors running Linux [circa-2015] work well, but have sometimes struggled with initial SSH handoff).** [Tested](#tested) on macOS (Apple Silicon) and Linux (amd64, arm64). Intel Macs unsupported. Windows hosts [untested](#not-tested). See [Troubleshooting](#troubleshooting) on failure.
 
 > Requires a Rust toolchain (`cargo` 1.85+ via [rustup](https://rustup.rs)).
 > Remaining dependencies download automatically on first run and execute from
@@ -37,7 +37,7 @@ SHA-256-verified into the cache on first run.
 ## Commands
 
 ```sh
-# One command: build the installer, boot the VM, land at a Command Prompt.
+# One command: build the installer, boot the VM, land at a Command Prompt in the same terminal.
 # Always --release. Debug builds slow every status tick.
 cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
 
