@@ -16,6 +16,8 @@ Output: SSH shell running Windows 11.
 
 <sub>A [kNN classifier](./src/screen_knn.rs) labels each frame (installer progress, OOBE, firmware boot art, lock/idle, error states) with limited accuracy. It can misread. Motion sensing tracks aliveness on its own.</sub>
 
+Frames are captured headless by the installer itself, only during install. See [Where things live](#where-things-live).
+
 **STATUS: EXPERIMENTAL.** Tested on macOS (Apple Silicon) and Linux (amd64, arm64): see [Tested](#tested). Intel Macs unsupported. Windows hosts untested. See [Troubleshooting](#troubleshooting) on failure.
 
 > Requires a Rust toolchain (`cargo` 1.85+ via [rustup](https://rustup.rs)).
