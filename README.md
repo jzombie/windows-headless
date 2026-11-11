@@ -4,7 +4,9 @@ Turn a Microsoft ISO into an SSH-ready Windows 11 VM in one command.
 
 Input: Microsoft retail ISO ([amd64](https://www.microsoft.com/en-us/software-download/windows11) / [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
 
-Output: SSH shell.
+Output: SSH shell running Windows 11.
+
+![ssh shell on mac](assets/win-ssh-on-mac.png)
 
 [One command](#commands) provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
 
