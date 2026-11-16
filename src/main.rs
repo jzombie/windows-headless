@@ -25,25 +25,9 @@ struct Cli {
     cmd: Cmd,
 }
 
+// VM lifecycle: boot, install, stop, snapshot, guest ops.
 #[derive(Subcommand)]
-enum Cmd {
-    /// Render autounattend.xml to stdout or a vvfat dir.
-    #[command(hide = true)]
-    Gen {
-        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
-        username: String,
-        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
-        password: String,
-        #[arg(long, default_value = "en-US")]
-        locale: String,
-        #[arg(long)]
-        autologon: bool,
-        #[arg(long)]
-        unattend_dir: Option<PathBuf>,
-        /// Guest arch (default: host arch). Selects the OpenSSH zip names.
-        #[arg(long)]
-        arch: Option<Architecture>,
-    },
+enum VmCmd {
     /// Run: boot the disk, attach if live, install first if missing.
     /// Boots `<vm-dir>/disk.qcow2` (or --disk); attaches to the shell when
     /// already running; installs when the disk is absent (needs cached
@@ -188,6 +172,78 @@ enum Cmd {
         #[arg(long, default_value = PROVEN_VNC_DISPLAY, value_parser = windows_headless::Display::parse)]
         display: windows_headless::Display,
     },
+    /// Graceful shutdown via QMP + pidfile cleanup (no orphans).
+    #[command(hide = true)]
+    Stop {
+        /// VM dir holding `qemu.pid` (default: project cache `vms/win11`).
+        #[arg(long)]
+        vm_dir: Option<PathBuf>,
+        /// QMP endpoint of the running VM (default: next to the disk in
+        /// the VM dir — never /tmp).
+        #[arg(long)]
+        qmp_sock: Option<String>,
+    },
+    /// Snapshot the running guest as the new golden state (`docker
+    /// commit`): proves the shell, stops QEMU, snapshots the disk. Boot
+    /// the guest with `run` first; boot again afterward to resume it.
+    Snapshot {
+        /// VM dir holding the disk (default: project cache `vms/win11`).
+        #[arg(long)]
+        vm_dir: Option<PathBuf>,
+        /// Portable tree override (default: newest cached tree from `fetch-qemu`).
+        #[arg(long)]
+        qemu_dir: Option<PathBuf>,
+        /// Guest username (for the shell proof).
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
+        username: String,
+        /// Guest password (for the shell proof).
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
+        password: String,
+        #[arg(long, default_value_t = PROVEN_SSH_PORT)]
+        ssh_port: u16,
+        /// Live snapshot (overlay pivot + RAM migration, guest keeps
+        /// running): instant-boot state, experimental.
+        #[arg(long, default_value_t = false)]
+        live: bool,
+    },
+    /// Run guest verbs against an already-booted machine (no install,
+    /// no boot — just SSH). Connection flags mirror `run`/`install`.
+    #[command(hide = true)]
+    Guest {
+        #[command(subcommand)]
+        op: GuestOp,
+        /// SSH port (default: proven 2232).
+        #[arg(long, default_value_t = PROVEN_SSH_PORT)]
+        ssh_port: u16,
+        /// Guest username.
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
+        username: String,
+        /// Guest password.
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
+        password: String,
+    },
+}
+
+// Offline helpers: answer-file gen, media build, overlay, classify, report.
+#[derive(Subcommand)]
+enum ToolingCmd {
+    /// Render autounattend.xml to stdout or a vvfat dir.
+    #[command(hide = true)]
+    Gen {
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
+        username: String,
+        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
+        password: String,
+        #[arg(long, default_value = "en-US")]
+        locale: String,
+        #[arg(long)]
+        autologon: bool,
+        #[arg(long)]
+        unattend_dir: Option<PathBuf>,
+        /// Guest arch (default: host arch). Selects the OpenSSH zip names.
+        #[arg(long)]
+        arch: Option<Architecture>,
+    },
     /// Build the USB installer image from the Windows ISO (pure Rust +
     /// vendored `wimlib-imagex`; no host tools). Output defaults to the
     /// media cache (`install` consumes it).
@@ -239,62 +295,12 @@ enum Cmd {
         #[arg(long)]
         qemu_dir: Option<PathBuf>,
     },
-    /// Snapshot the running guest as the new golden state (`docker
-    /// commit`): proves the shell, stops QEMU, snapshots the disk. Boot
-    /// the guest with `run` first; boot again afterward to resume it.
-    Snapshot {
-        /// VM dir holding the disk (default: project cache `vms/win11`).
-        #[arg(long)]
-        vm_dir: Option<PathBuf>,
-        /// Portable tree override (default: newest cached tree from `fetch-qemu`).
-        #[arg(long)]
-        qemu_dir: Option<PathBuf>,
-        /// Guest username (for the shell proof).
-        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
-        username: String,
-        /// Guest password (for the shell proof).
-        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
-        password: String,
-        #[arg(long, default_value_t = PROVEN_SSH_PORT)]
-        ssh_port: u16,
-        /// Live snapshot (overlay pivot + RAM migration, guest keeps
-        /// running): instant-boot state, experimental.
-        #[arg(long, default_value_t = false)]
-        live: bool,
-    },
     /// Score one PNG through the screen classifier (top-1 + gap + top-3
     /// matches, naming the exemplar). OOD triage: no fixture dir, no
     /// snapshot, nothing blessed.
     Classify {
         /// PNG frame to score.
         png: PathBuf,
-    },
-    /// Graceful shutdown via QMP + pidfile cleanup (no orphans).
-    #[command(hide = true)]
-    Stop {
-        /// VM dir holding `qemu.pid` (default: project cache `vms/win11`).
-        #[arg(long)]
-        vm_dir: Option<PathBuf>,
-        /// QMP endpoint of the running VM (default: next to the disk in
-        /// the VM dir — never /tmp).
-        #[arg(long)]
-        qmp_sock: Option<String>,
-    },
-    /// Run guest verbs against an already-booted machine (no install,
-    /// no boot — just SSH). Connection flags mirror `run`/`install`.
-    #[command(hide = true)]
-    Guest {
-        #[command(subcommand)]
-        op: GuestOp,
-        /// SSH port (default: proven 2232).
-        #[arg(long, default_value_t = PROVEN_SSH_PORT)]
-        ssh_port: u16,
-        /// Guest username.
-        #[arg(long, default_value = windows_headless::unattend::DEFAULT_USERNAME)]
-        username: String,
-        /// Guest password.
-        #[arg(long, default_value = windows_headless::unattend::DEFAULT_PASSWORD)]
-        password: String,
     },
     /// Render `tested-isos.jsonl` as a markdown table (stdout, or spliced
     /// into a README between `<!-- TESTED-BEGIN/END -->` markers).
@@ -307,11 +313,16 @@ enum Cmd {
         #[arg(long)]
         readme: Option<PathBuf>,
     },
+}
+
+// Provisioning: host setup, build, media/driver fetches, pin verification.
+#[cfg(feature = "downloader")]
+#[derive(Subcommand)]
+enum ProvisionCmd {
     /// One-shot host setup: portable QEMU + portable wimlib + virtio-win
     /// ISO + OpenSSH zip, all into the project cache. After this,
     /// `build-media` needs only `--win-iso` (the user-supplied Windows ISO).
     /// Re-runs are cheap (everything already-cached is skipped).
-    #[cfg(feature = "downloader")]
     #[command(hide = true)]
     Setup {
         /// virtio-win.iso URL override (default: vendored release asset).
@@ -328,7 +339,6 @@ enum Cmd {
     /// completion (CI takes its first snapshot exactly this way); `run`
     /// connects afterward. Only `--win-iso` is required. Sizing stays
     /// default here (prove it stock first); `install` takes the flags.
-    #[cfg(feature = "downloader")]
     Build {
         /// Windows ISO path.
         #[arg(long)]
@@ -350,7 +360,6 @@ enum Cmd {
         locale: String,
     },
     /// Download a portable QEMU release into the project cache.
-    #[cfg(feature = "downloader")]
     #[command(hide = true)]
     FetchQemu {
         /// Release tag (default: pinned, see pins::QEMU_PORTABLE_TAG).
@@ -372,7 +381,6 @@ enum Cmd {
     /// scripted downloads, fetch the file in a real browser and save it
     /// as `<dir>/virtio-win.iso` (or pass any mirror via --virtio-iso-url)
     /// — `fetch` validates and keeps it.
-    #[cfg(feature = "downloader")]
     #[command(hide = true)]
     Fetch {
         /// Windows ISO URL (fresh, time-limited link from a browser).
@@ -410,11 +418,9 @@ enum Cmd {
     /// (macos-arm64, linux-x86_64, linux-aarch64) from any single runner —
     /// no per-OS matrix needed. Fails non-zero listing every mismatch so one
     /// run reports everything.
-    #[cfg(feature = "downloader")]
     #[command(hide = true)]
-    VerifyPins {},
+    VerifyPins,
     /// Download a portable wimlib release into the project cache.
-    #[cfg(feature = "downloader")]
     #[command(hide = true)]
     FetchWimlib {
         /// Release tag (default: pinned, see pins::WIMLIB_PORTABLE_TAG).
@@ -430,6 +436,23 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         allow_unverified: bool,
     },
+}
+
+// Top-level dispatch. Grouped into flattened sub-enums so clap's derived
+// `from_arg_matches` stays small per function: one monolithic 16-variant
+// enum makes the derive merge every arm's temporaries into a single stack
+// frame, which trips clippy's stack-frame lints on unoptimized builds.
+// (Plain comment, not a doc comment: `///` here would surface as the
+// about-text in `--help`.)
+#[derive(Subcommand)]
+enum Cmd {
+    #[command(flatten)]
+    Vm(VmCmd),
+    #[command(flatten)]
+    Tooling(ToolingCmd),
+    #[cfg(feature = "downloader")]
+    #[command(flatten)]
+    Provision(ProvisionCmd),
 }
 
 /// Explicit runtime (not `#[tokio::main]`): `shutdown_timeout` with
@@ -472,7 +495,7 @@ async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         #[cfg(feature = "downloader")]
-        Cmd::Build {
+        Cmd::Provision(ProvisionCmd::Build {
             win_iso,
             arch,
             out,
@@ -480,7 +503,7 @@ async fn async_main() -> Result<()> {
             username,
             password,
             locale,
-        } => {
+        }) => {
             // Full chain with proven defaults: media, then install, settle,
             // golden snapshot — then exit. Never a shell here: `build` must
             // complete unattended (CI takes its first snapshot exactly this
@@ -517,14 +540,14 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Cmd::Gen {
+        Cmd::Tooling(ToolingCmd::Gen {
             username,
             password,
             locale,
             autologon,
             unattend_dir,
             arch,
-        } => cmd_gen(GenArgs {
+        }) => cmd_gen(GenArgs {
             username,
             password,
             locale,
@@ -532,7 +555,7 @@ async fn async_main() -> Result<()> {
             unattend_dir,
             arch,
         }),
-        Cmd::BuildMedia {
+        Cmd::Tooling(ToolingCmd::BuildMedia {
             win_iso,
             arch,
             virtio_iso,
@@ -544,7 +567,7 @@ async fn async_main() -> Result<()> {
             username,
             password,
             locale,
-        } => {
+        }) => {
             cmd_build_media(BuildMediaArgs {
                 win_iso,
                 arch,
@@ -560,7 +583,7 @@ async fn async_main() -> Result<()> {
             })
             .await
         }
-        Cmd::Run {
+        Cmd::Vm(VmCmd::Run {
             disk,
             ssh_port,
             display,
@@ -577,7 +600,7 @@ async fn async_main() -> Result<()> {
             screenshots_every_secs,
             classify_every_secs,
             live,
-        } => {
+        }) => {
             cmd_run(RunArgs {
                 disk,
                 ssh_port,
@@ -598,7 +621,7 @@ async fn async_main() -> Result<()> {
             })
             .await
         }
-        Cmd::Install {
+        Cmd::Vm(VmCmd::Install {
             usb_image,
             win_iso,
             screenshots_every_secs,
@@ -613,7 +636,7 @@ async fn async_main() -> Result<()> {
             cpus,
             disk_size,
             display,
-        } => {
+        }) => {
             cmd_install(
                 InstallParams {
                     usb_image,
@@ -634,27 +657,27 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Cmd::Overlay {
+        Cmd::Tooling(ToolingCmd::Overlay {
             base,
             overlay,
             qemu_dir,
-        } => cmd_overlay(base, overlay, qemu_dir).await,
-        Cmd::Classify { png } => cmd_classify(&png),
-        Cmd::Stop { vm_dir, qmp_sock } => cmd_stop(vm_dir, qmp_sock).await,
-        Cmd::Snapshot {
+        }) => cmd_overlay(base, overlay, qemu_dir).await,
+        Cmd::Tooling(ToolingCmd::Classify { png }) => cmd_classify(&png),
+        Cmd::Vm(VmCmd::Stop { vm_dir, qmp_sock }) => cmd_stop(vm_dir, qmp_sock).await,
+        Cmd::Vm(VmCmd::Snapshot {
             vm_dir,
             qemu_dir,
             username,
             password,
             ssh_port,
             live,
-        } => cmd_snapshot(vm_dir, qemu_dir, username, password, ssh_port, live).await,
-        Cmd::Guest {
+        }) => cmd_snapshot(vm_dir, qemu_dir, username, password, ssh_port, live).await,
+        Cmd::Vm(VmCmd::Guest {
             op,
             ssh_port,
             username,
             password,
-        } => {
+        }) => {
             cmd_guest(GuestArgs {
                 op,
                 ssh_port,
@@ -663,20 +686,20 @@ async fn async_main() -> Result<()> {
             })
             .await
         }
-        Cmd::Report { log, readme } => cmd_report(ReportArgs { log, readme }),
+        Cmd::Tooling(ToolingCmd::Report { log, readme }) => cmd_report(ReportArgs { log, readme }),
         #[cfg(feature = "downloader")]
-        Cmd::Setup {
+        Cmd::Provision(ProvisionCmd::Setup {
             virtio_iso_url,
             arch,
-        } => cmd_setup(virtio_iso_url, arch).await,
+        }) => cmd_setup(virtio_iso_url, arch).await,
         #[cfg(feature = "downloader")]
-        Cmd::FetchQemu {
+        Cmd::Provision(ProvisionCmd::FetchQemu {
             qemu_tag,
             dir,
             allow_unverified,
-        } => cmd_fetch_qemu(qemu_tag, dir, allow_unverified).await,
+        }) => cmd_fetch_qemu(qemu_tag, dir, allow_unverified).await,
         #[cfg(feature = "downloader")]
-        Cmd::Fetch {
+        Cmd::Provision(ProvisionCmd::Fetch {
             win_iso_url,
             win_iso_sha256,
             virtio_iso_url,
@@ -685,7 +708,7 @@ async fn async_main() -> Result<()> {
             openssh,
             arch,
             force,
-        } => {
+        }) => {
             cmd_fetch(FetchArgs {
                 win_iso_url,
                 win_iso_sha256,
@@ -699,13 +722,13 @@ async fn async_main() -> Result<()> {
             .await
         }
         #[cfg(feature = "downloader")]
-        Cmd::VerifyPins {} => cmd_verify_pins().await,
+        Cmd::Provision(ProvisionCmd::VerifyPins) => cmd_verify_pins().await,
         #[cfg(feature = "downloader")]
-        Cmd::FetchWimlib {
+        Cmd::Provision(ProvisionCmd::FetchWimlib {
             wimlib_tag,
             dir,
             allow_unverified,
-        } => cmd_fetch_wimlib(wimlib_tag, dir, allow_unverified).await,
+        }) => cmd_fetch_wimlib(wimlib_tag, dir, allow_unverified).await,
     }
 }
 
@@ -728,12 +751,12 @@ mod tests {
             "128g",
         ])
         .unwrap();
-        let Cmd::Run {
+        let Cmd::Vm(VmCmd::Run {
             memory,
             cpus,
             disk_size,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected run");
         };
@@ -746,12 +769,12 @@ mod tests {
     fn run_smp_alias_and_defaults() {
         // Legacy --smp still maps to cpus; bare --memory digits are rejected.
         let cli = Cli::try_parse_from(["wh", "run", "--smp", "2"]).unwrap();
-        let Cmd::Run {
+        let Cmd::Vm(VmCmd::Run {
             memory,
             cpus,
             disk_size,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected run");
         };
@@ -759,12 +782,20 @@ mod tests {
         // Bare digits keep the old integer meaning (MB for memory, GB disk);
         // toy sizes hit the floors.
         let cli = Cli::try_parse_from(["wh", "run", "--memory", "4096"]).unwrap();
-        let Cmd::Run { memory, .. } = cli.cmd else {
+        let Cmd::Vm(VmCmd::Run { memory, .. }) = cli.cmd else {
             panic!("expected run");
         };
         assert_eq!(memory, 4096);
         assert!(Cli::try_parse_from(["wh", "run", "--memory", "512m"]).is_err());
         assert!(Cli::try_parse_from(["wh", "run", "--disk-size", "8g"]).is_err());
+    }
+
+    #[test]
+    fn cli_command_invariants() {
+        // Unconditional so clap's static assertions (subcommand uniqueness,
+        // argument conflicts, help/parser invariants across the flattened
+        // hierarchy) run under --no-default-features as well as
+        // --all-features — not only in the downloader-gated tests.
         Cli::command().debug_assert();
     }
 
@@ -774,21 +805,21 @@ mod tests {
         // Classification omitted by default: the profile resolves it from
         // the accelerator after detection.
         let cli = Cli::try_parse_from(["wh", "run"]).unwrap();
-        let Cmd::Run {
+        let Cmd::Vm(VmCmd::Run {
             screenshots_every_secs,
             classify_every_secs,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected run");
         };
         assert_eq!(screenshots_every_secs, 60);
         assert_eq!(classify_every_secs, None);
         let cli = Cli::try_parse_from(["wh", "run", "--screenshots-every-secs", "0"]).unwrap();
-        let Cmd::Run {
+        let Cmd::Vm(VmCmd::Run {
             screenshots_every_secs,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected run");
         };
@@ -800,10 +831,42 @@ mod tests {
         // `overlay` (required) precedes `base` (optional): a single
         // positional lands on overlay instead of erroring on a missing one.
         let cli = Cli::try_parse_from(["wh", "overlay", "delta.qcow2"]).unwrap();
-        let Cmd::Overlay { base, overlay, .. } = cli.cmd else {
+        let Cmd::Tooling(ToolingCmd::Overlay { base, overlay, .. }) = cli.cmd else {
             panic!("expected overlay");
         };
         assert_eq!(overlay, PathBuf::from("delta.qcow2"));
         assert_eq!(base, None);
+    }
+
+    #[cfg(feature = "downloader")]
+    #[test]
+    fn build_parses_minimal_args_through_flattened_provision() {
+        // The flattened `ProvisionCmd` group parses like the others: only
+        // `--win-iso` is required; everything else takes its defaults.
+        let cli = Cli::try_parse_from(["wh", "build", "--win-iso", "win.iso"]).unwrap();
+        let Cmd::Provision(ProvisionCmd::Build {
+            win_iso,
+            arch,
+            out,
+            force,
+            username,
+            password,
+            locale,
+        }) = cli.cmd
+        else {
+            panic!("expected build");
+        };
+        assert_eq!(win_iso, PathBuf::from("win.iso"));
+        assert_eq!(arch, None);
+        assert_eq!(out, None);
+        assert!(!force);
+        assert_eq!(
+            (username.as_str(), password.as_str(), locale.as_str()),
+            (
+                windows_headless::unattend::DEFAULT_USERNAME,
+                windows_headless::unattend::DEFAULT_PASSWORD,
+                "en-US"
+            )
+        );
     }
 }
