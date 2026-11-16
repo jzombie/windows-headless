@@ -9,8 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ### Changed
 
-- IPC `interprocess` 2.4.7 → 2.4.8.
-- Checksums `crc32fast` 1.5.4 → 1.5.5.
+- IPC `interprocess` 2.4.7 → 2.4.8 (PR #54).
+- Checksums `crc32fast` 1.5.4 → 1.5.5 (PR #53).
 - SSH stack `russh` 0.65.1 → 0.65.2 (plus transitive `rsa` 0.10.0-rc.18 → 0.10.0,
   `ssh-key` 0.7.0-rc.11 → 0.7.0-rc.12, `elliptic-curve` 0.14.1 → 0.14.3,
   `crypto-bigint` 0.7.8 → 0.7.11, `ctutils` 0.4.5 → 0.4.8).
@@ -28,8 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 - Yanked `crypto-bigint` 0.7.8 → 0.7.11 and `yoke` 0.8.3 → 0.8.4
   (`cargo deny` clean again, no warnings).
 - Removed stale `RUSTSEC-2023-0071` ignores from `.cargo/deny.toml` and
-  `.cargo/audit.toml`: `rsa` 0.10.0 final is no longer affected, so the
-  `advisory-not-detected` warning is gone.
+  `.cargo/audit.toml`: `rsa` 0.10.0 final is no longer affected.
 
 ## [0.3.4-alpha] - 2026-11-10
 
