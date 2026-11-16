@@ -127,6 +127,11 @@ jobs:
       - name: Fetch host tools (portable QEMU/wimlib, virtio, OpenSSH)
         # `setup` only: `build` would chain a full install here, and the
         # `install` step below is the single install (one install per run).
+        # GITHUB_TOKEN is NOT in the runner env by default — without it the
+        # api.github.com release lookups share 60 req/hr per egress IP and
+        # flake with 403s on shared CI runners (authenticated = 5,000/hr).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: cargo run -- setup
 
       - name: Build installer media

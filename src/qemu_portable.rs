@@ -521,17 +521,31 @@ pub(crate) async fn release_by_tag(tag: &str) -> Result<Vec<(String, String)>> {
         "https://api.github.com/repos/{}/releases/tags/{tag}",
         crate::pins::RELEASE_REPO,
     );
-    let body: serde_json::Value = github_client()?
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("portable QEMU release {tag} not found"))?
-        .json()
-        .await?;
+    let body = github_get_json(&url, &format!("portable QEMU release {tag}")).await?;
     let (_, assets) = parse_release_body(&body)?;
     Ok(assets)
+}
+
+/// GET `url` via [`github_client`], returning the decoded JSON body.
+/// `what` names the lookup (e.g. `portable QEMU release qemu-v11.1.3`) for
+/// error context. The HTTP status is captured before `error_for_status()`
+/// so failures name the likely cause: a 403 here is almost always the
+/// shared-IP 60 req/hr unauthenticated rate limit (not a missing tag) —
+/// the workflows pass GITHUB_TOKEN (5,000/hr) for exactly this reason.
+async fn github_get_json(url: &str, what: &str) -> Result<serde_json::Value> {
+    let resp = github_client()?
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    let status = resp.status();
+    resp.error_for_status()
+        .with_context(|| {
+            format!("{what} lookup failed (HTTP {status}; 403 usually means GitHub API rate limit — retry with GITHUB_TOKEN set)")
+        })?
+        .json()
+        .await
+        .context("decode GitHub release JSON")
 }
 
 fn parse_release_body(body: &serde_json::Value) -> Result<(String, Vec<(String, String)>)> {
@@ -579,15 +593,7 @@ pub const DEFAULT_WIMLIB_PORTABLE_TAG: &str = crate::pins::WIMLIB_PORTABLE_TAG;
 /// Release metadata for an exact tag in `repo` (`owner/name`).
 async fn release_for_tag(repo: &str, tag: &str) -> Result<(String, Vec<(String, String)>)> {
     let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    let body: serde_json::Value = github_client()?
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?
-        .json()
-        .await?;
+    let body = github_get_json(&url, &format!("release {tag} in {repo}")).await?;
     parse_release_body(&body)
 }
 
