@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [UNRELEASED]
+
+### Changed
+
+- IPC `interprocess` 2.4.7 → 2.4.8.
+- Checksums `crc32fast` 1.5.4 → 1.5.5.
+- SSH stack `russh` 0.65.1 → 0.65.2 (plus transitive `rsa` 0.10.0-rc.18 → 0.10.0,
+  `ssh-key` 0.7.0-rc.11 → 0.7.0-rc.12, `elliptic-curve` 0.14.1 → 0.14.3,
+  `crypto-bigint` 0.7.8 → 0.7.11, `ctutils` 0.4.5 → 0.4.8).
+- HTTP/QUIC transitive via `reqwest`: `hyper` 1.11.1 → 1.12.0,
+  `hyper-util` 0.1.20 → 0.1.21, `h2` 0.4.19 → 0.4.20,
+  `rustls-webpki` 0.103.16 → 0.103.17,
+  `webpki-root-certs` 1.0.11 → 1.0.12.
+
+### Security
+
+- `cargo audit` clean again (transitive via `reqwest` / `quinn`):
+  `quinn-proto` 0.11.18 → 0.11.19 (RUSTSEC-2026-0523, RUSTSEC-2026-0524),
+  `quinn-udp` 0.5.15 → 0.5.16 (RUSTSEC-2026-0538),
+  `rustix` 1.1.5 → 1.1.6 (RUSTSEC-2026-0486).
+- Yanked `crypto-bigint` 0.7.8 → 0.7.11 and `yoke` 0.8.3 → 0.8.4
+  (`cargo deny` clean again, no warnings).
+- Removed stale `RUSTSEC-2023-0071` ignores from `.cargo/deny.toml` and
+  `.cargo/audit.toml`: `rsa` 0.10.0 final is no longer affected, so the
+  `advisory-not-detected` warning is gone.
+
 ## [0.3.4-alpha] - 2026-11-10
 
 ### Changed
