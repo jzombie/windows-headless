@@ -21,12 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ### Security
 
-- `cargo audit` clean again (transitive via `reqwest` / `quinn`):
+- Transitive via `reqwest` / `quinn`:
   `quinn-proto` 0.11.18 → 0.11.19 (RUSTSEC-2026-0523, RUSTSEC-2026-0524),
   `quinn-udp` 0.5.15 → 0.5.16 (RUSTSEC-2026-0538),
   `rustix` 1.1.5 → 1.1.6 (RUSTSEC-2026-0486).
-- Yanked `crypto-bigint` 0.7.8 → 0.7.11 and `yoke` 0.8.3 → 0.8.4
-  (`cargo deny` clean again, no warnings).
+- Yanked `crypto-bigint` 0.7.8 → 0.7.11 and `yoke` 0.8.3 → 0.8.4.
 - Removed stale `RUSTSEC-2023-0071` ignores from `.cargo/deny.toml` and
   `.cargo/audit.toml`: `rsa` 0.10.0 final is no longer affected.
 
