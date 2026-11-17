@@ -48,9 +48,9 @@ git clone https://github.com/jzombie/windows-headless
 cd windows-headless
 ```
 
-From the registry instead: `cargo install windows-headless`, then use
+> _From the Cargo registry instead: `cargo install windows-headless`, then use
 `windows-headless` in place of `cargo run --release --` below. Installed
-runs use the OS user cache instead of `./.cache`.
+runs use the OS user cache instead of `./.cache`._
 
 ```sh
 # Build the installer, boot the VM, drop into the guest shell over SSH.
