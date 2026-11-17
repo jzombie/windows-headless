@@ -46,7 +46,8 @@ SHA-256-verified into the cache on first run.
   [amd64](https://www.microsoft.com/en-us/software-download/windows11) /
   [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
   Guest arch must match host arch.
-- Rust toolchain (`cargo` 1.85+ via [rustup](https://rustup.rs)).
+- [Rust toolchain](https://rust-lang.org/tools/install/) (`cargo` 1.85+).
+  Everything else downloads on first run.
 
 ## Commands
 
