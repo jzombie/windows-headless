@@ -10,7 +10,7 @@ Output: SSH shell running Windows 11.
 
 ![ssh shell on mac](assets/win-ssh-on-mac.png)
 
-[One command](#commands) provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
+[Setup](#commands): clone, then run. Provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
 
 | Installer 16% | Installer 56% | Installer 94% | Reboot (TianoCore) | Lock/idle (SSH-ready) |
 |---|---|---|---|---|
@@ -40,8 +40,22 @@ SHA-256-verified into the cache on first run.
 
 ## Commands
 
+Clone first. Running from the checkout keeps the cache in `./.cache`,
+gitignored next to the tree:
+
 ```sh
-# One command: build the installer, boot the VM, land at a Command Prompt in the same terminal.
+git clone https://github.com/jzombie/windows-headless
+cd windows-headless
+```
+
+From the registry instead: `cargo install windows-headless`, then use
+`windows-headless` in place of `cargo run --release --` below. Installed
+runs use the OS user cache instead of `./.cache`.
+
+```sh
+# Build the installer, boot the VM, drop into the guest shell over SSH.
+# Interactive terminals land in the shell; piped/CI runs supervise instead
+# (--shell / --shell=false forces either way).
 # Always --release. Debug builds slow every status tick.
 cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
 
@@ -57,7 +71,7 @@ GB). Floors: 2g RAM, 32g disk. `--smp` aliases `--cpus`. Applies to installs;
 
 Connect:
 - SSH: `ssh -p 2232 AdminUser@127.0.0.1`, password `P@ssw0rd123!`
-  (`--username` / `--password` override; the CLI prints the exact
+  (`--username` / `--password` override; supervise mode prints the exact
   command when ready).
 - VNC: `vnc://127.0.0.1:5910`, password `demo2026`.
 
