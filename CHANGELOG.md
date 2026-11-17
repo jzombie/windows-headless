@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
  (or is loosely based on) Semantic Versioning.
 
+## [0.3.6-alpha] - 2026-11-16
+
+### Changed
+
+- README setup leads with a clone-first checkout flow (the checkout keeps the
+  cache in gitignored `./.cache`), with `cargo install windows-headless` as
+  the registry alternative.
+- README drops the unconditional "one command" framing: `run` drops into the
+  guest shell on interactive terminals and supervises on piped/CI runs, with
+  `--shell` / `--shell=false` forcing either way; the printed SSH connect
+  command is scoped to supervise mode.
+
 ## [0.3.5-alpha] - 2026-11-16
 
 ### Changed

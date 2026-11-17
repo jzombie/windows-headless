@@ -10,7 +10,7 @@ Output: SSH shell running Windows 11.
 
 ![ssh shell on mac](assets/win-ssh-on-mac.png)
 
-[One command](#commands) provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
+[Setup](#commands): clone, then run. Provisions a real VM in-process, unattended. No daemon, no GUI, no host packages, no Docker, no nested virtualization.
 
 | Installer 16% | Installer 56% | Installer 94% | Reboot (TianoCore) | Lock/idle (SSH-ready) |
 |---|---|---|---|---|
@@ -38,10 +38,35 @@ QEMU, wimlib, and virtio-win builds come from
 zero-install binaries for Windows, Linux, and macOS. Downloaded and
 SHA-256-verified into the cache on first run.
 
+## Prerequisites
+
+- Host: macOS (Apple Silicon) or Linux (amd64, arm64). Intel Macs are
+  unsupported; Windows hosts are [untested](#not-tested).
+- Microsoft retail Windows 11 ISO for your host arch (`en-US` tested;
+  [amd64](https://www.microsoft.com/en-us/software-download/windows11) /
+  [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
+  Guest arch must match host arch.
+- [Rust toolchain](https://rust-lang.org/tools/install/) (`cargo` 1.85+).
+  Everything else downloads on first run.
+
 ## Commands
 
+Clone first. Running from the checkout keeps the cache in `./.cache`,
+gitignored next to the tree:
+
 ```sh
-# One command: build the installer, boot the VM, land at a Command Prompt in the same terminal.
+git clone https://github.com/jzombie/windows-headless
+cd windows-headless
+```
+
+> _From the Cargo registry instead: `cargo install windows-headless`, then use
+`windows-headless` in place of `cargo run --release --` below. Installed
+runs use the OS user cache instead of `./.cache`._
+
+```sh
+# Build the installer, boot the VM, drop into the guest shell over SSH.
+# Interactive terminals land in the shell; piped/CI runs supervise instead
+# (--shell / --shell=false forces either way).
 # Always --release. Debug builds slow every status tick.
 cargo run --release -- run --win-iso <PATH_TO_WIN_ISO>
 
@@ -57,7 +82,7 @@ GB). Floors: 2g RAM, 32g disk. `--smp` aliases `--cpus`. Applies to installs;
 
 Connect:
 - SSH: `ssh -p 2232 AdminUser@127.0.0.1`, password `P@ssw0rd123!`
-  (`--username` / `--password` override; the CLI prints the exact
+  (`--username` / `--password` override; supervise mode prints the exact
   command when ready).
 - VNC: `vnc://127.0.0.1:5910`, password `demo2026`.
 
