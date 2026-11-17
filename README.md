@@ -38,6 +38,16 @@ QEMU, wimlib, and virtio-win builds come from
 zero-install binaries for Windows, Linux, and macOS. Downloaded and
 SHA-256-verified into the cache on first run.
 
+## Prerequisites
+
+- Host: macOS (Apple Silicon) or Linux (amd64, arm64). Intel Macs are
+  unsupported; Windows hosts are [untested](#not-tested).
+- Microsoft retail Windows 11 ISO for your host arch (`en-US` tested;
+  [amd64](https://www.microsoft.com/en-us/software-download/windows11) /
+  [arm64](https://www.microsoft.com/en-us/software-download/windows11arm64)).
+  Guest arch must match host arch.
+- Rust toolchain (`cargo` 1.85+ via [rustup](https://rustup.rs)).
+
 ## Commands
 
 Clone first. Running from the checkout keeps the cache in `./.cache`,
